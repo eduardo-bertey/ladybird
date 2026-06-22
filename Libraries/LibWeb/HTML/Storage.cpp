@@ -15,6 +15,8 @@
 #include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/StorageEvent.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/Page/Page.h>
+#include <LibWeb/StorageAPI/StorageKey.h>
 #include <LibWeb/WebIDL/QuotaExceededError.h>
 
 namespace Web::HTML {
@@ -187,7 +189,14 @@ void Storage::broadcast(Optional<String> const& key, Optional<String> const& old
 
     // 1. Let thisDocument be storage's relevant global object's associated Document.
     auto& relevant_global = relevant_global_object(*this);
-    auto const& this_document = as<Window>(relevant_global).associated_document();
+    auto& this_document = as<Window>(relevant_global).associated_document();
+
+    if (auto storage_key = StorageAPI::obtain_a_storage_key(relevant_settings_object(*this)); storage_key.has_value()) {
+        auto storage_endpoint = type() == Type::Local
+            ? StorageAPI::StorageEndpointType::LocalStorage
+            : StorageAPI::StorageEndpointType::SessionStorage;
+        this_document.page().client().page_did_broadcast_storage_change(storage_endpoint, this_document.url().serialize(), key, old_value, new_value);
+    }
 
     // 2. Let url be the serialization of thisDocument's URL.
     auto url = this_document.url().serialize();
@@ -272,7 +281,7 @@ JS::Value Storage::named_item_value(FlyString const& name) const
         // AD-HOC: Spec leaves open to a description at: https://html.spec.whatwg.org/multipage/webstorage.html#the-storage-interface
         // However correct behavior expected here: https://github.com/whatwg/html/issues/8684
         return JS::js_undefined();
-    return JS::PrimitiveString::create(vm(), value.release_value());
+    return JS::PrimitiveString::create(vm(), Utf16String::from_utf8(value.release_value()));
 }
 
 WebIDL::ExceptionOr<Bindings::PlatformObject::DidDeletionFail> Storage::delete_value(String const& name)
@@ -285,7 +294,7 @@ WebIDL::ExceptionOr<void> Storage::set_value_of_named_property(String const& key
 {
     // NOTE: Since PlatformObject does not know the type of value, we must convert it ourselves.
     //       The type of `value` is `DOMString`.
-    auto value = TRY(unconverted_value.to_string(vm()));
+    auto value = TRY(unconverted_value.to_utf16_string(vm())).to_utf8_but_should_be_ported_to_utf16();
     return set_item(key, value);
 }
 

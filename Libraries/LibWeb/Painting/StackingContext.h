@@ -12,6 +12,7 @@
 #include <AK/Vector.h>
 #include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
+#include <AK/kmalloc.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Painting/Paintable.h>
 
@@ -23,6 +24,8 @@ class WEB_API StackingContext final
     friend class ViewportPaintable;
 
 public:
+    AK_ALLOC_WITH_KMALLOC_PARTITION(HeapPartition::Painting);
+
     static NonnullRefPtr<StackingContext> create(PaintableBox&, RefPtr<StackingContext> parent, size_t index_in_tree_order);
 
     RefPtr<StackingContext> parent() { return m_parent.strong_ref(); }
@@ -64,6 +67,7 @@ private:
 
     Vector<WeakPtr<PaintableBox>> m_positioned_descendants_and_stacking_contexts_with_stack_level_0;
     Vector<WeakPtr<PaintableBox>> m_non_positioned_floating_descendants;
+    bool m_contains_inline_or_replaced_descendants { false };
 
     static void paint_child(DisplayListRecordingContext&, StackingContext const&);
     void paint_internal(DisplayListRecordingContext&) const;

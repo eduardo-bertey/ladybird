@@ -13,6 +13,7 @@
 #include <AK/Vector.h>
 #include <LibDatabase/Database.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
+#include <LibURL/PublicSuffixData.h>
 #include <LibURL/URL.h>
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/ViewImplementation.h>
@@ -23,6 +24,11 @@ namespace WebView {
 // https://datatracker.ietf.org/doc/draft-ietf-httpbis-rfc6265bis/history/
 
 static constexpr auto DATABASE_SYNCHRONIZATION_TIMER = AK::Duration::from_seconds(30);
+
+static CookieStorageKey storage_key_for_cookie(HTTP::Cookie::Cookie const& cookie)
+{
+    return { cookie.name, cookie.domain, cookie.path };
+}
 
 ErrorOr<NonnullOwnPtr<CookieJar>> CookieJar::create(Database::Database& database)
 {
@@ -198,7 +204,7 @@ void CookieJar::set_cookie(URL::URL const& url, HTTP::Cookie::ParsedCookie const
         return;
 
     // 9. If the user agent is configured to reject "public suffixes" and the domain-attribute is a public suffix:
-    if (URL::is_public_suffix(domain_attribute)) {
+    if (URL::PublicSuffixData::is_matching_public_suffix(domain_attribute, URL::PublicSuffixData::IncludeStarRule::Yes)) {
         // 1. Let request-host-canonical be the canonicalized request-host.
         // 2. If request-host fails to be canonicalized then abort this algorithm and ignore the cookie entirely.
 
@@ -397,7 +403,7 @@ void CookieJar::set_cookie(URL::URL const& url, HTTP::Cookie::ParsedCookie const
 // This is based on store_cookie() below, however the whole ParsedCookie->Cookie conversion is skipped.
 void CookieJar::update_cookie(HTTP::Cookie::Cookie cookie)
 {
-    CookieStorageKey key { cookie.name, cookie.domain, cookie.path };
+    auto key = storage_key_for_cookie(cookie);
 
     // 23. If the cookie store contains a cookie with the same name, domain, host-only-flag, and path as the
     //     newly-created cookie:
@@ -413,6 +419,31 @@ void CookieJar::update_cookie(HTTP::Cookie::Cookie cookie)
     m_transient_storage.set_cookie(move(key), move(cookie));
 
     m_transient_storage.purge_expired_cookies();
+}
+
+ErrorOr<void> CookieJar::set_cookie_from_devtools(URL::URL const& url, Optional<CookieStorageKey> old_key, HTTP::Cookie::Cookie cookie)
+{
+    auto new_key = storage_key_for_cookie(cookie);
+    auto parsed_cookie = TRY(HTTP::Cookie::parse_cookie(cookie));
+    set_cookie(url, parsed_cookie, HTTP::Cookie::Source::Http);
+
+    if (old_key.has_value() && *old_key != new_key)
+        delete_cookie(*old_key);
+
+    return {};
+}
+
+bool CookieJar::delete_cookie(CookieStorageKey const& key)
+{
+    auto cookie = m_transient_storage.get_cookie(key);
+    if (!cookie.has_value())
+        return false;
+
+    auto expired_cookie = *cookie;
+    expired_cookie.expiry_time = UnixDateTime::earliest();
+    expired_cookie.persistent = true;
+    update_cookie(move(expired_cookie));
+    return true;
 }
 
 void CookieJar::dump_cookies()
@@ -480,6 +511,14 @@ Optional<HTTP::Cookie::Cookie> CookieJar::get_named_cookie(URL::URL const& url, 
 void CookieJar::expire_cookies_with_time_offset(AK::Duration offset)
 {
     m_transient_storage.purge_expired_cookies(offset);
+}
+
+void CookieJar::delete_all_cookies(URL::URL const& url)
+{
+    for (auto& cookie : get_all_cookies_webdriver(url)) {
+        cookie.expiry_time = UnixDateTime::earliest();
+        update_cookie(move(cookie));
+    }
 }
 
 void CookieJar::expire_cookies_accessed_since(UnixDateTime since)
@@ -564,17 +603,20 @@ void CookieJar::TransientStorage::set_cookie(CookieStorageKey key, HTTP::Cookie:
     if (cookie.expiry_time < now && !m_cookies.contains(key))
         return;
 
-    // We skip notifying about updating expired cookies, as they will be notified as being expired immediately after instead
+    auto cookie_value_changed = true;
     if (cookie.expiry_time >= now) {
-        auto cookie_value_changed = true;
         if (auto old_cookie = m_cookies.get(key); old_cookie.has_value())
             cookie_value_changed = old_cookie->value != cookie.value;
-
-        send_cookie_changed_notifications({ { CookieEntry { {}, cookie } } }, cookie_value_changed);
     }
 
+    auto cookie_for_notification = cookie;
     m_cookies.set(key, cookie);
     m_dirty_cookies.set(move(key), move(cookie));
+
+    // We skip notifying about updating expired cookies, as they will be notified as being
+    // expired immediately after instead.
+    if (cookie_for_notification.expiry_time >= now)
+        send_cookie_changed_notifications({ { CookieEntry { {}, move(cookie_for_notification) } } }, cookie_value_changed);
 }
 
 Optional<HTTP::Cookie::Cookie const&> CookieJar::TransientStorage::get_cookie(CookieStorageKey const& key)
@@ -635,17 +677,25 @@ void CookieJar::TransientStorage::send_cookie_changed_notifications(ReadonlySpan
             return IterationDecision::Continue;
 
         HashTable<String> changed_domains;
-        Vector<HTTP::Cookie::Cookie> matching_cookies;
+        Vector<HTTP::Cookie::Cookie> page_cookies;
+        Vector<HTTP::Cookie::Cookie> host_cookies;
 
         for (auto const& cookie : cookies) {
             if (inform_web_view_about_changed_domains)
                 changed_domains.set(cookie.value.domain);
 
             if (HTTP::Cookie::cookie_matches_url(cookie.value, view.url(), *retrieval_host_canonical))
-                matching_cookies.append(cookie.value);
+                page_cookies.append(cookie.value);
+
+            if (cookie.value.host_only) {
+                if (cookie.value.domain == *retrieval_host_canonical)
+                    host_cookies.append(cookie.value);
+            } else if (HTTP::Cookie::domain_matches(*retrieval_host_canonical, cookie.value.domain)) {
+                host_cookies.append(cookie.value);
+            }
         }
 
-        view.notify_cookies_changed(changed_domains, matching_cookies);
+        view.notify_cookies_changed(changed_domains, page_cookies, host_cookies);
         return IterationDecision::Continue;
     });
 }

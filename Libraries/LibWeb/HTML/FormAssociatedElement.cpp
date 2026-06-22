@@ -6,8 +6,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Utf16StringBuilder.h>
 #include <LibUnicode/CharacterTypes.h>
 #include <LibUnicode/Segmenter.h>
+#include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/EditingHostManager.h>
 #include <LibWeb/DOM/Event.h>
@@ -109,6 +111,9 @@ void FormAssociatedElement::set_custom_validity(String& error)
 
     // 2. Set the custom validity error message to error.
     m_custom_validity_error_message = error;
+
+    // AD-HOC: Setting a custom validity error changes which validity pseudo-classes match.
+    CSS::Invalidation::invalidate_style_after_validity_change(form_associated_element_to_html_element());
 }
 
 bool FormAssociatedElement::enabled() const
@@ -883,20 +888,20 @@ WebIDL::ExceptionOr<void> FormAssociatedTextControlElement::set_range_text(Utf16
     // 9. If start is less than end, delete the sequence of code units within the element's relevant value starting with
     //    the code unit at the startth position and ending with the code unit at the (end-1)th position.
     if (start < end) {
-        StringBuilder builder(StringBuilder::Mode::UTF16, the_relevant_value.length_in_code_units() - (end - start));
+        Utf16StringBuilder builder(the_relevant_value.length_in_code_units() - (end - start));
         builder.append(the_relevant_value.substring_view(0, start));
         builder.append(the_relevant_value.substring_view(end));
 
-        the_relevant_value = builder.to_utf16_string();
+        the_relevant_value = builder.to_string();
     }
 
     // 10. Insert the value of the first argument into the text of the relevant value of the text control, immediately before the startth code unit.
-    StringBuilder builder(StringBuilder::Mode::UTF16, the_relevant_value.length_in_code_units() + replacement.length_in_code_units());
+    Utf16StringBuilder builder(the_relevant_value.length_in_code_units() + replacement.length_in_code_units());
     builder.append(the_relevant_value.substring_view(0, start));
     builder.append(replacement);
     builder.append(the_relevant_value.substring_view(start));
 
-    the_relevant_value = builder.to_utf16_string();
+    the_relevant_value = builder.to_string();
     TRY(set_relevant_value(the_relevant_value));
 
     // 11. Let new length be the length of the value of the first argument.

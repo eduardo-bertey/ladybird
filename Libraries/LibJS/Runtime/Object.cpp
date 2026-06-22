@@ -5,7 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/ByteString.h>
+#include <AK/NeverDestroyed.h>
 #include <AK/QuickSort.h>
 #include <AK/TypeCasts.h>
 #include <AK/kmalloc.h>
@@ -34,7 +34,11 @@ namespace JS {
 
 GC_DEFINE_ALLOCATOR(Object);
 
-static GC::WeakHashMap<GC::Ptr<Object const>, HashMap<Utf16FlyString, Object::IntrinsicAccessor>> s_intrinsics;
+static auto& intrinsic_accessor_map()
+{
+    static NeverDestroyed<GC::WeakHashMap<GC::Ptr<Object const>, HashMap<Utf16FlyString, Object::IntrinsicAccessor>>> intrinsics;
+    return *intrinsics;
+}
 
 // Heap-allocated named property storage layout:
 //   [u32 capacity] [u32 padding] [Value 0] [Value 1] ...
@@ -46,7 +50,7 @@ static Value* allocate_heap_named_storage(u32 capacity)
 {
     VERIFY(capacity > Object::INLINE_NAMED_PROPERTY_CAPACITY);
     auto allocation_size = HEAP_STORAGE_HEADER_SIZE + capacity * sizeof(Value);
-    auto* raw = static_cast<u8*>(kmalloc(allocation_size));
+    auto* raw = static_cast<u8*>(kmalloc(HeapPartition::JSObjectStorage, allocation_size));
     VERIFY(raw);
     *reinterpret_cast<u32*>(raw) = capacity;
     return reinterpret_cast<Value*>(raw + HEAP_STORAGE_HEADER_SIZE);
@@ -85,6 +89,7 @@ void Object::ensure_named_storage_capacity(u32 needed)
         m_named_properties = new_storage;
     } else {
         auto* raw = static_cast<u8*>(krealloc(
+            HeapPartition::JSObjectStorage,
             reinterpret_cast<u8*>(m_named_properties) - HEAP_STORAGE_HEADER_SIZE,
             HEAP_STORAGE_HEADER_SIZE + new_capacity * sizeof(Value)));
         VERIFY(raw);
@@ -165,7 +170,7 @@ Object::~Object()
 {
     free_indexed_elements();
     if (has_intrinsic_accessors())
-        s_intrinsics.remove(this);
+        intrinsic_accessor_map().remove(this);
     if (!named_storage_is_inline())
         free_heap_named_storage(m_named_properties);
 }
@@ -549,6 +554,42 @@ ThrowCompletionOr<void> Object::copy_data_properties(VM& vm, Value source, HashT
 
     // 2. Let from be ! ToObject(source).
     auto from = MUST(source.to_object(vm));
+
+    // OPTIMIZATION: For ordinary objects we can iterate the shape directly and read values by storage
+    //               offset, avoiding repeated property lookups through DescriptorArray::find.
+    if (from->eligible_for_own_property_enumeration_fast_path()
+        && !from->has_intrinsic_accessors()
+        && !from->may_interfere_with_indexed_property_access()
+        && excluded_values.is_empty()
+        && from->indexed_storage_kind() <= IndexedStorageKind::Packed) {
+
+        bool has_accessors = false;
+        from->shape().for_each_property_in_insertion_order([&](auto const&, auto const& metadata) {
+            if (metadata.attributes.is_enumerable() && from->get_direct(metadata.offset).is_accessor()) {
+                has_accessors = true;
+                return IterationDecision::Break;
+            }
+            return IterationDecision::Continue;
+        });
+
+        if (!has_accessors) {
+            for (u32 i = 0; i < from->indexed_array_like_size(); ++i) {
+                if (!excluded_keys.is_empty() && excluded_keys.contains(PropertyKey(i)))
+                    continue;
+                MUST(create_data_property_or_throw(PropertyKey(i), from->m_indexed_elements[i]));
+            }
+
+            from->shape().for_each_property_in_insertion_order([&](auto const& property_key, auto const& metadata) {
+                if (!metadata.attributes.is_enumerable())
+                    return;
+                if (!excluded_keys.is_empty() && excluded_keys.contains(property_key))
+                    return;
+                MUST(create_data_property_or_throw(property_key, from->get_direct(metadata.offset)));
+            });
+
+            return {};
+        }
+    }
 
     // 3. Let keys be ? from.[[OwnPropertyKeys]]().
     auto keys = TRY(from->internal_own_property_keys());
@@ -1008,6 +1049,9 @@ ThrowCompletionOr<Value> Object::internal_get(PropertyKey const& property_key, V
             return js_undefined();
 
         // c. Return ? parent.[[Get]](P, Receiver).
+        // AD-HOC: Avoid a native stack overflow when walking a pathologically-deep prototype chain.
+        if (vm.did_reach_stack_space_limit()) [[unlikely]]
+            return vm.throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
         return parent->internal_get(property_key, receiver, cacheable_metadata, PropertyLookupPhase::PrototypeChain);
     }
 
@@ -1281,7 +1325,7 @@ static Optional<Object::IntrinsicAccessor> find_intrinsic_accessor(Object const*
     if (!property_key.is_string())
         return {};
 
-    auto intrinsics = s_intrinsics.get(object);
+    auto intrinsics = intrinsic_accessor_map().get(object);
     if (!intrinsics.has_value())
         return {};
 
@@ -1347,7 +1391,7 @@ Optional<u32> Object::storage_set(PropertyKey const& property_key, ValueAndAttri
     }
 
     if (has_intrinsic_accessors() && property_key.is_string()) {
-        if (auto intrinsics = s_intrinsics.get(this); intrinsics.has_value())
+        if (auto intrinsics = intrinsic_accessor_map().get(this); intrinsics.has_value())
             intrinsics->remove(property_key.as_string());
     }
 
@@ -1387,7 +1431,7 @@ void Object::storage_delete(PropertyKey const& property_key)
         return indexed_delete(property_key.as_number());
 
     if (has_intrinsic_accessors() && property_key.is_string()) {
-        if (auto intrinsics = s_intrinsics.get(this); intrinsics.has_value())
+        if (auto intrinsics = intrinsic_accessor_map().get(this); intrinsics.has_value())
             intrinsics->remove(property_key.as_string());
     }
 
@@ -1456,7 +1500,7 @@ void Object::define_intrinsic_accessor(PropertyKey const& property_key, Property
     (void)storage_set(property_key, { {}, attributes });
 
     set_has_intrinsic_accessors();
-    auto& intrinsics = s_intrinsics.ensure(this);
+    auto& intrinsics = intrinsic_accessor_map().ensure(this);
     intrinsics.set(property_key.as_string(), move(accessor));
 }
 
@@ -1697,11 +1741,11 @@ ThrowCompletionOr<Value> Object::ordinary_to_primitive(Value::PreferredType pref
         // a. Let method be ? Get(O, name).
         Value method;
         if (method_name == vm.names.toString) {
-            static Bytecode::StaticPropertyLookupCache cache;
+            static auto& cache = *new Bytecode::StaticPropertyLookupCache;
             method = TRY(get(method_name, cache));
         } else {
             ASSERT(method_name == vm.names.valueOf);
-            static Bytecode::StaticPropertyLookupCache cache;
+            static auto& cache = *new Bytecode::StaticPropertyLookupCache;
             method = TRY(get(method_name, cache));
         }
 
@@ -1757,7 +1801,7 @@ static Value* allocate_indexed_elements(u32 capacity)
 {
     // Layout: [u32 capacity] [u32 padding] [Value 0] [Value 1] ...
     auto allocation_size = sizeof(u64) + capacity * sizeof(Value);
-    auto* raw = static_cast<u8*>(kmalloc(allocation_size));
+    auto* raw = static_cast<u8*>(kmalloc(HeapPartition::JSObjectStorage, allocation_size));
     VERIFY(raw);
     *reinterpret_cast<u32*>(raw) = capacity;
     *reinterpret_cast<u32*>(raw + sizeof(u32)) = 0; // padding

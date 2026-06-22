@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -72,14 +74,14 @@ AbstractElement::TreeCountingFunctionResolutionContext AbstractElement::tree_cou
     };
 }
 
-GC::Ptr<Layout::NodeWithStyle> AbstractElement::layout_node()
+Layout::NodeWithStyle* AbstractElement::layout_node()
 {
     if (m_pseudo_element.has_value())
         return m_element->pseudo_element_layout_node(*m_pseudo_element);
     return m_element->layout_node();
 }
 
-GC::Ptr<Layout::NodeWithStyle> AbstractElement::unsafe_layout_node()
+Layout::NodeWithStyle* AbstractElement::unsafe_layout_node()
 {
     if (m_pseudo_element.has_value())
         return m_element->pseudo_element_unsafe_layout_node(*m_pseudo_element);
@@ -109,7 +111,7 @@ Optional<AbstractElement> AbstractElement::element_to_inherit_style_from() const
 Optional<AbstractElement> AbstractElement::walk_layout_tree(WalkMethod walk_method)
 {
     // NB: Called during style recalculation.
-    GC::Ptr<Layout::Node> node = unsafe_layout_node();
+    Layout::Node* node = unsafe_layout_node();
     if (!node)
         return OptionalNone {};
 
@@ -141,7 +143,7 @@ bool AbstractElement::is_before(AbstractElement const& other) const
     return this_node && other_node && this_node->is_before(*other_node);
 }
 
-GC::Ptr<CSS::ComputedProperties const> AbstractElement::computed_properties() const
+CSS::ComputedProperties const* AbstractElement::computed_properties() const
 {
     return m_element->computed_properties(m_pseudo_element);
 }
@@ -172,7 +174,7 @@ void AbstractElement::set_custom_property_data(RefPtr<CSS::CustomPropertyData co
     m_element->set_custom_property_data(m_pseudo_element, move(data));
 }
 
-RefPtr<CSS::StyleValue const> AbstractElement::get_custom_property(FlyString const& name) const
+RefPtr<CSS::StyleValue const> AbstractElement::get_custom_property(Utf16FlyString const& name) const
 {
     auto data = custom_property_data();
     if (!data)

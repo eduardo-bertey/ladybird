@@ -4,14 +4,23 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NeverDestroyed.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Time.h>
 #include <LibGfx/Bitmap.h>
+#ifdef USE_DIRECTX
+#    include <LibGfx/Direct3DContext.h>
+#endif
 #include <LibGfx/SkiaBackendContext.h>
 
 #include <core/SkSurface.h>
 #include <gpu/ganesh/GrDirectContext.h>
+
+#ifdef USE_DIRECTX
+#    include <AK/Windows.h>
+#    include <gpu/ganesh/d3d/GrD3DBackendContext.h>
+#endif
 
 #ifdef USE_VULKAN
 #    include <gpu/ganesh/vk/GrVkDirectContext.h>
@@ -28,7 +37,7 @@
 
 namespace Gfx {
 
-#if defined(AK_OS_MACOS) || USE_VULKAN
+#if defined(AK_OS_MACOS) || defined(USE_DIRECTX) || defined(USE_VULKAN)
 static constexpr size_t skia_resource_cache_limit = 256 * MiB;
 #endif
 static constexpr auto skia_deferred_cleanup_interval = AK::Duration::from_seconds(1);
@@ -37,9 +46,13 @@ static constexpr auto skia_deferred_cleanup_resource_age = std::chrono::seconds(
 static constexpr auto skia_resource_cache_high_watermark = 384 * MiB;
 static constexpr auto skia_resource_cache_critical_watermark = 512 * MiB;
 
-static RefPtr<SkiaBackendContext> s_main_thread_context;
+static auto& main_thread_context()
+{
+    static NeverDestroyed<RefPtr<SkiaBackendContext>> context;
+    return *context;
+}
 
-#if defined(AK_OS_MACOS) || USE_VULKAN
+#if defined(AK_OS_MACOS) || defined(USE_DIRECTX) || defined(USE_VULKAN)
 static void invoke_async_flush_callback(void* context)
 {
     auto* callback = static_cast<Function<void()>*>(context);
@@ -110,9 +123,9 @@ void SkiaBackendContext::perform_post_flush_cleanup()
 
 void SkiaBackendContext::initialize_gpu_backend()
 {
-    VERIFY(!s_main_thread_context);
+    VERIFY(!main_thread_context());
 
-    s_main_thread_context = create_independent_gpu_backend();
+    main_thread_context() = create_independent_gpu_backend();
 }
 
 RefPtr<SkiaBackendContext> SkiaBackendContext::create_independent_gpu_backend()
@@ -122,7 +135,14 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_independent_gpu_backend()
     if (!metal_context)
         return {};
     return create_metal_context(*metal_context);
-#elif USE_VULKAN
+#elif defined(USE_DIRECTX)
+    auto maybe_direct3d_context = Gfx::create_direct3d_context();
+    if (maybe_direct3d_context.is_error()) {
+        dbgln("Direct3D 12 context creation failed: {}", maybe_direct3d_context.error());
+        return {};
+    }
+    return create_direct3d_context(maybe_direct3d_context.release_value());
+#elif defined(USE_VULKAN)
     auto maybe_vulkan_context = Gfx::create_vulkan_context();
     if (maybe_vulkan_context.is_error()) {
         dbgln("Vulkan context creation failed: {}", maybe_vulkan_context.error());
@@ -137,8 +157,67 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_independent_gpu_backend()
 
 RefPtr<SkiaBackendContext> SkiaBackendContext::the_main_thread_context()
 {
-    return s_main_thread_context;
+    return main_thread_context();
 }
+
+#ifdef USE_DIRECTX
+class SkiaDirect3DBackendContext final : public SkiaBackendContext {
+    AK_MAKE_NONCOPYABLE(SkiaDirect3DBackendContext);
+    AK_MAKE_NONMOVABLE(SkiaDirect3DBackendContext);
+
+public:
+    SkiaDirect3DBackendContext(sk_sp<GrDirectContext> context, NonnullRefPtr<Direct3DContext> direct3d_context)
+        : m_context(move(context))
+        , m_direct3d_context(move(direct3d_context))
+    {
+    }
+
+    ~SkiaDirect3DBackendContext() override
+    {
+        m_context.reset();
+    }
+
+    void flush_and_submit_impl(SkSurface* surface) override
+    {
+        GrFlushInfo const flush_info {};
+        m_context->flush(surface, SkSurfaces::BackendSurfaceAccess::kPresent, flush_info);
+        m_context->submit(GrSyncCpu::kYes);
+    }
+
+    void flush_and_submit_async_impl(SkSurface* surface, Function<void()>&& callback) override
+    {
+        flush_and_submit_async_to_context(*m_context, surface, move(callback));
+    }
+
+    GrDirectContext* sk_context() const override { return m_context.get(); }
+
+    VulkanContext const& vulkan_context() override { VERIFY_NOT_REACHED(); }
+
+    MetalContext& metal_context() override { VERIFY_NOT_REACHED(); }
+
+private:
+    sk_sp<GrDirectContext> m_context;
+    NonnullRefPtr<Direct3DContext> m_direct3d_context;
+};
+
+RefPtr<SkiaBackendContext> SkiaBackendContext::create_direct3d_context(NonnullRefPtr<Direct3DContext> direct3d_context)
+{
+    GrD3DBackendContext backend_context;
+    backend_context.fAdapter.retain(direct3d_context->adapter());
+    backend_context.fDevice.retain(direct3d_context->device());
+    backend_context.fQueue.retain(direct3d_context->queue());
+    backend_context.fProtectedContext = GrProtected::kNo;
+
+    auto context = GrDirectContext::MakeDirect3D(backend_context);
+    if (!context) {
+        dbgln("Skia Direct3D context creation failed");
+        return {};
+    }
+
+    context->setResourceCacheLimit(skia_resource_cache_limit);
+    return adopt_ref(*new SkiaDirect3DBackendContext(move(context), move(direct3d_context)));
+}
+#endif
 
 #ifdef USE_VULKAN
 class SkiaVulkanBackendContext final : public SkiaBackendContext {

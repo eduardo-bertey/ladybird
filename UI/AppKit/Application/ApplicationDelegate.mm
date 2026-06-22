@@ -146,15 +146,6 @@
     }
 }
 
-- (void)updateBookmarksBarDisplay:(bool)show_bookmarks_bar
-{
-    for (TabController* controller in self.managed_tabs) {
-        if (auto* tab = (Tab*)[controller window]; ([tab styleMask] & NSWindowStyleMaskFullScreen) == 0) {
-            [tab updateBookmarksBarDisplay:show_bookmarks_bar];
-        }
-    }
-}
-
 - (void)onDevtoolsEnabled
 {
     if (!self.info_bar) {
@@ -239,11 +230,6 @@
 {
     auto* current_window = [NSApp keyWindow];
     [current_window performClose:self];
-}
-
-- (void)clearHistory:(id)sender
-{
-    WebView::Application::the().clear_history();
 }
 
 - (NSMenuItem*)createApplicationMenu
@@ -352,20 +338,7 @@
 
 - (NSMenuItem*)createHistoryMenu
 {
-    auto* menu = [[NSMenuItem alloc] init];
-
-    auto* submenu = [[NSMenu alloc] initWithTitle:@"History"];
-    [submenu setAutoenablesItems:NO];
-
-    [submenu addItem:Ladybird::create_application_menu_item(WebView::Application::the().reload_action())];
-    [submenu addItem:[NSMenuItem separatorItem]];
-
-    [submenu addItem:[[NSMenuItem alloc] initWithTitle:@"Clear History"
-                                                action:@selector(clearHistory:)
-                                         keyEquivalent:@""]];
-
-    [menu setSubmenu:submenu];
-    return menu;
+    return Ladybird::create_application_menu_item(WebView::Application::the().history_menu());
 }
 
 - (NSMenuItem*)createBookmarksMenu

@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NeverDestroyed.h>
 #include <LibURL/Origin.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/DOM/Document.h>
@@ -28,8 +29,8 @@ namespace Web::HTML {
 
 HashTable<NavigableContainer*>& NavigableContainer::all_instances()
 {
-    static HashTable<NavigableContainer*> set;
-    return set;
+    static NeverDestroyed<HashTable<NavigableContainer*>> set;
+    return *set;
 }
 
 NavigableContainer::NavigableContainer(DOM::Document& document, DOM::QualifiedName qualified_name)
@@ -118,28 +119,8 @@ void NavigableContainer::create_new_child_navigable()
             return;
         }
 
-        // 1. Let parentDocState be parentNavigable's active session history entry's document state.
-        auto parent_doc_state = parent_navigable->active_session_history_entry()->document_state();
-
-        // 2. Let parentNavigableEntries be the result of getting session history entries for parentNavigable.
-        auto parent_navigable_entries = parent_navigable->get_session_history_entries();
-
-        // 3. Let targetStepSHE be the first session history entry in parentNavigableEntries whose document state equals parentDocState.
-        auto target_step_she = *parent_navigable_entries.find_if([parent_doc_state](auto& entry) {
-            return entry->document_state() == parent_doc_state;
-        });
-
-        // 4. Set historyEntry's step to targetStepSHE's step.
-        history_entry->set_step(target_step_she->step());
-
-        // 5. Let nestedHistory be a new nested history whose id is navigable's id and entries list is « historyEntry ».
-        DocumentState::NestedHistory nested_history {
-            .id = navigable->id(),
-            .entries { *history_entry },
-        };
-
-        // 6. Append nestedHistory to parentDocState's nested histories.
-        parent_doc_state->nested_histories().append(move(nested_history));
+        // 1-6. Append nestedHistory to parentDocState's nested histories.
+        VERIFY(append_nested_history_for_child_navigable(*parent_navigable, *navigable, *history_entry));
 
         // 7. Update for navigable creation/destruction given traversable
         traversable->update_for_navigable_creation_or_destruction(GC::create_function(traversable->heap(), [signal](HistoryStepResult) {
@@ -220,15 +201,6 @@ Optional<URL::URL> NavigableContainer::shared_attribute_processing_steps_for_ifr
     if (!m_content_navigable)
         return {};
 
-    // AD-HOC: If the content navigable already has a navigation in progress or pending,
-    //         skip the initial attribute processing. Without this, the about:blank URL update
-    //         from perform_url_and_history_update_steps creates a state machine that clobbers the
-    //         navigable's ongoing_navigation, causing the real navigation to be dropped when its
-    //         populate completion callback checks ongoing_navigation != navigation_id.
-    if (initial_insertion == InitialInsertion::Yes && (m_content_navigable->has_pending_navigations() || !m_content_navigable->ongoing_navigation().has<Empty>())) {
-        return {};
-    }
-
     // 1. Let url be the URL record about:blank.
     auto url = URL::about_blank();
 
@@ -249,6 +221,17 @@ Optional<URL::URL> NavigableContainer::shared_attribute_processing_steps_for_ifr
         VERIFY(navigable->active_document());
         if (navigable->active_document()->url().equals(url, URL::ExcludeFragment::Yes))
             return {};
+    }
+
+    // AD-HOC: If the content navigable already has a navigation in progress or pending, skip the initial
+    //         about:blank URL update. Without this, the URL update creates a state machine that clobbers the
+    //         navigable's ongoing_navigation, causing the real navigation to be dropped when its populate completion
+    //         callback checks ongoing_navigation != navigation_id. Non-blank src navigations must still be processed
+    //         here, and will be queued by Navigable::navigate() until the child navigable is ready for navigation.
+    if (url_matches_about_blank(url) && initial_insertion == InitialInsertion::Yes
+        && (m_content_navigable->has_pending_navigations()
+            || !m_content_navigable->ongoing_navigation().has<Empty>())) {
+        return {};
     }
 
     // 4. If url matches about:blank and initialInsertion is true, then perform the URL and history update steps given element's content navigable's active document and url.
@@ -275,8 +258,15 @@ void NavigableContainer::navigate_an_iframe_or_frame(URL::URL url, ReferrerPolic
         history_handling = Bindings::NavigationHistoryBehavior::Replace;
     }
 
-    // FIXME: 3. If element is an iframe, then set element's pending resource-timing start time to the current high resolution
-    //           time given element's node document's relevant global object.
+    // 3. If element is an iframe:
+    if (auto* iframe = as_if<HTMLIFrameElement>(this)) {
+        // 1. Set element's pending resource-timing start time to the current high resolution time given element's node
+        //    document's relevant global object.
+        iframe->set_pending_resource_start_time(HighResolutionTime::current_high_resolution_time(relevant_global_object(document())));
+
+        // 2. Set element's pending resource-timing URL to url.
+        iframe->set_pending_resource_timing_url(url);
+    }
 
     // 4. Navigate element's content navigable to url using element's node document, with historyHandling set to historyHandling,
     //    referrerPolicy set to referrerPolicy, documentResource set to srcdocString, and initialInsertion set to

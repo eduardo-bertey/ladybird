@@ -7,7 +7,7 @@
 #include <AK/IDAllocator.h>
 #include <Compositor/ConnectionFromClient.h>
 #include <Compositor/ConnectionFromWebContent.h>
-#include <LibCore/EventLoop.h>
+#include <LibCore/Process.h>
 #include <LibCore/System.h>
 #include <LibIPC/Transport.h>
 
@@ -26,7 +26,7 @@ void ConnectionFromClient::die()
 {
     for (auto& [id, connection] : m_web_content_connections)
         connection->notify_compositor_lost();
-    Core::EventLoop::current().quit(0);
+    Core::Process::terminate_immediately(0);
 }
 
 void ConnectionFromClient::did_allocate_backing_stores(Web::Compositor::CompositorContextId context_id, i32 front_bitmap_id, Gfx::SharedImage&& front_backing_store, i32 back_bitmap_id, Gfx::SharedImage&& back_backing_store)
@@ -89,6 +89,11 @@ Messages::CompositorControlServer::DispatchMouseEventToWebContentResponse Connec
     return m_compositor_state->dispatch_mouse_event_to_web_content(context_id, event);
 }
 
+Messages::CompositorControlServer::HandlePinchEventResponse ConnectionFromClient::handle_pinch_event(Web::Compositor::CompositorContextId context_id, Web::PinchEvent event)
+{
+    return m_compositor_state->handle_pinch_event(context_id, event);
+}
+
 Messages::CompositorControlServer::AsyncScrollByResponse ConnectionFromClient::async_scroll_by(Web::Compositor::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels)
 {
     return m_compositor_state->async_scroll_by(context_id, position, delta_in_device_pixels);
@@ -97,6 +102,12 @@ Messages::CompositorControlServer::AsyncScrollByResponse ConnectionFromClient::a
 void ConnectionFromClient::presented_bitmap_ready_to_paint(Web::Compositor::CompositorContextId context_id, i32 bitmap_id)
 {
     m_compositor_state->presented_bitmap_ready_to_paint(context_id, bitmap_id);
+}
+
+void ConnectionFromClient::crash()
+{
+    warnln("Crashing Compositor process by request from Browser");
+    VERIFY_NOT_REACHED();
 }
 
 ConnectionFromWebContent* ConnectionFromClient::web_content_connection(i32 web_content_connection_id)

@@ -9,11 +9,13 @@
  */
 
 #include <AK/Debug.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibGfx/BoundingBox.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Path.h>
 #include <LibGfx/TextLayout.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/Text.h>
 #include <LibWeb/Layout/BlockFormattingContext.h>
 #include <LibWeb/Layout/DominantBaseline.h>
 #include <LibWeb/Layout/SVGClipBox.h>
@@ -23,6 +25,7 @@
 #include <LibWeb/Layout/SVGMaskBox.h>
 #include <LibWeb/Layout/SVGPatternBox.h>
 #include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/Painting/SVGGraphicsPaintable.h>
 #include <LibWeb/SVG/SVGAElement.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGForeignObjectElement.h>
@@ -329,6 +332,7 @@ void SVGFormattingContext::layout_svg_element(Box const& child)
         };
         auto parent_svg_transform = get_parent_svg_transform(child);
         auto svg_transform = parent_svg_transform.multiply(foreign_object_element->element_transform());
+        child_state.set_computed_svg_transforms(Painting::SVGGraphicsPaintable::ComputedTransforms(m_current_viewbox_transform, svg_transform));
         auto to_css_pixels_transform = Gfx::AffineTransform {}.multiply(m_current_viewbox_transform).multiply(svg_transform);
         auto transformed_rect = to_css_pixels_transform.map(rect.to_type<float>()).to_type<CSSPixels>();
         child_state.set_content_offset(transformed_rect.location());
@@ -434,6 +438,19 @@ Gfx::Path SVGFormattingContext::compute_path_for_text(SVGTextBox const& text_box
     return path;
 }
 
+static Utf16String rendered_text_contents(SVG::SVGTextContentElement const& element)
+{
+    Utf16StringBuilder builder;
+    element.for_each_in_subtree_of_type<DOM::Text>([&](auto const& text_node) {
+        if (text_node.parent() && text_node.parent()->unsafe_layout_node()) {
+            if (auto content = text_node.text_content(); content.has_value())
+                builder.append(*content);
+        }
+        return TraversalDecision::Continue;
+    });
+    return builder.to_string().trim_ascii_whitespace();
+}
+
 Gfx::Path SVGFormattingContext::compute_path_for_text_path(SVGTextPathBox const& text_path_box) const
 {
     auto& text_path_element = static_cast<SVG::SVGTextPathElement const&>(text_path_box.dom_node());
@@ -443,10 +460,28 @@ Gfx::Path SVGFormattingContext::compute_path_for_text_path(SVGTextPathBox const&
 
     // FIXME: Use per-code-point fonts.
     auto& font = text_path_box.first_available_font();
-    auto text_contents = text_path_element.text_contents();
+    auto text_contents = rendered_text_contents(text_path_element);
 
     auto shape_path = const_cast<SVG::SVGGeometryElement&>(*path_or_shape).get_path(m_viewport_size);
-    return shape_path.place_text_along(text_contents, font);
+    auto start_offset = text_path_element.start_offset_for_path_length(shape_path.length());
+
+    // https://svgwg.org/svg2-draft/text.html#TextAnchoringProperties
+    // FIXME: Take writing mode and text direction into account.
+    auto total_advance = font.width(text_contents);
+    switch (text_path_element.text_anchor().value_or(SVG::TextAnchor::Start)) {
+    case SVG::TextAnchor::Start:
+        break;
+    case SVG::TextAnchor::Middle:
+        start_offset -= total_advance / 2;
+        break;
+    case SVG::TextAnchor::End:
+        start_offset -= total_advance;
+        break;
+    default:
+        VERIFY_NOT_REACHED();
+    }
+
+    return shape_path.place_text_along(text_contents, font, start_offset);
 }
 
 void SVGFormattingContext::layout_path_like_element(SVGGraphicsBox const& graphics_box)

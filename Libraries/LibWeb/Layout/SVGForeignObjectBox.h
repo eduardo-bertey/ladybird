@@ -14,11 +14,10 @@
 namespace Web::Layout {
 
 class SVGForeignObjectBox final : public BlockContainer {
-    GC_CELL(SVGForeignObjectBox, BlockContainer);
-    GC_DECLARE_ALLOCATOR(SVGForeignObjectBox);
+    LAYOUT_NODE(SVGForeignObjectBox, BlockContainer);
 
 public:
-    SVGForeignObjectBox(DOM::Document&, SVG::SVGForeignObjectElement&, GC::Ref<CSS::ComputedProperties>);
+    SVGForeignObjectBox(DOM::Document&, SVG::SVGForeignObjectElement&, CSS::ComputedProperties const&);
     virtual ~SVGForeignObjectBox() override = default;
 
     SVG::SVGForeignObjectElement& dom_node() { return static_cast<SVG::SVGForeignObjectElement&>(*BlockContainer::dom_node()); }

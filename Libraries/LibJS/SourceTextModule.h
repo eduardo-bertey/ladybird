@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/NonnullRefPtr.h>
 #include <LibJS/CyclicModule.h>
 #include <LibJS/ExecutableBacking.h>
 #include <LibJS/Export.h>
@@ -24,6 +25,13 @@ struct DecodedBytecodeCacheBlob;
 
 }
 
+namespace RustIntegration {
+
+class DecodedBytecodeCache;
+struct ModuleResult;
+
+}
+
 // 16.2.1.6 Source Text Module Records, https://tc39.es/ecma262/#sec-source-text-module-records
 class JS_API SourceTextModule final : public CyclicModule {
     GC_CELL(SourceTextModule, CyclicModule);
@@ -32,10 +40,11 @@ class JS_API SourceTextModule final : public CyclicModule {
 public:
     virtual ~SourceTextModule() override;
 
-    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse(StringView source_text, Realm&, StringView filename = {}, Script::HostDefined* host_defined = nullptr);
-    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse_from_pre_parsed(FFI::ParsedProgram* parsed, NonnullRefPtr<SourceCode const> source_code, Realm&, Script::HostDefined* host_defined = nullptr);
-    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse_from_pre_compiled(FFI::CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm&, Script::HostDefined* host_defined = nullptr);
-    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse_from_bytecode_cache(FFI::DecodedBytecodeCacheBlob*, NonnullRefPtr<SourceCode const> source_code, Realm&, Script::HostDefined* host_defined = nullptr);
+    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse(Utf16View source_text, Realm&, StringView filename = {}, Utf16View display_filename = {}, Script::HostDefined* host_defined = nullptr);
+    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse(NonnullRefPtr<SourceCode const>, Realm&, StringView filename = {}, Script::HostDefined* host_defined = nullptr);
+    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse_from_pre_parsed(FFI::ParsedProgram* parsed, NonnullRefPtr<SourceCode const> source_code, Realm&, StringView filename, Script::HostDefined* host_defined = nullptr);
+    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse_from_pre_compiled(FFI::CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm&, StringView filename, Script::HostDefined* host_defined = nullptr);
+    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> parse_from_bytecode_cache(NonnullRefPtr<RustIntegration::DecodedBytecodeCache>, NonnullRefPtr<SourceCode const> source_code, Realm&, StringView filename, Script::HostDefined* host_defined = nullptr);
 
     virtual Vector<Utf16FlyString> get_exported_names(VM& vm, GC::RootHashTable<GC::Ref<Module const>>& export_star_set) override;
     virtual ResolvedBinding resolve_export(VM& vm, Utf16FlyString const& export_name, Vector<ResolvedBinding> resolve_set = {}) override;
@@ -63,8 +72,8 @@ public:
     [[nodiscard]] bool can_install_generated_bytecode_cache() const;
     void begin_bytecode_cache_generation();
     void finish_bytecode_cache_generation_without_install();
-    bool try_install_bytecode_cache(FFI::DecodedBytecodeCacheBlob*, NonnullRefPtr<SourceCode const> source_code);
-    void install_generated_bytecode_cache(FFI::DecodedBytecodeCacheBlob*, NonnullRefPtr<SourceCode const> source_code);
+    bool try_install_bytecode_cache(NonnullRefPtr<RustIntegration::DecodedBytecodeCache>, NonnullRefPtr<SourceCode const> source_code);
+    void install_generated_bytecode_cache(NonnullRefPtr<RustIntegration::DecodedBytecodeCache>, NonnullRefPtr<SourceCode const> source_code);
 
 protected:
     virtual ThrowCompletionOr<void> initialize_environment(VM& vm) override;
@@ -72,11 +81,12 @@ protected:
 
 private:
     SourceTextModule(Realm&, StringView filename, Script::HostDefined* host_defined, bool has_top_level_await, Vector<ModuleRequest> requested_modules, Vector<ImportEntry> import_entries, Vector<ExportEntry> local_export_entries, Vector<ExportEntry> indirect_export_entries, Vector<ExportEntry> star_export_entries, Optional<Utf16FlyString> default_export_binding_name, Vector<Utf16FlyString> var_declared_names, Vector<LexicalBinding> lexical_bindings, Vector<FunctionToInitialize> functions_to_initialize, Vector<GC::Root<SharedFunctionInstanceData>> shared_function_data, GC::Ptr<Bytecode::Executable> executable, GC::Ptr<SharedFunctionInstanceData> tla_shared_data, ExecutableBacking);
+    static Result<GC::Ref<SourceTextModule>, Vector<ParserError>> from_rust_result(Optional<Result<RustIntegration::ModuleResult, Vector<ParserError>>>, Realm&, StringView filename, Script::HostDefined*);
 
     virtual void visit_edges(Cell::Visitor&) override;
     virtual size_t external_memory_size() const override;
     Vector<SharedFunctionInstanceData*> collect_shared_function_data();
-    void complete_bytecode_cache_install(GC::Ptr<Bytecode::Executable>, GC::Ptr<Bytecode::Executable> top_level_await_executable);
+    void complete_bytecode_cache_install(GC::Ptr<Bytecode::Executable>, GC::Ptr<Bytecode::Executable> top_level_await_executable, NonnullRefPtr<RustIntegration::DecodedBytecodeCache>);
     void verify_executable_backing_invariants();
 
     NonnullOwnPtr<ExecutionContext> m_execution_context; // [[Context]]

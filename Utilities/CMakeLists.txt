@@ -1,17 +1,15 @@
-if(WIN32)
-    # FIXME: Add support for LibLine on Windows
-    ladybird_utility(js SOURCES js.cpp LIBS LibCrypto LibJS LibUnicode LibMain LibTextCodec LibGC Threads::Threads)
-    ladybird_utility(wasm SOURCES wasm.cpp LIBS LibFileSystem LibWasm LibMain LibJS LibCrypto LibGC)
-else()
-    ladybird_utility(js SOURCES js.cpp LIBS LibCrypto LibJS LibLine LibUnicode LibMain LibTextCodec LibGC Threads::Threads)
-    ladybird_utility(wasm SOURCES wasm.cpp LIBS LibFileSystem LibWasm LibLine LibMain LibJS LibCrypto LibGC)
+ladybird_utility(js SOURCES js.cpp LIBS LibCrypto LibJS LibMain LibTextCodec LibGC)
+ladybird_utility(wasm SOURCES wasm.cpp LIBS LibFileSystem LibWasm LibMain LibJS LibCrypto LibGC)
+
+if (NOT WIN32 AND NOT ANDROID)
+    target_link_libraries(js PRIVATE PkgConfig::LIBEDIT)
 endif()
 
 ladybird_utility(xml SOURCES xml.cpp LIBS LibFileSystem LibMain LibXML LibURL)
 ladybird_utility(dns SOURCES dns.cpp LIBS LibDNS LibMain LibTLS LibCrypto)
 
 if (ENABLE_GUI_TARGETS)
-    ladybird_utility(image SOURCES image.cpp LIBS LibGfx LibMain)
+    ladybird_utility(image SOURCES image.cpp LIBS LibGfx LibImageDecoders LibMain)
 endif()
 
 # FIXME: Increase support for building targets on Windows

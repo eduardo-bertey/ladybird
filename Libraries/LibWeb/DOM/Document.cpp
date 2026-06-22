@@ -70,6 +70,7 @@
 #include <LibWeb/CSS/StyleSheetList.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GuaranteedInvalidStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RandomValueSharingStyleValue.h>
 #include <LibWeb/CSS/SystemColor.h>
 #include <LibWeb/CSS/TransitionEvent.h>
@@ -118,6 +119,7 @@
 #include <LibWeb/HTML/CustomElements/CustomElementDefinition.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
+#include <LibWeb/HTML/DOMStringList.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/DragEvent.h>
@@ -195,7 +197,6 @@
 #include <LibWeb/Painting/PaintableBox.h>
 #include <LibWeb/Painting/StackingContext.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
-#include <LibWeb/PermissionsPolicy/AutoplayAllowlist.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/ResizeObserver/ResizeObserverEntry.h>
@@ -205,6 +206,7 @@
 #include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
 #include <LibWeb/SVG/SVGTitleElement.h>
+#include <LibWeb/SVG/SVGUseElement.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
@@ -219,6 +221,7 @@
 #include <LibWeb/UIEvents/PointerTypes.h>
 #include <LibWeb/UIEvents/TextEvent.h>
 #include <LibWeb/ViewTransition/ViewTransition.h>
+#include <LibWeb/WebDriver/UserPrompt.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -234,7 +237,7 @@ static Optional<u64> s_style_invalidation_counter_dump_interval;
 static void dump_style_invalidation_counters(Document const& document)
 {
     auto const& counters = document.style_invalidation_counters();
-    dbgln("Style invalidation counters for {}: styleInvalidations={}, fullStyleInvalidations={}, elementStyleRecomputations={}, elementStyleNoopRecomputations={}, elementInheritedStyleRecomputations={}, elementInheritedStyleNoopRecomputations={}, previousSiblingInvalidationWalkVisits={}, hasAncestorWalkInvocations={}, hasAncestorWalkVisits={}, hasAncestorSiblingElementChecks={}, hasInvalidationMetadataCandidates={}, hasMatchInvocations={}, hasResultCacheHits={}, hasResultCacheMisses={}",
+    dbgln("Style invalidation counters for {}: styleInvalidations={}, fullStyleInvalidations={}, elementStyleRecomputations={}, elementStyleNoopRecomputations={}, elementInheritedStyleRecomputations={}, elementInheritedStyleNoopRecomputations={}, previousSiblingInvalidationWalkVisits={}, mediaRuleEvaluations={}, hasAncestorWalkInvocations={}, hasAncestorWalkVisits={}, hasAncestorSiblingElementChecks={}, hasInvalidationMetadataCandidates={}, hasMatchInvocations={}, hasResultCacheHits={}, hasResultCacheMisses={}",
         document.url_string(),
         counters.style_invalidations,
         counters.full_style_invalidations,
@@ -243,6 +246,7 @@ static void dump_style_invalidation_counters(Document const& document)
         counters.element_inherited_style_recomputations,
         counters.element_inherited_style_noop_recomputations,
         counters.previous_sibling_invalidation_walk_visits,
+        counters.media_rule_evaluations,
         counters.has_ancestor_walk_invocations,
         counters.has_ancestor_walk_visits,
         counters.has_ancestor_sibling_element_checks,
@@ -470,10 +474,18 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     // 10. Set window's associated Document to document.
     window->set_associated_document(*document);
 
-    // 11. Run CSP initialization for a Document given document.
+    // 11. Set document's internal ancestor origin objects list to the result of running the internal ancestor origin
+    //     objects list creation steps given document and navigationParams's iframe element referrer policy.
+    document->set_internal_ancestor_origin_objects_list(document->internal_ancestor_origin_objects_list_creation_steps(navigation_params.iframe_element_referrer_policy));
+
+    // 12. Set document's ancestor origins list to the result of running the ancestor origins list creation steps given
+    //     document.
+    document->set_ancestor_origins_list(document->ancestor_origins_list_creation_steps());
+
+    // 13. Run CSP initialization for a Document given document.
     document->run_csp_initialization();
 
-    // 12. If navigationParams's request is non-null, then:
+    // 14. If navigationParams's request is non-null, then:
     if (navigation_params.request) {
         // 1. Set document's referrer to the empty string.
         document->m_referrer = String {};
@@ -487,12 +499,13 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
         }
     }
 
-    // FIXME: 13: If navigationParams's fetch controller is not null, then:
+    // FIXME: 15: If navigationParams's fetch controller is not null, then:
 
-    // FIXME: 14. Create the navigation timing entry for document, with navigationParams's response's timing info, redirectCount, navigationParams's navigation timing type, and
-    //            navigationParams's response's service worker timing info.
+    // FIXME: 16. Create the navigation timing entry for document, with navigationParams's response's timing info,
+    //        redirectCount, navigationParams's navigation timing type, and navigationParams's response's service
+    //        worker timing info.
 
-    // 15. If navigationParams's response has a `Refresh` header, then:
+    // 17. If navigationParams's response has a `Refresh` header, then:
     if (auto maybe_refresh = navigation_params.response->header_list()->get("Refresh"sv); maybe_refresh.has_value()) {
         // 1. Let value be the isomorphic decoding of the value of the header.
         auto value = TextCodec::isomorphic_decode(maybe_refresh.value());
@@ -501,13 +514,17 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
         document->shared_declarative_refresh_steps(value, nullptr);
     }
 
-    // FIXME: 16. If navigationParams's commit early hints is not null, then call navigationParams's commit early hints with document.
+    // FIXME: 18. If navigationParams's commit early hints is not null, then call navigationParams's commit early hints
+    //        with document.
 
-    // FIXME: 17. Process link headers given document, navigationParams's response, and "pre-media".
+    // FIXME: 19. Process link headers given document, navigationParams's response, and "pre-media".
 
-    // FIXME: 18. Potentially free deferred fetch quota for document.
+    // FIXME: 20. If navigationParams's navigable is a top-level traversable, then process the `Speculation-Rules`
+    //        header given document and navigationParams's response .
 
-    // 19. Return document.
+    // FIXME: 21. Potentially free deferred fetch quota for document.
+
+    // 22. Return document.
     return document;
 }
 
@@ -671,7 +688,6 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_pending_css_import_rules);
     visitor.visit(m_page);
     visitor.visit(m_window);
-    visitor.visit(m_layout_root);
     visitor.visit(m_style_sheets);
     visitor.visit(m_hovered_node);
     visitor.visit(m_inspected_node);
@@ -724,10 +740,11 @@ void Document::visit_edges(Cell::Visitor& visitor)
     for (auto& resize_observer : m_resize_observers)
         visitor.visit(resize_observer);
 
-    visitor.visit(m_svg_roots_needing_relayout);
     visitor.visit(m_query_containers_needing_container_query_evaluation_after_layout);
 
     visitor.visit(m_shared_resource_requests);
+    for (auto& resource : m_css_image_resources)
+        resource.value->visit_edges(visitor);
 
     visitor.visit(m_associated_animation_timelines);
     visitor.visit(m_list_of_available_images);
@@ -776,6 +793,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_style_invalidator);
     visitor.visit(m_deferred_parser_start);
     visitor.visit(m_custom_element_registry);
+    visitor.visit(m_ancestor_origins_list);
 }
 
 String const& Document::content_blocker_style_sheet()
@@ -1350,6 +1368,7 @@ void Document::tear_down_layout_tree()
 {
     if (m_layout_root)
         m_layout_root->prepare_subtree_for_detach_from_layout_tree();
+    m_hit_test_display_list = nullptr;
     m_layout_root = nullptr;
     m_paintable = nullptr;
     m_needs_full_layout_tree_update = true;
@@ -1631,7 +1650,7 @@ void Document::invalidate_layout_tree(InvalidateLayoutTreeReason reason)
 
 void Document::mark_svg_root_as_needing_relayout(Layout::SVGSVGBox& svg_root)
 {
-    m_svg_roots_needing_relayout.set(svg_root);
+    m_svg_roots_needing_relayout.set(svg_root.make_weak_ptr<Layout::SVGSVGBox>());
 }
 
 void Document::set_needs_container_query_evaluation_after_layout(Element const& query_container)
@@ -1779,7 +1798,11 @@ void Document::update_layout(UpdateLayoutReason reason)
     for (size_t layout_pass = 0; layout_pass < max_container_query_layout_passes; ++layout_pass) {
         update_style();
 
-        if (layout_is_up_to_date())
+        auto const should_collect_devtools_layout_data = page().client().has_active_devtools_client();
+        auto const force_devtools_layout_data_collection = should_collect_devtools_layout_data
+            && reason == UpdateLayoutReason::InspectDevToolsLayoutData;
+
+        if (layout_is_up_to_date() && !force_devtools_layout_data_collection)
             return;
 
         auto svg_roots_to_relayout = move(m_svg_roots_needing_relayout);
@@ -1792,8 +1815,10 @@ void Document::update_layout(UpdateLayoutReason reason)
 
         // Partial SVG relayout
         if (!needs_layout_tree_rebuild && !svg_roots_to_relayout.is_empty() && !m_layout_root->needs_layout_update()) {
-            for (auto const& svg_root : svg_roots_to_relayout)
-                relayout_svg_root(*svg_root);
+            for (auto const& svg_root : svg_roots_to_relayout) {
+                if (svg_root)
+                    relayout_svg_root(*svg_root);
+            }
 
             invalidate_stacking_context_tree();
             set_needs_to_record_display_list();
@@ -1866,6 +1891,7 @@ void Document::update_layout(UpdateLayoutReason reason)
 
         Layout::LayoutState layout_state;
         layout_state.ensure_capacity(layout_index_counter);
+        layout_state.set_should_collect_devtools_layout_data(should_collect_devtools_layout_data);
 
         {
             auto& viewport = static_cast<Layout::Viewport&>(*m_layout_root);
@@ -1963,6 +1989,22 @@ void Document::update_layout(UpdateLayoutReason reason)
     VERIFY(layout_is_up_to_date());
 }
 
+void Document::clear_devtools_layout_inspection_data()
+{
+    clear_grid_highlighted_node(nullptr);
+    clear_flexbox_highlighted_node(nullptr);
+
+    auto paintable = this->paintable();
+    if (!paintable)
+        return;
+
+    paintable->for_each_in_subtree_of_type<Painting::PaintableBox>([](auto& paintable_box) {
+        paintable_box.set_grid_layout_data(nullptr);
+        paintable_box.set_flex_layout_data(nullptr);
+        return TraversalDecision::Continue;
+    });
+}
+
 bool Document::layout_is_up_to_date() const
 {
     if (!navigable() || navigable()->active_document() != this)
@@ -1998,7 +2040,10 @@ static void apply_element_style_invalidation_after_style_change(Element& element
 
 static void apply_document_style_invalidation_after_style_change(Document& document, CSS::RequiredInvalidationAfterStyleChange const& invalidation)
 {
-    if (!invalidation.is_none())
+    if (invalidation.repaint
+        || invalidation.rebuild_stacking_context_tree
+        || invalidation.relayout
+        || invalidation.rebuild_layout_tree)
         document.set_needs_to_record_display_list();
     if (invalidation.rebuild_accumulated_visual_contexts)
         document.set_needs_accumulated_visual_contexts_update(true);
@@ -2160,14 +2205,14 @@ void Document::update_style()
         CSS::Invalidation::invalidate_style_for_pending_has_mutations(*this);
     }
 
-    if (!m_style_invalidator->has_pending_invalidations() && !needs_full_style_update() && !needs_style_update() && !child_needs_style_update() && !m_needs_media_query_evaluation)
+    if (!m_style_invalidator->has_pending_invalidations() && !needs_full_style_update() && !needs_style_update() && !child_needs_style_update() && !m_needs_media_rule_evaluation)
         return;
 
     // NOTE: If this is a document hosting <template> contents, style update is unnecessary.
     if (m_created_for_appropriate_template_contents)
         return;
 
-    if (m_needs_media_query_evaluation)
+    if (m_needs_media_rule_evaluation)
         evaluate_media_rules();
 
     if (!m_style_invalidator->has_pending_invalidations() && !needs_full_style_update() && !needs_style_update() && !child_needs_style_update())
@@ -2269,7 +2314,7 @@ static CSS::RequiredInvalidationAfterStyleChange recompute_style_for_targeted_st
     return {};
 }
 
-GC::Ptr<CSS::ComputedProperties const> Document::update_style_for_element(AbstractElement const& abstract_element, StyleUpdateMode mode)
+CSS::ComputedProperties const* Document::update_style_for_element(AbstractElement const& abstract_element, StyleUpdateMode mode)
 {
     // Refresh computed properties for an abstract element without requiring every unrelated dirty element in the
     // document to be resolved. This walks the flat-tree inheritance chain and re-cascades from the rootmost stale
@@ -2286,7 +2331,7 @@ GC::Ptr<CSS::ComputedProperties const> Document::update_style_for_element(Abstra
 
         // Media query evaluation can enqueue normal style invalidations, so do it before deciding whether the full
         // style traversal needs to run.
-        if (m_needs_media_query_evaluation)
+        if (m_needs_media_rule_evaluation)
             evaluate_media_rules();
 
         if (!m_is_running_update_layout
@@ -2328,7 +2373,7 @@ GC::Ptr<CSS::ComputedProperties const> Document::update_style_for_element(Abstra
             ancestor_needs_descendant_style_recompute = true;
         }
 
-        if (auto const* properties = ancestor->computed_properties().ptr(); properties && properties->display().is_none()) {
+        if (auto const properties = ancestor->computed_properties(); properties && properties->display().is_none()) {
             topmost_display_none_index = i - 1;
             if (mode == StyleUpdateMode::StopAtDisplayNone && !topmost_element_requiring_style.has_value())
                 return nullptr;
@@ -2410,7 +2455,7 @@ bool Document::element_needs_style_update(AbstractElement const& abstract_elemen
         return true;
     if (m_needs_invalidation_of_elements_affected_by_has)
         return true;
-    if (m_needs_media_query_evaluation)
+    if (m_needs_media_rule_evaluation)
         return true;
     if (m_style_invalidator->has_pending_invalidations())
         return true;
@@ -2737,7 +2782,7 @@ void Document::clear_grid_highlighted_node(GC::Ptr<Node> node)
         node->set_needs_repaint();
 }
 
-GC::Ptr<Layout::Node> Document::highlighted_layout_node()
+Layout::Node* Document::highlighted_layout_node()
 {
     if (!m_highlighted_node)
         return nullptr;
@@ -2801,7 +2846,7 @@ static CSSPixelPoint compute_mouse_event_offset(CSSPixelPoint position, Painting
 {
     auto inverse_transform_point = [](Painting::PaintableBox const& paintable_box, CSSPixelPoint position) -> Optional<CSSPixelPoint> {
         auto viewport_paintable = paintable_box.document().unsafe_paintable();
-        if (!viewport_paintable)
+        if (!viewport_paintable || !viewport_paintable->has_visual_context_tree())
             return {};
         auto pixel_ratio = static_cast<float>(paintable_box.document().page().client().device_pixels_per_css_pixel());
         auto const& visual_context_tree = viewport_paintable->visual_context_tree();
@@ -2812,15 +2857,11 @@ static CSSPixelPoint compute_mouse_event_offset(CSSPixelPoint position, Painting
 
     CSSPixelPoint offset_position = position;
     if (auto const* paintable_box = as_if<Painting::PaintableBox>(paintable)) {
-        if (paintable_box->accumulated_visual_context_index().value()) {
-            if (auto transformed_position = inverse_transform_point(*paintable_box, position); transformed_position.has_value())
-                offset_position = *transformed_position;
-        }
+        if (auto transformed_position = inverse_transform_point(*paintable_box, position); transformed_position.has_value())
+            offset_position = *transformed_position;
     } else if (auto containing_block = paintable.containing_block()) {
-        if (containing_block->accumulated_visual_context_index().value()) {
-            if (auto transformed_position = inverse_transform_point(*containing_block, position); transformed_position.has_value())
-                offset_position = *transformed_position;
-        }
+        if (auto transformed_position = inverse_transform_point(*containing_block, position); transformed_position.has_value())
+            offset_position = *transformed_position;
     }
 
     auto const top_left_of_layout_node = paintable.box_type_agnostic_position();
@@ -3530,8 +3571,8 @@ DocumentType const* Document::doctype() const
 
 String const& Document::compat_mode() const
 {
-    static String const back_compat = "BackCompat"_string;
-    static String const css1_compat = "CSS1Compat"_string;
+    static String const& back_compat = *new String("BackCompat"_string);
+    static String const& css1_compat = *new String("CSS1Compat"_string);
 
     if (m_quirks_mode == QuirksMode::Yes)
         return back_compat;
@@ -4634,55 +4675,61 @@ void Document::run_the_scroll_steps()
 
 void Document::add_media_query_list(GC::Ref<CSS::MediaQueryList> media_query_list)
 {
-    m_needs_media_query_evaluation = true;
     m_media_query_lists.append(media_query_list);
+    m_needs_media_query_list_evaluation = true;
 }
 
 // https://drafts.csswg.org/cssom-view/#evaluate-media-queries-and-report-changes
 void Document::evaluate_media_queries_and_report_changes()
 {
-    if (!m_needs_media_query_evaluation)
+    if (!m_needs_media_query_list_evaluation && !m_needs_media_rule_evaluation)
         return;
-    m_needs_media_query_evaluation = false;
 
-    // NOTE: Not in the spec, but we take this opportunity to prune null WeakPtrs.
-    m_media_query_lists.remove_all_matching([](auto& it) {
-        return !it;
-    });
+    bool evaluate_media_query_lists = m_needs_media_query_list_evaluation;
+    m_needs_media_query_list_evaluation = false;
 
-    // 1. For each MediaQueryList object target that has doc as its document,
-    //    in the order they were created, oldest first, run these substeps:
-    for (auto& media_query_list_ptr : m_media_query_lists) {
-        // 1. If target’s matches state has changed since the last time these steps
-        //    were run, fire an event at target using the MediaQueryListEvent constructor,
-        //    with its type attribute initialized to change, its isTrusted attribute
-        //    initialized to true, its media attribute initialized to target’s media,
-        //    and its matches attribute initialized to target’s matches state.
-        if (!media_query_list_ptr)
-            continue;
-        GC::Ptr<CSS::MediaQueryList> media_query_list = media_query_list_ptr.ptr();
-        bool did_match = media_query_list->matches();
-        bool now_matches = media_query_list->evaluate();
+    if (evaluate_media_query_lists) {
+        // NOTE: Not in the spec, but we take this opportunity to prune null WeakPtrs.
+        m_media_query_lists.remove_all_matching([](auto& it) {
+            return !it;
+        });
 
-        auto did_change_internally = media_query_list->has_changed_state();
-        media_query_list->set_has_changed_state(false);
+        // 1. For each MediaQueryList object target that has doc as its document,
+        //    in the order they were created, oldest first, run these substeps:
+        for (auto& media_query_list_ptr : m_media_query_lists) {
+            // 1. If target’s matches state has changed since the last time these steps
+            //    were run, fire an event at target using the MediaQueryListEvent constructor,
+            //    with its type attribute initialized to change, its isTrusted attribute
+            //    initialized to true, its media attribute initialized to target’s media,
+            //    and its matches attribute initialized to target’s matches state.
+            if (!media_query_list_ptr)
+                continue;
+            GC::Ptr<CSS::MediaQueryList> media_query_list = media_query_list_ptr.ptr();
+            bool did_match = media_query_list->matches();
+            bool now_matches = media_query_list->evaluate();
 
-        if (did_change_internally == true || did_match != now_matches) {
-            Bindings::MediaQueryListEventInit init;
-            init.media = media_query_list->media();
-            init.matches = now_matches;
-            auto event = CSS::MediaQueryListEvent::create(realm(), HTML::EventNames::change, init);
-            event->set_is_trusted(true);
-            media_query_list->dispatch_event(*event);
+            auto did_change_internally = media_query_list->has_changed_state();
+            media_query_list->set_has_changed_state(false);
+
+            if (did_change_internally == true || did_match != now_matches) {
+                Bindings::MediaQueryListEventInit init;
+                init.media = media_query_list->media();
+                init.matches = now_matches;
+                auto event = CSS::MediaQueryListEvent::create(realm(), HTML::EventNames::change, init);
+                event->set_is_trusted(true);
+                media_query_list->dispatch_event(*event);
+            }
         }
     }
 
     // Also not in the spec, but this is as good a place as any to evaluate @media rules!
-    evaluate_media_rules();
+    if (m_needs_media_rule_evaluation)
+        evaluate_media_rules();
 }
 
 void Document::evaluate_media_rules()
 {
+    m_needs_media_rule_evaluation = false;
     CSS::Invalidation::evaluate_media_rules_and_invalidate_style(*this);
 }
 
@@ -4852,6 +4899,16 @@ void Document::unregister_document_observer(Badge<DocumentObserver>, DocumentObs
 {
     bool was_removed = m_document_observers.remove(document_observer);
     VERIFY(was_removed);
+}
+
+void Document::register_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement& use_element)
+{
+    m_svg_use_elements.append(use_element);
+}
+
+void Document::unregister_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement& use_element)
+{
+    m_svg_use_elements.remove(use_element);
 }
 
 void Document::increment_number_of_things_delaying_the_load_event(Badge<DocumentLoadEventDelayer>)
@@ -5723,7 +5780,10 @@ void Document::unload_a_document_and_its_descendants(GC::Ptr<Document> new_docum
                 auto increment_unloaded = GC::create_function(heap, [unload_state] { unload_state->did_process_child(); });
 
                 // 2. Unload a document and its descendants given childNavigable's active document, null, and incrementUnloaded.
-                child_navigable->active_document()->unload_a_document_and_its_descendants({}, increment_unloaded);
+                if (auto active_document = child_navigable->active_document())
+                    active_document->unload_a_document_and_its_descendants({}, increment_unloaded);
+                else
+                    increment_unloaded->function()();
             }));
     }
 
@@ -5747,9 +5807,8 @@ bool Document::is_allowed_to_use_feature(PolicyControlledFeature feature) const
     // FIXME: This is ad-hoc. Implement the Permissions Policy specification.
     switch (feature) {
     case PolicyControlledFeature::Autoplay:
-        if (PermissionsPolicy::AutoplayAllowlist::the().is_allowed_for_origin(*this, origin()) == PermissionsPolicy::Decision::Enabled)
-            return true;
-        break;
+        // FIXME: Implement allowlist for this.
+        return true;
     case PolicyControlledFeature::Camera:
         // FIXME: Implement allowlist for this.
         return true;
@@ -5834,6 +5893,8 @@ GC::Ref<DOM::Document> Document::appropriate_template_contents_owner_document()
 
 String Document::dump_accessibility_tree_as_json()
 {
+    update_layout(UpdateLayoutReason::InspectAccessibilityTree);
+
     StringBuilder builder;
     auto accessibility_tree = AccessibilityTreeNode::create(this, nullptr);
     build_accessibility_tree(*&accessibility_tree);
@@ -6091,7 +6152,7 @@ static CSSPixelRect compute_intersection(GC::Ref<Element> target, CSSPixelRect t
             auto overflow_y = container->computed_values().overflow_y();
             bool has_content_clip = overflow_x != CSS::Overflow::Visible || overflow_y != CSS::Overflow::Visible;
             if (has_content_clip) {
-                auto clip_rect = container->transform_rect_to_viewport(container->absolute_padding_box_rect());
+                auto clip_rect = container->transform_rect_to_viewport(container->absolute_padding_box_rect(), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
 
                 // Apply scroll margin to expand the scrollport for scroll containers.
                 auto& scroll_margin = observer.scroll_margin_values();
@@ -6593,7 +6654,9 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
             auto pop_state_event = HTML::PopStateEvent::create(realm(), "popstate"_fly_string, popstate_event_init);
             relevant_global_object.dispatch_event(pop_state_event);
 
-            // FIXME: 4. Restore persisted state given entry.
+            // 4. Restore persisted state given entry.
+            if (auto navigable = this->navigable())
+                navigable->restore_persisted_state_from_session_history_entry(*entry);
 
             // 5. If oldURL's fragment is not equal to entry's URL's fragment, then queue a global task on the DOM manipulation task source
             //    given document's relevant global object to fire an event named hashchange at document's relevant global object,
@@ -6613,12 +6676,16 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
         // 5. Otherwise:
         else {
             // 1. Assert: entriesForNavigationAPI is given.
-            VERIFY(entries_for_navigation_api.has_value());
+            VERIFY(!update_navigation_api || entries_for_navigation_api.has_value());
 
-            // FIXME: 2. Restore persisted state given entry.
+            // 2. Restore persisted state given entry.
+            if (auto navigable = this->navigable())
+                navigable->restore_persisted_state_from_session_history_entry(*entry);
 
             // 3. Initialize the navigation API entries for a new document given navigation, entriesForNavigationAPI, and entry.
-            navigation->initialize_the_navigation_api_entries_for_a_new_document(*entries_for_navigation_api, entry);
+            if (update_navigation_api)
+                navigation->initialize_the_navigation_api_entries_for_a_new_document(
+                    *entries_for_navigation_api, entry);
         }
     }
 
@@ -6687,10 +6754,57 @@ HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>>& Document::shared_resour
     return m_shared_resource_requests;
 }
 
+HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>> const& Document::shared_resource_requests() const
+{
+    return m_shared_resource_requests;
+}
+
+CSS::ImageStyleValueResource* Document::css_image_resource(URL::URL const& url)
+{
+    auto it = m_css_image_resources.find(url);
+    if (it == m_css_image_resources.end())
+        return nullptr;
+    return it->value.ptr();
+}
+
+CSS::ImageStyleValueResource const* Document::css_image_resource(URL::URL const& url) const
+{
+    auto it = m_css_image_resources.find(url);
+    if (it == m_css_image_resources.end())
+        return nullptr;
+    return it->value.ptr();
+}
+
+CSS::ImageStyleValueResource& Document::create_css_image_resource(GC::Ref<HTML::SharedResourceRequest> request)
+{
+    // NB: The caller should guard against creating already existing resources.
+    VERIFY(!m_css_image_resources.contains(request->url()));
+
+    auto resource = make<CSS::ImageStyleValueResource>(request, *this);
+    auto& resource_ref = *resource;
+    m_css_image_resources.set(request->url(), move(resource));
+    return resource_ref;
+}
+
+void Document::remove_css_image_resource_if_unused(URL::URL const& url)
+{
+    auto it = m_css_image_resources.find(url);
+    if (it == m_css_image_resources.end())
+        return;
+    if (!it->value->can_be_removed())
+        return;
+    m_css_image_resources.remove(it);
+}
+
 void Document::prune_image_resource_caches()
 {
     static constexpr size_t decoded_image_resource_cache_limit = 8 * MiB;
     static constexpr size_t decoded_image_resource_cache_count_limit = 96;
+
+    auto is_used_by_css_image_resource = [&](URL::URL const& url, HTML::SharedResourceRequest const& request) {
+        auto* css_image_resource = this->css_image_resource(url);
+        return css_image_resource && css_image_resource->decoded_image_data() == request.image_data();
+    };
 
     struct CacheSize {
         size_t decoded_image_size { 0 };
@@ -6704,6 +6818,8 @@ void Document::prune_image_resource_caches()
         for (auto const& it : m_shared_resource_requests) {
             auto const& request = *it.value;
             if (!request.can_be_pruned_from_memory_cache())
+                continue;
+            if (is_used_by_css_image_resource(it.key, request))
                 continue;
             ++count;
             if (auto image_data = request.image_data())
@@ -6722,6 +6838,8 @@ void Document::prune_image_resource_caches()
         for (auto const& it : m_shared_resource_requests) {
             auto const& request = *it.value;
             if (!request.can_be_pruned_from_memory_cache())
+                continue;
+            if (is_used_by_css_image_resource(it.key, request))
                 continue;
             if (request.cache_touch_serial() >= least_recently_used_serial)
                 continue;
@@ -7645,11 +7763,11 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
             if (auto* node = Node::from_unique_id(*identifier.dom_element_unique_id)) {
                 if (node->is_html_style_element()) {
                     if (auto* sheet = as<HTML::HTMLStyleElement>(*node).sheet())
-                        return sheet->source_text({});
+                        return sheet->source_text();
                 }
                 if (node->is_svg_style_element()) {
                     if (auto* sheet = as<SVG::SVGStyleElement>(*node).sheet())
-                        return sheet->source_text({});
+                        return sheet->source_text();
                 }
             }
         }
@@ -7664,7 +7782,7 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
         if (m_style_sheets) {
             for (auto& style_sheet : m_style_sheets->sheets()) {
                 if (auto match = find_style_sheet_with_url(identifier.url.value(), style_sheet); match.has_value())
-                    return match->source_text({});
+                    return match->source_text();
             }
         }
 
@@ -7675,7 +7793,7 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
                     return;
 
                 if (auto match = find_style_sheet_with_url(identifier.url.value(), style_sheet); match.has_value())
-                    result = match->source_text({});
+                    result = match->source_text();
             });
             return result;
         }
@@ -7839,16 +7957,29 @@ Vector<GC::Root<Range>> Document::find_matching_text(String const& query, CaseSe
                 match_start_position = &text_block.positions[i + 1];
 
             auto start_position = match_index.value() - match_start_position->start_offset + match_start_position->dom_offset_within_node;
-            auto& start_dom_node = match_start_position->dom_node;
+            auto start_dom_node = match_start_position->dom_node.ptr();
+            VERIFY(start_dom_node);
 
             auto* match_end_position = match_start_position;
             for (; i < text_block.positions.size() - 1 && (match_index.value() + utf16_query.length_in_code_units() > text_block.positions[i + 1].start_offset); ++i)
                 match_end_position = &text_block.positions[i + 1];
 
-            auto& end_dom_node = match_end_position->dom_node;
+            auto end_dom_node = match_end_position->dom_node.ptr();
+            VERIFY(end_dom_node);
             auto end_position = match_index.value() + utf16_query.length_in_code_units() - match_end_position->start_offset + match_end_position->dom_offset_within_node;
 
-            matches.append(Range::create(start_dom_node, start_position, end_dom_node, end_position));
+            if (&start_dom_node->root() != &end_dom_node->root()
+                || !start_dom_node->is_connected()
+                || !end_dom_node->is_connected()
+                || start_position > start_dom_node->length()
+                || end_position > end_dom_node->length()) {
+                offset = match_index.value() + utf16_query.length_in_code_units() + 1;
+                if (offset >= text_view.length_in_code_units())
+                    break;
+                continue;
+            }
+
+            matches.append(Range::create(*start_dom_node, start_position, *end_dom_node, end_position));
             match_start_position = match_end_position;
             offset = match_index.value() + utf16_query.length_in_code_units() + 1;
             if (offset >= text_view.length_in_code_units())
@@ -8073,7 +8204,7 @@ GC::Ref<WebIDL::Promise> Document::exit_fullscreen()
     // 2. If doc is not fully active or doc’s fullscreen element is null, then reject promise with a TypeError exception
     //    and return promise.
     if (!is_fully_active() || !fullscreen_element()) {
-        WebIDL::reject_promise(realm, promise, JS::TypeError::create(realm, "Document not fully active or no fullscreen element."sv));
+        WebIDL::reject_promise(realm, promise, JS::TypeError::create(realm, "Document not fully active or no fullscreen element."_utf16));
         return promise;
     }
 
@@ -8287,6 +8418,63 @@ GC::Ptr<DOM::Position> Document::cursor_position() const
     return nullptr;
 }
 
+Optional<CSSPixelRect> Document::current_caret_rect()
+{
+    // Returns the bounds of the current text caret in viewport-relative CSS pixels. Used to position platform overlays
+    // such as the IME candidate window. Returns nothing when no editable element is focused or when layout isn't ready.
+    auto position = cursor_position();
+    if (!position)
+        return {};
+    auto& dom_node = *position->node();
+
+    update_layout(UpdateLayoutReason::InputCaretRect);
+
+    auto* layout_node = dom_node.layout_node();
+    if (!layout_node)
+        return {};
+
+    // The caret rects computed here are document-relative (absolute). Platform IME overlays are positioned relative to
+    // the viewport — so translate by scroll offset and map through any containing navigables to the top-level viewport.
+    auto to_viewport_rect = [this](CSSPixelRect rect) -> CSSPixelRect {
+        auto navigable = this->navigable();
+        if (!navigable)
+            return rect;
+        auto scroll = navigable->viewport_scroll_offset();
+        CSSPixelRect viewport_rect { rect.x() - scroll.x(), rect.y() - scroll.y(), rect.width(), rect.height() };
+        return navigable->to_top_level_rect(viewport_rect);
+    };
+
+    // Walk up to the nearest PaintableWithLines, which is where text fragments live.
+    Painting::PaintableWithLines const* paintable_with_lines = nullptr;
+    for (auto paintable = layout_node->first_paintable(); paintable; paintable = paintable->parent()) {
+        if (auto const* with_lines = as_if<Painting::PaintableWithLines>(*paintable)) {
+            paintable_with_lines = with_lines;
+            break;
+        }
+    }
+
+    if (paintable_with_lines) {
+        for (auto const& fragment : paintable_with_lines->fragments()) {
+            if (fragment.layout_node().dom_node() != &dom_node)
+                continue;
+            auto const offset = position->offset();
+            if (offset < fragment.dom_start_offset_in_node() || offset > fragment.dom_end_offset_in_node())
+                continue;
+            return to_viewport_rect(fragment.range_rect(Painting::Paintable::SelectionState::StartAndEnd, offset, offset));
+        }
+    }
+
+    // Empty editable elements have no fragments; fall back to the padding-box corner.
+    if (auto* node_with_style = as_if<Layout::NodeWithStyleAndBoxModelMetrics>(*layout_node)) {
+        auto paintable = node_with_style->first_paintable();
+        if (auto const* box = as_if<Painting::PaintableBox>(paintable.ptr())) {
+            auto content_box = box->absolute_padding_box_rect();
+            return to_viewport_rect(CSSPixelRect { content_box.x(), content_box.y(), 1, node_with_style->computed_values().line_height() });
+        }
+    }
+    return {};
+}
+
 void Document::reset_cursor_blink_cycle()
 {
     m_cursor_blink_state = true;
@@ -8294,6 +8482,12 @@ void Document::reset_cursor_blink_cycle()
     // In testing mode, disable timed blinking so we can deterministically generate display lists.
     if (!HTML::Window::in_test_mode())
         m_cursor_blink_timer->restart();
+}
+
+void Document::set_cursor_position_needs_repaint()
+{
+    if (auto position = cursor_position())
+        position->node()->set_needs_repaint();
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#doc-container-document
@@ -8352,6 +8546,13 @@ void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display
     if (auto container = navigable->container()) {
         container->document().set_needs_repaint(InvalidateDisplayList::No);
     }
+}
+
+void Document::set_needs_accumulated_visual_contexts_update(bool value)
+{
+    m_needs_accumulated_visual_contexts_update = value;
+    if (value)
+        set_needs_repaint(InvalidateDisplayList::No);
 }
 
 void Document::set_needs_to_record_display_list()
@@ -8468,6 +8669,8 @@ void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
 
 Painting::HitTestDisplayList const* Document::ensure_hit_test_display_list()
 {
+    update_paint_and_hit_testing_properties_if_needed();
+
     auto viewport_paintable = paintable();
     if (!viewport_paintable)
         return nullptr;
@@ -8478,6 +8681,8 @@ Painting::HitTestDisplayList const* Document::ensure_hit_test_display_list()
         if (auto navigable = this->navigable()) {
             if (navigable->record_display_list_and_scroll_state(paint_config))
                 return;
+            (void)record_display_list(paint_config, navigable->display_list_resource_storage());
+            return;
         }
         Painting::DisplayListResourceStorage resource_storage;
         (void)record_display_list(paint_config, resource_storage);
@@ -8521,7 +8726,27 @@ Optional<Painting::CaretPosition> Document::caret_position_from_point(CSSPixelPo
     if (!hit_test_display_list || !viewport_paintable)
         return {};
     viewport_paintable->refresh_scroll_state();
-    return hit_test_display_list->caret_position_from_point(position, *viewport_paintable, page().client().device_pixels_per_css_pixel(), page().chrome_metrics());
+    return hit_test_display_list->caret_position_from_point(position, *viewport_paintable, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::Normal);
+}
+
+Optional<Painting::CaretPosition> Document::caret_position_from_point_for_selection_start(CSSPixelPoint position)
+{
+    auto hit_test_display_list = ensure_hit_test_display_list();
+    auto viewport_paintable = paintable();
+    if (!hit_test_display_list || !viewport_paintable)
+        return {};
+    viewport_paintable->refresh_scroll_state();
+    return hit_test_display_list->caret_position_from_point(position, *viewport_paintable, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::SelectionStart);
+}
+
+Optional<Painting::CaretPosition> Document::caret_position_from_point_for_selection(CSSPixelPoint position)
+{
+    auto hit_test_display_list = ensure_hit_test_display_list();
+    auto viewport_paintable = paintable();
+    if (!hit_test_display_list || !viewport_paintable)
+        return {};
+    viewport_paintable->refresh_scroll_state();
+    return hit_test_display_list->caret_position_from_point(position, *viewport_paintable, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::Selection);
 }
 
 TraversalDecision Document::hit_test_all(CSSPixelPoint position, Function<TraversalDecision(Painting::HitTestResult)> const& callback)
@@ -8579,8 +8804,8 @@ Document::StepsToFireBeforeunloadResult Document::steps_to_fire_beforeunload(boo
     // 5. Decrease document's relevant agent's event loop's termination nesting level by 1.
     event_loop.decrement_termination_nesting_level();
 
-    // FIXME: 6. If all of the following are true:
-    if (false &&
+    // 6. If all of the following are true:
+    if (
         //    - unloadPromptShown is false;
         !unload_prompt_shown
         //    - document's active sandboxing flag set does not have its sandboxed modals flag set;
@@ -8591,10 +8816,18 @@ Document::StepsToFireBeforeunloadResult Document::steps_to_fire_beforeunload(boo
         && (!event_firing_result || !beforeunload_event->return_value().is_empty())
         //    - FIXME: showing an unload prompt is unlikely to be annoying, deceptive, or pointless
     ) {
-        // FIXME: 1. Set unloadPromptShown to true.
+        // 1. Set unloadPromptShown to true.
+        unload_prompt_shown = true;
+
         // FIXME: 2. Invoke WebDriver BiDi user prompt opened with document's relevant global object, "beforeunload", and "".
         // FIXME: 3. Ask the user to confirm that they wish to unload the document, and pause while waiting for the user's response.
-        // FIXME: 4. If the user did not confirm the page navigation, set unloadPromptCanceled to true.
+
+        auto user_prompt_handler = WebDriver::get_the_prompt_handler(WebDriver::PromptType::BeforeUnload);
+
+        // 4. If the user did not confirm the page navigation, set unloadPromptCanceled to true.
+        if (user_prompt_handler.handler == WebDriver::PromptHandler::Dismiss)
+            unload_prompt_canceled = true;
+
         // FIXME: 5. Invoke WebDriver BiDi user prompt closed with document's relevant global object and true if unloadPromptCanceled is false or false otherwise.
     }
 
@@ -8868,7 +9101,7 @@ String Document::dump_display_list()
     if (!viewport_paintable)
         return "No paintable"_string;
 
-    Painting::DisplayListResourceStorage resource_storage;
+    auto& resource_storage = navigable()->display_list_resource_storage();
     auto display_list = record_display_list(HTML::PaintConfig {}, resource_storage);
     if (!display_list)
         return "No display list"_string;
@@ -8876,8 +9109,7 @@ String Document::dump_display_list()
     HashMap<size_t, RefPtr<Painting::PaintableBox const>> context_id_to_paintable;
     viewport_paintable->for_each_in_inclusive_subtree_of_type<Painting::PaintableBox>([&](auto const& paintable_box) {
         auto visual_context_index = paintable_box.accumulated_visual_context_index();
-        if (visual_context_index.value())
-            (void)context_id_to_paintable.try_set(visual_context_index.value(), paintable_box);
+        (void)context_id_to_paintable.try_set(visual_context_index.value(), paintable_box);
         return TraversalDecision::Continue;
     });
 
@@ -8890,15 +9122,15 @@ String Document::dump_display_list()
     Vector<size_t> root_contexts;
 
     display_list->for_each_command_header([&](Painting::DisplayListCommandHeader const& header, ReadonlyBytes) {
-        if (!header.context_index.value())
-            return;
-        for (size_t node_index = header.context_index.value(); node_index && !visited.contains(node_index);) {
+        for (size_t node_index = header.context_index.value(); !visited.contains(node_index);) {
             visited.set(node_index);
+            if (node_index == Painting::VISUAL_VIEWPORT_NODE_INDEX.value()) {
+                if (!root_contexts.contains_slow(node_index))
+                    root_contexts.append(node_index);
+                break;
+            }
             auto parent = visual_context_tree.node_at(Painting::VisualContextIndex(node_index)).parent_index.value();
-            if (parent)
-                children.ensure(parent).append(node_index);
-            else if (!root_contexts.contains_slow(node_index))
-                root_contexts.append(node_index);
+            children.ensure(parent).append(node_index);
             node_index = parent;
         }
     });
@@ -9015,7 +9247,7 @@ Optional<Vector<CSS::Parser::ComponentValue>> Document::environment_variable_val
     VERIFY_NOT_REACHED();
 }
 
-HashMap<FlyString, CSS::CustomPropertyRegistration>& Document::registered_property_set()
+HashMap<Utf16FlyString, CSS::CustomPropertyRegistration>& Document::registered_property_set()
 {
     return m_registered_property_set;
 }
@@ -9038,7 +9270,7 @@ GC::Ref<DOM::Node> Document::create_ns_resolver(GC::Ref<DOM::Node> node_resolver
 }
 
 // https://drafts.css-houdini.org/css-properties-values-api/#determining-registration
-Optional<CSS::CustomPropertyRegistration const&> Document::get_registered_custom_property(FlyString const& name) const
+Optional<CSS::CustomPropertyRegistration const&> Document::get_registered_custom_property(Utf16FlyString const& name) const
 {
     // If the Document’s [[registeredPropertySet]] slot contains a record with the custom property’s name, the
     // registration is that record.
@@ -9054,7 +9286,7 @@ Optional<CSS::CustomPropertyRegistration const&> Document::get_registered_custom
     return {};
 }
 
-NonnullRefPtr<CSS::StyleValue const> Document::custom_property_initial_value(FlyString const& name) const
+NonnullRefPtr<CSS::StyleValue const> Document::custom_property_initial_value(Utf16FlyString const& name) const
 {
     auto maybe_custom_property = get_registered_custom_property(name);
     if (maybe_custom_property.has_value()) {
@@ -9080,7 +9312,7 @@ void Document::did_change_custom_property_registrations()
 
 void Document::build_registered_properties_cache()
 {
-    HashMap<FlyString, CSS::CustomPropertyRegistration> cached_registered_properties_from_css_property_rules;
+    HashMap<Utf16FlyString, CSS::CustomPropertyRegistration> cached_registered_properties_from_css_property_rules;
     for_each_active_css_style_sheet([&](CSS::CSSStyleSheet const& style_sheet) {
         style_sheet.for_each_effective_rule(TraversalOrder::Preorder, [&](CSS::CSSRule const& rule) {
             if (auto* property_rule = as_if<CSS::CSSPropertyRule>(rule))
@@ -9107,6 +9339,87 @@ void Document::ensure_cookie_version_index(URL::URL const& new_url, URL::URL con
 
     page().client().page_did_request_document_cookie_version_index(unique_id(), *new_domain);
     m_cookie_version_index = {};
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#internal-ancestor-origin-objects-list-creation-steps
+Vector<URL::Origin> Document::internal_ancestor_origin_objects_list_creation_steps(ReferrerPolicy::ReferrerPolicy referrer_policy) const
+{
+    // 1. Let output be « ».
+    Vector<URL::Origin> output;
+
+    // 2. Let parentDoc be document's container document.
+    auto parent_doc = container_document();
+
+    // 3. If parentDoc is null, then return output.
+    if (!parent_doc)
+        return output;
+
+    // 4. Assert: parentDoc is fully active.
+    VERIFY(parent_doc->is_fully_active());
+
+    // 5. Let ancestorOrigins be parentDoc's internal ancestor origin objects list.
+    auto ancestor_origins = parent_doc->internal_ancestor_origin_objects_list();
+
+    // 6. Let container be document's node navigable's container.
+    // AD-HOC: This isn't used, see https://github.com/whatwg/html/issues/12566
+    // auto container = navigable()->container();
+
+    // 7. Let masked be false.
+    auto masked = false;
+
+    // 8. If referrerPolicy is "no-referrer", then set masked to true.
+    if (referrer_policy == ReferrerPolicy::ReferrerPolicy::NoReferrer)
+        masked = true;
+
+    // 9. Otherwise, if referrerPolicy is "same-origin" and parentDoc's origin is not same origin with document's origin, then set masked to true.
+    else if (referrer_policy == ReferrerPolicy::ReferrerPolicy::SameOrigin && parent_doc->origin().is_same_origin(origin()))
+        masked = true;
+
+    // 10. If masked is true, then append a new opaque origin to output.
+    if (masked)
+        output.append(URL::Origin::create_opaque());
+
+    // 11. Otherwise, append parentDoc's origin to output.
+    else
+        output.append(parent_doc->origin());
+
+    // 12. For each ancestorOrigin of ancestorOrigins:
+    for (auto const& ancestor_origin : ancestor_origins.value()) {
+        // 1. If masked is true and ancestorOrigin is same origin with parentDoc's origin, then append a new opaque origin to output and continue.
+        if (masked && ancestor_origin.is_same_origin(parent_doc->origin())) {
+            output.append(URL::Origin::create_opaque());
+            continue;
+        }
+
+        // 2. Append ancestorOrigin to output and set masked to false.
+        output.append(ancestor_origin);
+        masked = false;
+    }
+
+    // 13. Return output.
+    return output;
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#ancestor-origins-list-creation-steps
+GC::Ref<HTML::DOMStringList> Document::ancestor_origins_list_creation_steps() const
+{
+    // 1. Let ancestorOrigins be document's internal ancestor origin objects list.
+    auto& ancestor_origins = m_internal_ancestor_origin_objects_list;
+
+    // 2. Assert: ancestorOrigins is not null.
+    VERIFY(ancestor_origins.has_value());
+
+    // 3. Let output be « ».
+    Vector<String> output;
+
+    // 4. For each origin of ancestorOrigins:
+    for (auto const& origin : ancestor_origins.value()) {
+        // 1. Append the serialization of origin to output.
+        output.append(origin.serialize());
+    }
+
+    // 5. Return a new DOMStringList object whose associated list is output.
+    return HTML::DOMStringList::create(realm(), move(output));
 }
 
 StringView to_string(SetNeedsLayoutReason reason)

@@ -87,6 +87,7 @@ mod bytecode_cache;
 pub mod fast_hash;
 pub mod lexer;
 pub mod parser;
+pub mod runtime;
 pub mod scope_collector;
 pub mod token;
 
@@ -101,10 +102,12 @@ use bytecode::generator::PendingSharedFunctionData;
 use parser::ParseError;
 use parser::Parser;
 use parser::ProgramType;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
+use std::rc::Rc;
 
 // Compile-time assertion: `ParsedProgram` travels between the parse worker
 // thread and the main thread, so it must be `Send`. After the StringId and
@@ -137,6 +140,7 @@ pub struct CompiledProgram {
     parsed: ParsedProgram,
     bytecode: CompiledProgramBytecode,
     declaration_functions: Vec<PendingSharedFunctionData>,
+    source_len: usize,
 }
 
 pub struct CompiledFunction {
@@ -150,7 +154,12 @@ pub struct BytecodeCacheBlob {
 }
 
 pub struct DecodedBytecodeCacheBlob {
-    _blob: bytecode_cache::DecodedCacheBlob,
+    _blob: Rc<RefCell<bytecode_cache::DecodedCacheBlob>>,
+}
+
+fn validate_decoded_blob(blob: &DecodedBytecodeCacheBlob, source_len: usize) -> bool {
+    let mut decoded_blob = blob._blob.borrow_mut();
+    decoded_blob.validate_for_materialization(source_len).is_ok()
 }
 
 enum CompiledProgramBytecode {
@@ -243,8 +252,27 @@ unsafe fn source_from_raw<'a>(source: *const u16, len: usize) -> Option<&'a [u16
 
 /// Callback type for reporting parse errors to C++.
 pub type ParseErrorCallback = Option<
-    unsafe extern "C" fn(ctx: *mut c_void, message: *const u8, message_len: usize, line: u32, column: u32) -> (),
+    unsafe extern "C" fn(ctx: *mut c_void, message: *const u16, message_len: usize, line: u32, column: u32) -> (),
 >;
+
+unsafe fn report_parse_error(
+    callback: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        message: *const u16,
+        message_len: usize,
+        line: u32,
+        column: u32,
+    ) -> (),
+    context: *mut c_void,
+    message: &str,
+    line: u32,
+    column: u32,
+) {
+    let message_utf16: Vec<u16> = message.encode_utf16().collect();
+    unsafe {
+        callback(context, message_utf16.as_ptr(), message_utf16.len(), line, column);
+    }
+}
 
 /// Check for errors, optionally reporting them via a C++ callback.
 fn check_errors_with_callback(
@@ -255,9 +283,8 @@ fn check_errors_with_callback(
     if parser.has_errors() {
         if let Some(cb) = error_callback {
             for err in parser.errors() {
-                let msg = &err.message;
                 unsafe {
-                    cb(error_context, msg.as_ptr(), msg.len(), err.line, err.column);
+                    report_parse_error(cb, error_context, &err.message, err.line, err.column);
                 }
             }
         }
@@ -266,9 +293,8 @@ fn check_errors_with_callback(
     if parser.scope_collector.has_errors() {
         if let Some(cb) = error_callback {
             for err in parser.scope_collector.drain_errors() {
-                let msg = &err.message;
                 unsafe {
-                    cb(error_context, msg.as_ptr(), msg.len(), err.line, err.column);
+                    report_parse_error(cb, error_context, &err.message, err.line, err.column);
                 }
             }
         }
@@ -671,8 +697,13 @@ pub unsafe extern "C" fn rust_parsed_program_take_errors(
     unsafe {
         let parsed = &mut *parsed;
         for err in parsed.errors.drain(..) {
-            let msg = err.message.as_bytes();
-            error_callback.unwrap()(error_context, msg.as_ptr(), msg.len(), err.line, err.column);
+            report_parse_error(
+                error_callback.unwrap(),
+                error_context,
+                &err.message,
+                err.line,
+                err.column,
+            );
         }
     }
 }
@@ -745,6 +776,7 @@ fn compile_parsed_program_off_thread_impl(
                 parsed: *parsed,
                 bytecode,
                 declaration_functions,
+                source_len,
             }))
         })
     }
@@ -858,7 +890,7 @@ pub unsafe extern "C" fn rust_free_bytecode_cache_blob(data: *mut u8, length: us
 /// # Safety
 /// - `data` must point to `length` readable bytes.
 /// - `owner` must keep `data` alive until `free_owner` is called.
-/// - `clone_owner` must return a new owner that keeps the same bytes alive.
+/// - `clone_owner` must return a new `bytecode_owner` for `rust_create_executable()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_decode_bytecode_cache_blob_with_owner(
     data: *const u8,
@@ -902,7 +934,9 @@ pub unsafe extern "C" fn rust_decode_bytecode_cache_blob_with_owner(
             ) else {
                 return std::ptr::null_mut();
             };
-            Box::into_raw(Box::new(DecodedBytecodeCacheBlob { _blob: blob }))
+            Box::into_raw(Box::new(DecodedBytecodeCacheBlob {
+                _blob: Rc::new(RefCell::new(blob)),
+            }))
         })
     }
 }
@@ -915,6 +949,50 @@ pub unsafe extern "C" fn rust_decode_bytecode_cache_blob_with_owner(
 pub unsafe extern "C" fn rust_free_decoded_bytecode_cache_blob(blob: *mut DecodedBytecodeCacheBlob) {
     unsafe {
         drop(Box::from_raw(blob));
+    }
+}
+
+/// Validate a decoded bytecode cache blob before materializing it.
+///
+/// # Safety
+/// `blob` must be a valid pointer from `rust_decode_bytecode_cache_blob_with_owner()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_validate_decoded_bytecode_cache_blob(
+    blob: *mut DecodedBytecodeCacheBlob,
+    source_len: usize,
+) -> bool {
+    unsafe {
+        abort_on_panic(|| {
+            if blob.is_null() {
+                return false;
+            }
+            (*blob)
+                ._blob
+                .borrow_mut()
+                .validate_for_materialization(source_len)
+                .is_ok()
+        })
+    }
+}
+
+/// Add a reference to a decoded bytecode cache blob.
+///
+/// # Safety
+/// `blob` must be a valid pointer from `rust_decode_bytecode_cache_blob_with_owner()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_ref_decoded_bytecode_cache_blob(
+    blob: *const DecodedBytecodeCacheBlob,
+) -> *mut DecodedBytecodeCacheBlob {
+    unsafe {
+        abort_on_panic(|| {
+            if blob.is_null() {
+                return std::ptr::null_mut();
+            }
+
+            Box::into_raw(Box::new(DecodedBytecodeCacheBlob {
+                _blob: Rc::clone(&(*blob)._blob),
+            }))
+        })
     }
 }
 
@@ -940,10 +1018,11 @@ pub unsafe extern "C" fn rust_materialize_bytecode_cache_script(
                 return std::ptr::null_mut();
             }
             let blob = Box::from_raw(blob);
-            if !blob._blob.source_ranges_are_valid(source_len) {
+            if !validate_decoded_blob(&blob, source_len) {
                 return std::ptr::null_mut();
             }
             blob._blob
+                .borrow()
                 .materialize_script(vm_ptr, source_code_ptr, shared_function_data_list_ptr, gdi_context)
         })
     }
@@ -974,10 +1053,10 @@ pub unsafe extern "C" fn rust_materialize_bytecode_cache_module(
                 return std::ptr::null_mut();
             }
             let blob = Box::from_raw(blob);
-            if !blob._blob.source_ranges_are_valid(source_len) {
+            if !validate_decoded_blob(&blob, source_len) {
                 return std::ptr::null_mut();
             }
-            blob._blob.materialize_module(
+            blob._blob.borrow().materialize_module(
                 vm_ptr,
                 source_code_ptr,
                 shared_function_data_list_ptr,
@@ -1024,10 +1103,10 @@ pub unsafe extern "C" fn rust_install_bytecode_cache_script(
                 }
                 std::slice::from_raw_parts(existing_declaration_function_ptrs, existing_declaration_function_count)
             };
-            if !blob._blob.source_ranges_are_valid(source_len) {
+            if !validate_decoded_blob(&blob, source_len) {
                 return std::ptr::null_mut();
             }
-            blob._blob.install_script(
+            blob._blob.borrow().install_script(
                 vm_ptr,
                 source_code_ptr,
                 existing_executable_ptr,
@@ -1075,10 +1154,10 @@ pub unsafe extern "C" fn rust_install_bytecode_cache_module(
                 }
                 std::slice::from_raw_parts(existing_declaration_function_ptrs, existing_declaration_function_count)
             };
-            if !blob._blob.source_ranges_are_valid(source_len) {
+            if !validate_decoded_blob(&blob, source_len) {
                 return std::ptr::null_mut();
             }
-            blob._blob.install_module(
+            blob._blob.borrow().install_module(
                 vm_ptr,
                 source_code_ptr,
                 existing_executable_ptr,
@@ -1495,13 +1574,7 @@ pub unsafe extern "C" fn rust_compile_dynamic_function(
                             .message
                             .unwrap_or_else(|| format!("Unexpected token {}", token.token_type.name()));
                         if let Some(cb) = error_callback {
-                            cb(
-                                error_context,
-                                msg.as_ptr(),
-                                msg.len(),
-                                token.line_number,
-                                token.line_column,
-                            );
+                            report_parse_error(cb, error_context, &msg, token.line_number, token.line_column);
                         }
                         return std::ptr::null_mut();
                     }
@@ -1585,8 +1658,7 @@ pub unsafe extern "C" fn rust_compile_dynamic_function(
             if parser.scope_collector.has_errors() {
                 if let Some(cb) = error_callback {
                     for err in parser.scope_collector.drain_errors() {
-                        let msg = &err.message;
-                        cb(error_context, msg.as_ptr(), msg.len(), err.line, err.column);
+                        report_parse_error(cb, error_context, &err.message, err.line, err.column);
                     }
                 }
                 return std::ptr::null_mut();
@@ -1621,8 +1693,7 @@ pub unsafe extern "C" fn rust_compile_dynamic_function(
 
             let Some(function_id) = function_id else {
                 if let Some(cb) = error_callback {
-                    let msg = "Failed to parse dynamic function";
-                    cb(error_context, msg.as_ptr(), msg.len(), 0, 0);
+                    report_parse_error(cb, error_context, "Failed to parse dynamic function", 0, 0);
                 }
                 return std::ptr::null_mut();
             };

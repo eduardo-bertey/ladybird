@@ -42,8 +42,10 @@ private:
     virtual void set_display_metadata(Web::Compositor::CompositorContextId, Optional<u64>, double) override;
     virtual Messages::CompositorControlServer::HandleMouseEventResponse handle_mouse_event(Web::Compositor::CompositorContextId, Web::MouseEvent) override;
     virtual Messages::CompositorControlServer::DispatchMouseEventToWebContentResponse dispatch_mouse_event_to_web_content(Web::Compositor::CompositorContextId, Web::MouseEvent) override;
+    virtual Messages::CompositorControlServer::HandlePinchEventResponse handle_pinch_event(Web::Compositor::CompositorContextId, Web::PinchEvent) override;
     virtual Messages::CompositorControlServer::AsyncScrollByResponse async_scroll_by(Web::Compositor::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels) override;
     virtual void presented_bitmap_ready_to_paint(Web::Compositor::CompositorContextId, i32 bitmap_id) override;
+    virtual void crash() override;
 
     ConnectionFromWebContent* web_content_connection(i32 web_content_connection_id);
 

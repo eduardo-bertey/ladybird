@@ -4,10 +4,12 @@ set(SOURCES
     Actors/AccessibilityNodeActor.cpp
     Actors/AccessibilityWalkerActor.cpp
     Actors/ConsoleActor.cpp
+    Actors/CookiesActor.cpp
     Actors/CSSPropertiesActor.cpp
     Actors/DeviceActor.cpp
     Actors/FrameActor.cpp
     Actors/HighlighterActor.cpp
+    Actors/IndexedDBActor.cpp
     Actors/InspectorActor.cpp
     Actors/LayoutInspectorActor.cpp
     Actors/NetworkEventActor.cpp
@@ -18,7 +20,9 @@ set(SOURCES
     Actors/PreferenceActor.cpp
     Actors/ProcessActor.cpp
     Actors/RootActor.cpp
+    Actors/StyleRuleActor.cpp
     Actors/StyleSheetsActor.cpp
+    Actors/StorageActor.cpp
     Actors/TabActor.cpp
     Actors/TargetConfigurationActor.cpp
     Actors/ThreadActor.cpp
@@ -27,7 +31,9 @@ set(SOURCES
     Actors/WatcherActor.cpp
     Connection.cpp
     DevToolsServer.cpp
+    IndexedDBSerialization.cpp
+    StorageHelpers.cpp
 )
 
 ladybird_lib(LibDevTools devtools EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibDevTools PRIVATE LibCore LibWeb)
+target_link_libraries(LibDevTools PRIVATE LibCore LibHTTP LibWeb LibURL)

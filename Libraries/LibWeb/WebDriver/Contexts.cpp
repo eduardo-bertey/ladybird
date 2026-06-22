@@ -14,10 +14,10 @@
 namespace Web::WebDriver {
 
 // https://w3c.github.io/webdriver/#dfn-web-window-identifier
-static JS::PropertyKey const WEB_WINDOW_IDENTIFIER { "window-fcc6-11e5-b4f8-330a88ab9d7f"_utf16_fly_string };
+static auto const& WEB_WINDOW_IDENTIFIER = *new JS::PropertyKey("window-fcc6-11e5-b4f8-330a88ab9d7f"_utf16_fly_string);
 
 // https://w3c.github.io/webdriver/#dfn-web-frame-identifier
-static JS::PropertyKey const WEB_FRAME_IDENTIFIER { "frame-075b-4da1-b6ba-e579c2d3230a"_utf16_fly_string };
+static auto const& WEB_FRAME_IDENTIFIER = *new JS::PropertyKey("frame-075b-4da1-b6ba-e579c2d3230a"_utf16_fly_string);
 
 // https://w3c.github.io/webdriver/#dfn-windowproxy-reference-object
 JsonObject window_proxy_reference_object(HTML::WindowProxy const& window)
@@ -77,7 +77,7 @@ ErrorOr<GC::Ref<HTML::WindowProxy>, WebDriver::Error> deserialize_web_frame(JS::
         return WebDriver::Error::from_code(WebDriver::ErrorCode::InvalidArgument, "Object is not a web frame"sv);
 
     // 2. Let reference be the result of getting the web frame identifier property from object.
-    auto reference = property.value().as_string().utf8_string();
+    auto reference = property.value().as_string().utf16_string_view().to_utf8_but_should_be_ported_to_utf16();
 
     // 3. Let browsing context be the browsing context whose window handle is reference, or null if no such browsing
     //    context exists.
@@ -112,7 +112,7 @@ ErrorOr<GC::Ref<HTML::WindowProxy>, WebDriver::Error> deserialize_web_window(JS:
         return WebDriver::Error::from_code(WebDriver::ErrorCode::InvalidArgument, "Object is not a web window"sv);
 
     // 2. Let reference be the result of getting the web window identifier property from object.
-    auto reference = property.value().as_string().utf8_string();
+    auto reference = property.value().as_string().utf16_string_view().to_utf8_but_should_be_ported_to_utf16();
 
     // 3. Let browsing context be the browsing context whose window handle is reference, or null if no such browsing
     //    context exists.

@@ -12,11 +12,10 @@
 namespace Web::Layout {
 
 class CheckBox final : public ReplacedBox {
-    GC_CELL(CheckBox, ReplacedBox);
-    GC_DECLARE_ALLOCATOR(CheckBox);
+    LAYOUT_NODE(CheckBox, ReplacedBox);
 
 public:
-    CheckBox(DOM::Document&, HTML::HTMLInputElement&, GC::Ref<CSS::ComputedProperties>);
+    CheckBox(DOM::Document&, HTML::HTMLInputElement&, CSS::ComputedProperties const&);
     virtual ~CheckBox() override;
 
 private:

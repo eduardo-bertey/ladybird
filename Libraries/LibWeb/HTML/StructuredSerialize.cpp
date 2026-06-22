@@ -144,14 +144,14 @@ static WebIDL::ExceptionOr<void> serialize_array_buffer(JS::VM& vm, TransferData
             //           [[ArrayBufferMaxByteLength]]: value.[[ArrayBufferMaxByteLength]],
             //           FIXME: [[AgentCluster]]: the surrounding agent's agent cluster }.
             data_holder.encode(ValueTag::GrowableSharedArrayBuffer);
-            data_holder.encode(array_buffer.buffer());
+            data_holder.encode(MUST(ByteBuffer::copy(array_buffer.bytes())));
             data_holder.encode(array_buffer.max_byte_length());
         } else {
             // 4. Otherwise, set serialized to { [[Type]]: "SharedArrayBuffer", [[ArrayBufferData]]: value.[[ArrayBufferData]],
             //           [[ArrayBufferByteLength]]: value.[[ArrayBufferByteLength]],
             //           FIXME: [[AgentCluster]]: the surrounding agent's agent cluster }.
             data_holder.encode(ValueTag::SharedArrayBuffer);
-            data_holder.encode(array_buffer.buffer());
+            data_holder.encode(MUST(ByteBuffer::copy(array_buffer.bytes())));
         }
     }
     // 2. Otherwise:
@@ -168,22 +168,21 @@ static WebIDL::ExceptionOr<void> serialize_array_buffer(JS::VM& vm, TransferData
         auto data_copy = TRY(JS::create_byte_data_block(vm, size));
 
         // 4. Perform CopyDataBlockBytes(dataCopy, 0, value.[[ArrayBufferData]], 0, size).
-        if (array_buffer.is_external())
-            data_copy.overwrite(0, array_buffer.data(), size);
-        else
-            JS::copy_data_block_bytes(data_copy.buffer(), 0, array_buffer.buffer(), 0, size);
+        auto data_copy_bytes = data_copy.bytes();
+        auto array_buffer_bytes = array_buffer.bytes();
+        JS::copy_data_block_bytes(data_copy_bytes, 0, array_buffer_bytes, 0, size);
 
         // 5. If value has an [[ArrayBufferMaxByteLength]] internal slot, then set serialized to { [[Type]]: "ResizableArrayBuffer",
         //    [[ArrayBufferData]]: dataCopy, [[ArrayBufferByteLength]]: size, [[ArrayBufferMaxByteLength]]: value.[[ArrayBufferMaxByteLength]] }.
         if (!array_buffer.is_fixed_length()) {
             data_holder.encode(ValueTag::ResizeableArrayBuffer);
-            data_holder.encode(data_copy.buffer());
+            data_holder.encode(MUST(ByteBuffer::copy(data_copy.bytes())));
             data_holder.encode(array_buffer.max_byte_length());
         }
         // 6. Otherwise, set serialized to { [[Type]]: "ArrayBuffer", [[ArrayBufferData]]: dataCopy, [[ArrayBufferByteLength]]: size }.
         else {
             data_holder.encode(ValueTag::ArrayBuffer);
-            data_holder.encode(data_copy.buffer());
+            data_holder.encode(MUST(ByteBuffer::copy(data_copy.bytes())));
         }
     }
     return {};
@@ -270,6 +269,9 @@ public:
     // https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal
     WebIDL::ExceptionOr<SerializationRecord> serialize(JS::Value value)
     {
+        if (m_vm.did_reach_stack_space_limit())
+            return m_vm.throw_completion<JS::InternalError>(JS::ErrorType::CallStackSizeExceeded);
+
         TransferDataEncoder serialized;
 
         // 2. If memory[value] exists, then return memory[value].
@@ -300,7 +302,7 @@ public:
             serialized.encode(MUST(value.as_bigint().big_integer().to_base(10)));
         } else if (value.is_string()) {
             serialized.encode(ValueTag::StringPrimitive);
-            serialized.encode(value.as_string().utf8_string());
+            serialized.encode(value.as_string().utf16_string());
         } else {
             return_primitive_type = false;
         }
@@ -336,7 +338,7 @@ public:
             // 10. Otherwise, if value has a [[StringData]] internal slot, then set serialized to { [[Type]]: "String", [[StringData]]: value.[[StringData]] }.
             else if (auto const* string_object = as_if<JS::StringObject>(*object)) {
                 serialized.encode(ValueTag::StringObject);
-                serialized.encode(string_object->primitive_string().utf8_string());
+                serialized.encode(string_object->primitive_string().utf16_string());
             }
 
             // 11. Otherwise, if value has a [[DateValue]] internal slot, then set serialized to { [[Type]]: "Date", [[DateValue]]: value.[[DateValue]] }.
@@ -395,7 +397,7 @@ public:
                 // 2. If name is not one of "Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", or "URIError", then set name to "Error".
                 auto type = ErrorType::Error;
                 if (name.is_string())
-                    type = error_name_to_type(name.as_string().utf8_string_view());
+                    type = error_name_to_type(name.as_string().utf16_string_view().to_utf8_but_should_be_ported_to_utf16());
 
                 // 3. Let valueMessageDesc be ? value.[[GetOwnProperty]]("message").
                 auto value_message_descriptor = TRY(object->internal_get_own_property(m_vm.names.message));
@@ -593,6 +595,9 @@ public:
     // https://html.spec.whatwg.org/multipage/structured-data.html#structureddeserialize
     WebIDL::ExceptionOr<JS::Value> deserialize()
     {
+        if (m_vm.did_reach_stack_space_limit())
+            return m_vm.throw_completion<JS::InternalError>(JS::ErrorType::CallStackSizeExceeded);
+
         auto& realm = *m_vm.current_realm();
 
         auto tag = m_serialized.decode<ValueTag>();
@@ -614,7 +619,7 @@ public:
         auto is_primitive = false;
 
         auto decode_string = [&]() {
-            auto string = m_serialized.decode<String>();
+            auto string = m_serialized.decode<Utf16String>();
             return JS::PrimitiveString::create(m_vm, string);
         };
 
@@ -1044,9 +1049,7 @@ WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer
         // 4. If transferable has an [[ArrayBufferData]] internal slot, then:
         if (array_buffer) {
             // 1. If transferable has an [[ArrayBufferMaxByteLength]] internal slot, then:
-            auto buffer_data = array_buffer->is_external()
-                ? MUST(ByteBuffer::copy(array_buffer->bytes()))
-                : ByteBuffer(array_buffer->buffer());
+            auto buffer_data = MUST(ByteBuffer::copy(array_buffer->bytes()));
 
             if (!array_buffer->is_fixed_length()) {
                 // 1. Set dataHolder.[[Type]] to "ResizableArrayBuffer".

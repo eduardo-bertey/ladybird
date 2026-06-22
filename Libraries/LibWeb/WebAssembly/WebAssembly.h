@@ -49,7 +49,12 @@ struct CompiledWebAssemblyModule : public RefCounted<CompiledWebAssemblyModule> 
 };
 
 class WebAssemblyCache {
+    AK_MAKE_NONCOPYABLE(WebAssemblyCache);
+    AK_MAKE_NONMOVABLE(WebAssemblyCache);
+
 public:
+    WebAssemblyCache() = default;
+
     void add_compiled_module(NonnullRefPtr<CompiledWebAssemblyModule> module) { m_compiled_modules.append(module); }
     void add_function_instance(Wasm::FunctionAddress address, GC::Ptr<JS::NativeFunction> function) { m_function_instances.set(address, function); }
     void add_imported_object(GC::Ptr<JS::Object> object) { m_imported_objects.set(object); }
@@ -62,17 +67,20 @@ public:
     }
     void add_global_instance(Wasm::GlobalAddress address, GC::Ptr<WebAssembly::Global> global) { m_global_instances.set(address, global); }
     void add_memory_instance(Wasm::MemoryAddress address, GC::Ptr<WebAssembly::Memory> memory) { m_memory_instances.set(address, memory); }
+    void add_table_instance(Wasm::TableAddress address, GC::Ptr<WebAssembly::Table> table) { m_table_instances.set(address, table); }
 
     Optional<GC::Ptr<JS::NativeFunction>> get_function_instance(Wasm::FunctionAddress address) { return m_function_instances.get(address); }
     Optional<JS::Value> get_extern_value(Wasm::ExternAddress address) { return m_extern_values.get(address); }
     Optional<GC::Ptr<WebAssembly::Global>> get_global_instance(Wasm::GlobalAddress address) { return m_global_instances.get(address); }
     Optional<GC::Ptr<WebAssembly::Memory>> get_memory_instance(Wasm::MemoryAddress address) { return m_memory_instances.get(address); }
+    Optional<GC::Ptr<WebAssembly::Table>> get_table_instance(Wasm::TableAddress address) { return m_table_instances.get(address); }
 
     HashMap<Wasm::FunctionAddress, GC::Ptr<JS::NativeFunction>> const& function_instances() const { return m_function_instances; }
     HashMap<Wasm::ExternAddress, JS::Value> const& extern_values() const { return m_extern_values; }
     HashMap<JS::Value, Wasm::ExternAddress> const& inverse_extern_values() const { return m_inverse_extern_values; }
     HashMap<Wasm::GlobalAddress, GC::Ptr<WebAssembly::Global>> const& global_instances() const { return m_global_instances; }
     HashMap<Wasm::MemoryAddress, GC::Ptr<WebAssembly::Memory>> const& memory_instances() const { return m_memory_instances; }
+    HashMap<Wasm::TableAddress, GC::Ptr<WebAssembly::Table>> const& table_instances() const { return m_table_instances; }
     HashTable<GC::Ptr<JS::Object>> const& imported_objects() const { return m_imported_objects; }
     Wasm::AbstractMachine& abstract_machine() { return m_abstract_machine; }
 
@@ -82,6 +90,7 @@ private:
     HashMap<JS::Value, Wasm::ExternAddress> m_inverse_extern_values;
     HashMap<Wasm::GlobalAddress, GC::Ptr<WebAssembly::Global>> m_global_instances;
     HashMap<Wasm::MemoryAddress, GC::Ptr<WebAssembly::Memory>> m_memory_instances;
+    HashMap<Wasm::TableAddress, GC::Ptr<WebAssembly::Table>> m_table_instances;
     Vector<NonnullRefPtr<CompiledWebAssemblyModule>> m_compiled_modules;
     HashTable<GC::Ptr<JS::Object>> m_imported_objects;
     Wasm::AbstractMachine m_abstract_machine;

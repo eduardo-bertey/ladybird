@@ -14,11 +14,10 @@
 namespace Web::Layout {
 
 class FieldSetBox final : public BlockContainer {
-    GC_CELL(FieldSetBox, BlockContainer);
-    GC_DECLARE_ALLOCATOR(FieldSetBox);
+    LAYOUT_NODE(FieldSetBox, BlockContainer);
 
 public:
-    FieldSetBox(DOM::Document&, DOM::Element&, GC::Ref<CSS::ComputedProperties>);
+    FieldSetBox(DOM::Document&, DOM::Element&, CSS::ComputedProperties const&);
     virtual ~FieldSetBox() override;
 
     DOM::Element& dom_node() { return static_cast<DOM::Element&>(*BlockContainer::dom_node()); }

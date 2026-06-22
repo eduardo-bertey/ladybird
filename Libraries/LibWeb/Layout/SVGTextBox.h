@@ -13,11 +13,10 @@
 namespace Web::Layout {
 
 class SVGTextBox final : public SVGGraphicsBox {
-    GC_CELL(SVGTextBox, SVGGraphicsBox);
-    GC_DECLARE_ALLOCATOR(SVGTextBox);
+    LAYOUT_NODE(SVGTextBox, SVGGraphicsBox);
 
 public:
-    SVGTextBox(DOM::Document&, SVG::SVGTextPositioningElement&, GC::Ref<CSS::ComputedProperties>);
+    SVGTextBox(DOM::Document&, SVG::SVGTextPositioningElement&, CSS::ComputedProperties const&);
     virtual ~SVGTextBox() override = default;
 
     SVG::SVGTextPositioningElement& dom_node() { return static_cast<SVG::SVGTextPositioningElement&>(SVGGraphicsBox::dom_node()); }

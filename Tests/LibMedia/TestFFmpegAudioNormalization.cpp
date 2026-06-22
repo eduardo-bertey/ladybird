@@ -79,7 +79,7 @@ static void decode_and_expect()
 
     auto tracks = TRY_OR_FAIL(demuxer->get_tracks_for_type(Media::TrackType::Audio));
     VERIFY(!tracks.is_empty());
-    auto producer = TRY_OR_FAIL(Media::DecodedAudioProducer::try_create(Core::EventLoop::current_weak(), demuxer, tracks[0]));
+    auto producer = TRY_OR_FAIL(Media::DecodedAudioProducer::try_create(loop, demuxer, tracks[0]));
 
     producer->set_error_handler([&](Media::DecoderError&&) {
         FAIL("An error occurred while decoding generated WAV data.");
@@ -99,16 +99,18 @@ static void decode_and_expect()
             producer->pull(block);
         if (status == Media::PipelineStatus::HaveData) {
             EXPECT(!block.is_empty());
-            for (float sample : block.data()) {
-                EXPECT(sample >= -1.0f);
-                if constexpr (sizeof(Sample) >= sizeof(i32))
-                    EXPECT(sample <= 1.0f);
-                else
-                    EXPECT(sample < 1.0f);
-                if (sample == -1.0f)
-                    saw_negative_full_scale_sample = true;
-                if (sample > 0.0f)
-                    saw_positive_peak_sample = true;
+            for (size_t channel = 0; channel < block.channel_count(); ++channel) {
+                for (float sample : block.channel_data(channel)) {
+                    EXPECT(sample >= -1.0f);
+                    if constexpr (sizeof(Sample) >= sizeof(i32))
+                        EXPECT(sample <= 1.0f);
+                    else
+                        EXPECT(sample < 1.0f);
+                    if (sample == -1.0f)
+                        saw_negative_full_scale_sample = true;
+                    if (sample > 0.0f)
+                        saw_positive_peak_sample = true;
+                }
             }
             decoded_frame_count += block.frame_count();
         } else if (status == Media::PipelineStatus::EndOfStream) {

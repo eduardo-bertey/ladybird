@@ -51,6 +51,24 @@ static Optional<u64> display_id_for_screen(NSScreen* screen)
     return static_cast<u64>([screen_number unsignedLongLongValue]);
 }
 
+static bool is_browser_reserved_key_equivalent(NSEvent* event)
+{
+    auto modifiers = event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagShift);
+    if (modifiers != NSEventModifierFlagCommand)
+        return false;
+
+    auto* characters = [[event charactersIgnoringModifiers] lowercaseString];
+    if ([characters length] != 1)
+        return false;
+
+    unichar character = [characters characterAtIndex:0];
+    return character == 'l'
+        || character == 'n'
+        || character == 'q'
+        || character == 't'
+        || character == 'w';
+}
+
 static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge const& web_view_bridge, Web::DevicePixelPoint widget_position)
 {
     return {
@@ -102,6 +120,10 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
 // To handle key events after dead key processing, we need to hold onto the originating key-down event.
 @property (nonatomic, strong) NSEvent* current_key_down_event;
 
+// Length of the marked text (input-method preedit) currently shown in the focused editable. LibWeb owns the marked-text
+// range and replaces the preedit itself. The UI keeps this length only to answer the NSTextInputClient range queries.
+@property (nonatomic, assign) NSUInteger marked_text_length;
+
 @end
 
 @implementation LadybirdWebView
@@ -115,6 +137,11 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
     }
 
     return self;
+}
+
+- (void)dealloc
+{
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 - (instancetype)initAsChild:(id<LadybirdWebViewObserver>)observer
@@ -155,6 +182,11 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
 
         m_web_view_bridge = MUST(Ladybird::WebViewBridge::create(move(screen_rects), device_pixel_ratio, maximum_frames_per_second, display_id));
         [self setWebViewCallbacks];
+
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(inputSourceDidChange:)
+                                                     name:NSTextInputContextKeyboardSelectionDidChangeNotification
+                                                   object:nil];
 
         self.page_context_menu = Ladybird::create_context_menu(self, [self view].page_context_menu());
         self.link_context_menu = Ladybird::create_context_menu(self, [self view].link_context_menu());
@@ -934,7 +966,7 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
     };
 }
 
-- (void)handleCurrentKeyDownEvent
+- (void)handleCurrentKeyDownEvent:(BOOL)shouldInsertText
 {
     if (!self.current_key_down_event)
         return;
@@ -944,7 +976,7 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
         return;
     }
 
-    auto key_event = Ladybird::ns_event_to_key_event(Web::KeyEvent::Type::KeyDown, self.current_key_down_event);
+    auto key_event = Ladybird::ns_event_to_key_event(Web::KeyEvent::Type::KeyDown, self.current_key_down_event, shouldInsertText);
     m_web_view_bridge->enqueue_input_event(move(key_event));
 
     self.current_key_down_event = nil;
@@ -1282,6 +1314,9 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
     if (self.event_being_redispatched == event) {
         return NO;
     }
+    if (is_browser_reserved_key_equivalent(event)) {
+        return NO;
+    }
 
     [self keyDown:event];
     return YES;
@@ -1375,35 +1410,76 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
 
 - (void)insertText:(id)string replacementRange:(NSRange)replacementRange
 {
-    [self handleCurrentKeyDownEvent];
+    // macOS calls this for both regular typing (the typed character routed through interpretKeyEvents:) and for CJK
+    // input methods committing a composition.
+    //
+    // For regular typing, the original NSEvent in current_key_down_event has the same character. Forward the NSEvent —
+    // so JS sees keydown/keypress/input events (the existing path). For IME commits, the committed text differs from
+    // the trigger key (or there is no current event) — so, route the committed text directly into the focused element.
+    NSString* committed = [string isKindOfClass:[NSAttributedString class]] ? [(NSAttributedString*)string string] : (NSString*)string;
+    NSEvent* event = self.current_key_down_event;
+    bool matches_current_key_event = event && committed.length > 0 && [committed isEqualToString:event.characters];
+    bool has_marked_text = self.marked_text_length > 0;
+    if ((!matches_current_key_event && committed.length > 0) || has_marked_text) {
+        auto utf8 = ByteString { committed.length > 0 ? [committed UTF8String] : "" };
+        m_web_view_bridge->commit_text_from_input_method(Utf16String::from_utf8(utf8));
+        self.marked_text_length = 0;
+        self.current_key_down_event = nil;
+        return;
+    }
+    [self handleCurrentKeyDownEvent:YES];
 }
 
 - (void)doCommandBySelector:(SEL)selector
 {
-    [self handleCurrentKeyDownEvent];
+    [self handleCurrentKeyDownEvent:NO];
 }
 
 - (BOOL)hasMarkedText
 {
-    return NO;
+    return self.marked_text_length > 0;
 }
 
 - (NSRange)markedRange
 {
-    return NSMakeRange(NSNotFound, 0);
+    return self.marked_text_length > 0 ? NSMakeRange(0, self.marked_text_length) : NSMakeRange(NSNotFound, 0);
 }
 
 - (NSRange)selectedRange
 {
-    return NSMakeRange(NSNotFound, 0);
+    // We present the input method with a virtual text model whose marked text occupies [0, marked_text_length) with
+    // the caret at its end; keep selectedRange consistent with markedRange, so the IME's range bookkeeping is coherent.
+    return NSMakeRange(self.marked_text_length, 0);
 }
 
 - (void)setMarkedText:(id)string selectedRange:(NSRange)selectedRange replacementRange:(NSRange)replacementRange
 {
+    // Called by the input method as the user types each composing character. We present inline preedit by inserting the
+    // marked text into the focused editable. LibWeb owns the marked-text range and replaces the previous preedit on
+    // each subsequent setMarkedText, or on commit (insertText) or abort (unmarkText). We keep marked_text_length only
+    // to answer the NSTextInputClient range queries (markedRange/selectedRange/hasMarkedText).
+    NSString* preedit = [string isKindOfClass:[NSAttributedString class]] ? [(NSAttributedString*)string string] : (NSString*)string;
+    auto utf8 = ByteString { preedit.length > 0 ? [preedit UTF8String] : "" };
+    m_web_view_bridge->set_marked_text_from_input_method(Utf16String::from_utf8(utf8));
+    self.marked_text_length = preedit.length;
 }
 
 - (void)unmarkText
 {
+    // Per the NSTextInputClient contract, unmarkText finalizes (commits) the marked text in place. Tell LibWeb to end
+    // the composition — keeping the inserted text, and forgetting our marked-text length.
+    m_web_view_bridge->unmark_text_from_input_method();
+    self.marked_text_length = 0;
+}
+
+- (void)inputSourceDidChange:(NSNotification*)notification
+{
+    // When the keyboard input source changes mid-composition, the input method may not send a commit/abort callback for
+    // our pending preedit. Finalize it in place: end the composition in LibWeb (keeping the text), and forget the
+    // marked-text length — so a later composition doesn't replace the wrong characters.
+    (void)notification;
+    m_web_view_bridge->unmark_text_from_input_method();
+    self.marked_text_length = 0;
 }
 
 - (NSArray<NSAttributedStringKey>*)validAttributesForMarkedText
@@ -1423,7 +1499,22 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
 
 - (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange
 {
-    return NSZeroRect;
+    // Tells macOS where to anchor IME overlays (candidate window, accent menu, etc.). Otherwise, without this, the
+    // overlays appear in the bottom-left corner of the screen — since NSZeroRect anchors at screen origin.
+    auto caret_rect = m_web_view_bridge->get_input_caret_rect();
+    if (!caret_rect.has_value())
+        return NSZeroRect;
+
+    auto dpr = m_web_view_bridge->device_pixel_ratio();
+    NSRect view_rect = NSMakeRect(
+        caret_rect->x().value() / dpr,
+        caret_rect->y().value() / dpr,
+        caret_rect->width().value() / dpr,
+        caret_rect->height().value() / dpr);
+
+    // Convert: view coords (flipped, top-left origin) → window coords → screen coords.
+    NSRect window_rect = [self convertRect:view_rect toView:nil];
+    return [[self window] convertRectToScreen:window_rect];
 }
 
 #pragma mark - NSDraggingDestination

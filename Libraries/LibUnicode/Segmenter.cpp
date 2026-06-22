@@ -8,7 +8,6 @@
 #include <AK/GenericShorthands.h>
 #include <AK/OwnPtr.h>
 #include <AK/Utf16View.h>
-#include <AK/Utf32View.h>
 #include <LibUnicode/CharacterTypes.h>
 #include <LibUnicode/ICU.h>
 #include <LibUnicode/Locale.h>
@@ -33,17 +32,30 @@ SegmenterGranularity segmenter_granularity_from_string(StringView segmenter_gran
     VERIFY_NOT_REACHED();
 }
 
-StringView segmenter_granularity_to_string(SegmenterGranularity segmenter_granularity)
+SegmenterGranularity segmenter_granularity_from_string(Utf16View segmenter_granularity)
+{
+    if (segmenter_granularity == "grapheme"sv)
+        return SegmenterGranularity::Grapheme;
+    if (segmenter_granularity == "line"sv)
+        return SegmenterGranularity::Line;
+    if (segmenter_granularity == "sentence"sv)
+        return SegmenterGranularity::Sentence;
+    if (segmenter_granularity == "word"sv)
+        return SegmenterGranularity::Word;
+    VERIFY_NOT_REACHED();
+}
+
+Utf16String segmenter_granularity_to_string(SegmenterGranularity segmenter_granularity)
 {
     switch (segmenter_granularity) {
     case SegmenterGranularity::Grapheme:
-        return "grapheme"sv;
+        return "grapheme"_utf16;
     case SegmenterGranularity::Line:
-        return "line"sv;
+        return "line"_utf16;
     case SegmenterGranularity::Sentence:
-        return "sentence"sv;
+        return "sentence"_utf16;
     case SegmenterGranularity::Word:
-        return "word"sv;
+        return "word"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -107,12 +119,6 @@ public:
     virtual void for_each_boundary(Utf16View const& text, SegmentationCallback callback) override
     {
         set_segmented_text(text);
-        for_each_boundary_impl(callback);
-    }
-
-    virtual void for_each_boundary(Utf32View const& text, SegmentationCallback callback) override
-    {
-        m_length = text.length();
         for_each_boundary_impl(callback);
     }
 
@@ -491,11 +497,6 @@ public:
         iterate(callback);
     }
 
-    virtual void for_each_boundary(Utf32View const&, SegmentationCallback) override
-    {
-        VERIFY_NOT_REACHED();
-    }
-
     virtual bool is_current_boundary_word_like() const override
     {
         return false;
@@ -628,30 +629,6 @@ public:
         for_each_boundary(move(callback));
     }
 
-    virtual void for_each_boundary(Utf32View const& text, SegmentationCallback callback) override
-    {
-        if (text.is_empty())
-            return;
-
-        // FIXME: We should be able to create a custom UText provider to avoid converting to UTF-8 here.
-        set_segmented_text(MUST(String::formatted("{}", text)));
-
-        auto code_points = m_segmented_text.get<String>().code_points();
-        auto current = code_points.begin();
-        size_t code_point_index = 0;
-
-        for_each_boundary([&](auto index) {
-            auto it = code_points.iterator_at_byte_offset(index);
-
-            while (current != it) {
-                ++code_point_index;
-                ++current;
-            }
-
-            return callback(code_point_index);
-        });
-    }
-
     virtual bool is_current_boundary_word_like() const override
     {
         auto status = m_segmenter->getRuleStatus();
@@ -714,11 +691,11 @@ NonnullOwnPtr<Segmenter> Segmenter::create(SegmenterGranularity segmenter_granul
     return Segmenter::create(default_locale(), segmenter_granularity);
 }
 
-NonnullOwnPtr<Segmenter> Segmenter::create(StringView locale, SegmenterGranularity segmenter_granularity)
+NonnullOwnPtr<Segmenter> Segmenter::create(Utf16View locale, SegmenterGranularity segmenter_granularity)
 {
     UErrorCode status = U_ZERO_ERROR;
 
-    auto locale_data = LocaleData::for_locale(locale);
+    auto locale_data = LocaleData::for_locale(locale.bytes());
     VERIFY(locale_data.has_value());
 
     auto segmenter = adopt_own_if_nonnull([&]() {

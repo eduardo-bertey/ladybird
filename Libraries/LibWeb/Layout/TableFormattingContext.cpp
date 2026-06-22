@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NeverDestroyed.h>
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/HTMLTableColElement.h>
@@ -59,7 +60,7 @@ static inline bool is_table_column(Box const& box)
 CSSPixels TableFormattingContext::run_caption_layout(CSS::CaptionSide phase, AvailableSpace const& caption_available_space)
 {
     CSSPixels caption_height = 0;
-    for (auto* child = table_box().first_child(); child; child = child->next_sibling()) {
+    for (auto child = table_box().first_child(); child; child = child->next_sibling()) {
         if (!child->display().is_table_caption() || child->computed_values().caption_side() != phase) {
             continue;
         }
@@ -122,14 +123,14 @@ void TableFormattingContext::compute_constrainedness()
     });
 
     for (auto& row : m_rows) {
-        auto const& computed_values = row.box->computed_values();
+        auto const& computed_values = row.box.computed_values();
         if (computed_values.height().is_length()) {
             row.is_constrained = true;
         }
     }
 
     for (auto& cell : m_cells) {
-        auto const& computed_values = cell.box->computed_values();
+        auto const& computed_values = cell.box.computed_values();
         if (computed_values.width().is_length()) {
             m_columns[cell.column_index].is_constrained = true;
         }
@@ -149,7 +150,7 @@ void TableFormattingContext::compute_cell_measures(RowMeasurement row_measuremen
     compute_constrainedness();
 
     for (auto& cell : m_cells) {
-        auto const& computed_values = cell.box->computed_values();
+        auto const& computed_values = cell.box.computed_values();
         CSSPixels padding_top = computed_values.padding().top().to_px_or_zero(cell.box, containing_block_height);
         CSSPixels padding_bottom = computed_values.padding().bottom().to_px_or_zero(cell.box, containing_block_height);
         CSSPixels padding_left = computed_values.padding().left().to_px_or_zero(cell.box, containing_block_width);
@@ -245,7 +246,7 @@ void TableFormattingContext::compute_outer_content_sizes()
     });
 
     for (auto& row : m_rows) {
-        auto const& computed_values = row.box->computed_values();
+        auto const& computed_values = row.box.computed_values();
         auto min_height = computed_values.min_height().to_px(row.box, containing_block_height);
         auto max_height = computed_values.max_height().is_length() ? computed_values.max_height().to_px(row.box, containing_block_height) : CSSPixels::max();
         auto height = computed_values.height().to_px(row.box, containing_block_height);
@@ -262,7 +263,7 @@ void TableFormattingContext::initialize_table_measures<TableFormattingContext::R
     auto containing_block_height = table_wrapper_containing_block_height();
 
     for (auto& cell : m_cells) {
-        auto const& computed_values = cell.box->computed_values();
+        auto const& computed_values = cell.box.computed_values();
         if (cell.row_span == 1) {
             auto specified_height = computed_values.height().to_px(cell.box, containing_block_height);
             // https://www.w3.org/TR/css-tables-3/#row-layout makes specified cell height part of the initialization formula for row table measures:
@@ -485,7 +486,7 @@ CSSPixels TableFormattingContext::compute_capmin()
     // https://drafts.csswg.org/css-tables-3/#computing-the-table-width
     CSSPixels capmin = 0;
     auto width_of_table_wrapper_containing_block = table_wrapper_containing_block_width();
-    for (auto* child = table_box().first_child(); child; child = child->next_sibling()) {
+    for (auto child = table_box().first_child(); child; child = child->next_sibling()) {
         if (!child->display().is_table_caption()) {
             continue;
         }
@@ -603,7 +604,7 @@ void TableFormattingContext::compute_table_width()
         // A percentage value for a column width is relative to the table width. If the table has 'width: auto',
         // a percentage represents a constraint on the column's width, which a UA should try to satisfy.
         for (auto& cell : m_cells) {
-            auto const& cell_width = cell.box->computed_values().width();
+            auto const& cell_width = cell.box.computed_values().width();
             if (cell_width.is_percentage()) {
                 CSSPixels adjusted_used_width = undistributable_space;
                 if (cell_width.percentage().value() != 0)
@@ -952,7 +953,7 @@ bool TableFormattingContext::can_skip_row_intrinsic_measurement() const
         if (row.is_collapsed)
             return false;
 
-        auto const& computed_values = row.box->computed_values();
+        auto const& computed_values = row.box.computed_values();
         if (!computed_values.height().is_auto()
             || !computed_values.min_height().is_auto()
             || !computed_values.max_height().is_none()) {
@@ -964,7 +965,7 @@ bool TableFormattingContext::can_skip_row_intrinsic_measurement() const
         if (cell.row_span != 1)
             return false;
 
-        auto const& computed_values = cell.box->computed_values();
+        auto const& computed_values = cell.box.computed_values();
         if (!computed_values.height().is_auto()
             || !computed_values.min_height().is_auto()
             || !computed_values.max_height().is_none()) {
@@ -983,9 +984,9 @@ void TableFormattingContext::compute_table_height()
             row.base_height = 0;
             continue;
         }
-        auto row_computed_height = row.box->computed_values().height();
+        auto row_computed_height = row.box.computed_values().height();
         if (row_computed_height.is_length()) {
-            auto height_of_containing_block = m_state.get(*row.box->containing_block()).content_height();
+            auto height_of_containing_block = m_state.get(*row.box.containing_block()).content_height();
             auto row_used_height = row_computed_height.to_px(row.box, height_of_containing_block);
             row.base_height = max(row.base_height, row_used_height);
         }
@@ -1003,20 +1004,20 @@ void TableFormattingContext::compute_table_height()
         auto width_of_containing_block = cell_state.containing_block_used_values()->content_width();
         auto height_of_containing_block = cell_state.containing_block_used_values()->content_height();
 
-        cell_state.padding_top = cell.box->computed_values().padding().top().to_px_or_zero(cell.box, width_of_containing_block);
-        cell_state.padding_bottom = cell.box->computed_values().padding().bottom().to_px_or_zero(cell.box, width_of_containing_block);
-        cell_state.padding_left = cell.box->computed_values().padding().left().to_px_or_zero(cell.box, width_of_containing_block);
-        cell_state.padding_right = cell.box->computed_values().padding().right().to_px_or_zero(cell.box, width_of_containing_block);
+        cell_state.padding_top = cell.box.computed_values().padding().top().to_px_or_zero(cell.box, width_of_containing_block);
+        cell_state.padding_bottom = cell.box.computed_values().padding().bottom().to_px_or_zero(cell.box, width_of_containing_block);
+        cell_state.padding_left = cell.box.computed_values().padding().left().to_px_or_zero(cell.box, width_of_containing_block);
+        cell_state.padding_right = cell.box.computed_values().padding().right().to_px_or_zero(cell.box, width_of_containing_block);
 
         if (table_box().computed_values().border_collapse() == CSS::BorderCollapse::Separate) {
-            cell_state.border_top = cell.box->computed_values().border_top().width;
-            cell_state.border_bottom = cell.box->computed_values().border_bottom().width;
-            cell_state.border_left = cell.box->computed_values().border_left().width;
-            cell_state.border_right = cell.box->computed_values().border_right().width;
+            cell_state.border_top = cell.box.computed_values().border_top().width;
+            cell_state.border_bottom = cell.box.computed_values().border_bottom().width;
+            cell_state.border_left = cell.box.computed_values().border_left().width;
+            cell_state.border_right = cell.box.computed_values().border_right().width;
         }
 
         if (!row.is_collapsed) {
-            auto cell_computed_height = cell.box->computed_values().height();
+            auto cell_computed_height = cell.box.computed_values().height();
             if (cell_computed_height.is_length()) {
                 auto cell_used_height = cell_computed_height.to_px(cell.box, height_of_containing_block);
                 cell_state.set_content_height(cell_used_height - cell_state.border_box_top() - cell_state.border_box_bottom());
@@ -1036,7 +1037,10 @@ void TableFormattingContext::compute_table_height()
             independent_formatting_context->parent_context_did_dimension_child_root_box();
         }
 
-        cell.baseline = box_baseline(cell.box);
+        // https://drafts.csswg.org/css2/#height-layout
+        // The baseline of a cell is the baseline of the first in-flow line box in the cell, or the first in-flow
+        // table-row in the cell, whichever comes first.
+        cell.baseline = box_baseline(cell.box, BaselineSet::First);
 
         // Implements https://www.w3.org/TR/css-tables-3/#computing-the-table-height
 
@@ -1093,7 +1097,7 @@ void TableFormattingContext::compute_table_height()
             row.reference_height = 0;
             continue;
         }
-        auto row_computed_height = row.box->computed_values().height();
+        auto row_computed_height = row.box.computed_values().height();
         if (row_computed_height.is_percentage()) {
             auto row_used_height = row_computed_height.to_px(row.box, m_table_height);
             row.reference_height = max(row.reference_height, row_used_height);
@@ -1112,7 +1116,7 @@ void TableFormattingContext::compute_table_height()
         for (size_t i = 0; i < cell.column_span; ++i)
             span_width += m_columns[cell.column_index + i].used_width;
 
-        auto cell_computed_height = cell.box->computed_values().height();
+        auto cell_computed_height = cell.box.computed_values().height();
         if (cell_computed_height.is_percentage()) {
             auto cell_used_height = cell_computed_height.to_px(cell.box, m_table_height);
             cell_state.set_content_height(cell_used_height - cell_state.border_box_top() - cell_state.border_box_bottom());
@@ -1128,7 +1132,7 @@ void TableFormattingContext::compute_table_height()
             independent_formatting_context->parent_context_did_dimension_child_root_box();
         }
 
-        cell.baseline = box_baseline(cell.box);
+        cell.baseline = box_baseline(cell.box, BaselineSet::First);
 
         if (!row.is_collapsed) {
             row.reference_height = max(row.reference_height, cell_state.border_box_height());
@@ -1152,7 +1156,7 @@ void TableFormattingContext::distribute_height_to_rows()
 
     Vector<Row&> rows_with_auto_height;
     for (auto& row : m_rows) {
-        if (row.box->computed_values().height().is_auto() && !row.is_collapsed) {
+        if (row.box.computed_values().height().is_auto() && !row.is_collapsed) {
             rows_with_auto_height.append(row);
         }
     }
@@ -1268,9 +1272,9 @@ void TableFormattingContext::position_cell_boxes()
     // wrapped in an anonymous table-cell box per CSS Tables 3), the cell should be aligned to the top. This allows
     // the flex/grid container to fill the cell and handle alignment of its children via its own properties.
     auto cell_is_anonymous_wrapper_for_flex_or_grid = [](auto const& cell) {
-        if (!cell.box->is_anonymous())
+        if (!cell.box.is_anonymous())
             return false;
-        auto const* child = cell.box->first_child();
+        auto child = cell.box.first_child();
         if (!child || child->next_sibling())
             return false;
         auto const& display = child->computed_values().display();
@@ -1281,7 +1285,7 @@ void TableFormattingContext::position_cell_boxes()
         auto& cell_state = m_state.get_mutable(cell.box);
         auto& row_state = m_state.get(m_rows[cell.row_index].box);
         auto const row_content_height = compute_row_content_height(cell);
-        auto const& vertical_align = cell.box->computed_values().vertical_align();
+        auto const& vertical_align = cell.box.computed_values().vertical_align();
         // The following image shows various alignment lines of a row:
         // https://www.w3.org/TR/css-tables-3/images/cell-align-explainer.png
         // https://drafts.csswg.org/css2/#height-layout
@@ -1348,7 +1352,7 @@ bool TableFormattingContext::border_is_less_specific(CSS::BorderData const& a, C
 {
     // Implements criteria for steps 1, 2 and 3 of border conflict resolution algorithm, as described in
     // https://www.w3.org/TR/CSS22/tables.html#border-conflict-resolution.
-    static HashMap<CSS::LineStyle, unsigned> const line_style_score = {
+    static NeverDestroyed<HashMap<CSS::LineStyle, unsigned>> line_style_score { HashMap<CSS::LineStyle, unsigned> {
         { CSS::LineStyle::Inset, 0 },
         { CSS::LineStyle::Groove, 1 },
         { CSS::LineStyle::Outset, 2 },
@@ -1357,7 +1361,7 @@ bool TableFormattingContext::border_is_less_specific(CSS::BorderData const& a, C
         { CSS::LineStyle::Dashed, 5 },
         { CSS::LineStyle::Solid, 6 },
         { CSS::LineStyle::Double, 7 },
-    };
+    } };
 
     // 1. Borders with the 'border-style' of 'hidden' take precedence over all other conflicting borders. Any border with this
     //    value suppresses all borders at this location.
@@ -1385,9 +1389,9 @@ bool TableFormattingContext::border_is_less_specific(CSS::BorderData const& a, C
     } else if (a.width < b.width) {
         return true;
     }
-    if (*line_style_score.get(a.line_style) > *line_style_score.get(b.line_style)) {
+    if (*line_style_score->get(a.line_style) > *line_style_score->get(b.line_style)) {
         return false;
-    } else if (*line_style_score.get(a.line_style) < *line_style_score.get(b.line_style)) {
+    } else if (*line_style_score->get(a.line_style) < *line_style_score->get(b.line_style)) {
         return true;
     }
     return false;
@@ -1475,7 +1479,7 @@ void TableFormattingContext::border_conflict_resolution()
         }
         Painting::PaintableBox::BordersDataWithElementKind override_borders_data;
         ConflictingEdge winning_edge_left {
-            .element = cell.box,
+            .element = &cell.box,
             .element_kind = Painting::PaintableBox::ConflictingElementKind::Cell,
             .side = ConflictingSide::Left,
             .row = cell.row_index,
@@ -1487,7 +1491,7 @@ void TableFormattingContext::border_conflict_resolution()
         override_borders_data.left = border_data_with_element_kind_from_conflicting_edge(winning_edge_left);
         cell_state.border_left = override_borders_data.left.border_data.width;
         ConflictingEdge winning_edge_right {
-            .element = cell.box,
+            .element = &cell.box,
             .element_kind = Painting::PaintableBox::ConflictingElementKind::Cell,
             .side = ConflictingSide::Right,
             .row = cell.row_index,
@@ -1499,7 +1503,7 @@ void TableFormattingContext::border_conflict_resolution()
         override_borders_data.right = border_data_with_element_kind_from_conflicting_edge(winning_edge_right);
         cell_state.border_right = override_borders_data.right.border_data.width;
         ConflictingEdge winning_edge_top {
-            .element = cell.box,
+            .element = &cell.box,
             .element_kind = Painting::PaintableBox::ConflictingElementKind::Cell,
             .side = ConflictingSide::Top,
             .row = cell.row_index,
@@ -1511,7 +1515,7 @@ void TableFormattingContext::border_conflict_resolution()
         override_borders_data.top = border_data_with_element_kind_from_conflicting_edge(winning_edge_top);
         cell_state.border_top = override_borders_data.top.border_data.width;
         ConflictingEdge winning_edge_bottom {
-            .element = cell.box,
+            .element = &cell.box,
             .element_kind = Painting::PaintableBox::ConflictingElementKind::Cell,
             .side = ConflictingSide::Bottom,
             .row = cell.row_index,
@@ -1571,11 +1575,11 @@ void TableFormattingContext::BorderConflictFinder::collect_conflicting_col_eleme
 {
     m_col_elements_by_index.resize(m_context->m_columns.size());
     size_t column_index = 0;
-    for (auto* child = m_context->table_box().first_child(); child; child = child->next_sibling()) {
+    for (auto child = m_context->table_box().first_child(); child; child = child->next_sibling()) {
         if (!child->display().is_table_column_group()) {
             continue;
         }
-        for (auto* child_of_column_group = child->first_child(); child_of_column_group; child_of_column_group = child_of_column_group->next_sibling()) {
+        for (auto child_of_column_group = child->first_child(); child_of_column_group; child_of_column_group = child_of_column_group->next_sibling()) {
             VERIFY(child_of_column_group->display().is_table_column());
             auto const& col_node = static_cast<HTML::HTMLElement const&>(*child_of_column_group->dom_node());
             unsigned span = col_node.get_attribute_value(HTML::AttributeNames::span).to_number<unsigned>().value_or(1);
@@ -1615,7 +1619,7 @@ void TableFormattingContext::BorderConflictFinder::collect_cell_conflicting_edge
         auto left_cell_column_index = cell.column_index - cell.column_span;
         auto maybe_cell_to_left = m_context->m_cells_by_coordinate[cell.row_index][left_cell_column_index];
         if (maybe_cell_to_left.has_value()) {
-            result.append({ maybe_cell_to_left->box, Painting::PaintableBox::ConflictingElementKind::Cell, ConflictingSide::Right, cell.row_index, left_cell_column_index });
+            result.append({ &maybe_cell_to_left->box, Painting::PaintableBox::ConflictingElementKind::Cell, ConflictingSide::Right, cell.row_index, left_cell_column_index });
         }
     }
     // Left edge of the cell to the right.
@@ -1623,7 +1627,7 @@ void TableFormattingContext::BorderConflictFinder::collect_cell_conflicting_edge
         auto right_cell_column_index = cell.column_index + cell.column_span;
         auto maybe_cell_to_right = m_context->m_cells_by_coordinate[cell.row_index][right_cell_column_index];
         if (maybe_cell_to_right.has_value()) {
-            result.append({ maybe_cell_to_right->box, Painting::PaintableBox::ConflictingElementKind::Cell, ConflictingSide::Left, cell.row_index, right_cell_column_index });
+            result.append({ &maybe_cell_to_right->box, Painting::PaintableBox::ConflictingElementKind::Cell, ConflictingSide::Left, cell.row_index, right_cell_column_index });
         }
     }
     // Bottom edge of the cell above.
@@ -1631,7 +1635,7 @@ void TableFormattingContext::BorderConflictFinder::collect_cell_conflicting_edge
         auto above_cell_row_index = cell.row_index - cell.row_span;
         auto maybe_cell_above = m_context->m_cells_by_coordinate[above_cell_row_index][cell.column_index];
         if (maybe_cell_above.has_value()) {
-            result.append({ maybe_cell_above->box, Painting::PaintableBox::ConflictingElementKind::Cell, ConflictingSide::Bottom, above_cell_row_index, cell.column_index });
+            result.append({ &maybe_cell_above->box, Painting::PaintableBox::ConflictingElementKind::Cell, ConflictingSide::Bottom, above_cell_row_index, cell.column_index });
         }
     }
     // Top edge of the cell below.
@@ -1639,7 +1643,7 @@ void TableFormattingContext::BorderConflictFinder::collect_cell_conflicting_edge
         auto below_cell_row_index = cell.row_index + cell.row_span;
         auto maybe_cell_below = m_context->m_cells_by_coordinate[below_cell_row_index][cell.column_index];
         if (maybe_cell_below.has_value()) {
-            result.append({ maybe_cell_below->box, Painting::PaintableBox::ConflictingElementKind::Cell, ConflictingSide::Top, below_cell_row_index, cell.column_index });
+            result.append({ &maybe_cell_below->box, Painting::PaintableBox::ConflictingElementKind::Cell, ConflictingSide::Top, below_cell_row_index, cell.column_index });
         }
     }
 }
@@ -1648,21 +1652,21 @@ void TableFormattingContext::BorderConflictFinder::collect_row_conflicting_edges
 {
     // Top edge of the row.
     if (edge == ConflictingSide::Top) {
-        result.append({ m_context->m_rows[cell.row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Top, cell.row_index, {} });
+        result.append({ &m_context->m_rows[cell.row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Top, cell.row_index, {} });
     }
     // Bottom edge of the row.
     if (edge == ConflictingSide::Bottom) {
-        result.append({ m_context->m_rows[cell.row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Bottom, cell.row_index, {} });
+        result.append({ &m_context->m_rows[cell.row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Bottom, cell.row_index, {} });
     }
     // Bottom edge of the row above.
     if (cell.row_index >= cell.row_span && edge == ConflictingSide::Top) {
         auto above_row_index = cell.row_index - cell.row_span;
-        result.append({ m_context->m_rows[above_row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Bottom, above_row_index, {} });
+        result.append({ &m_context->m_rows[above_row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Bottom, above_row_index, {} });
     }
     // Top edge of the row below.
     if (cell.row_index + cell.row_span < m_context->m_rows.size() && edge == ConflictingSide::Bottom) {
         auto below_row_index = cell.row_index + cell.row_span;
-        result.append({ m_context->m_rows[below_row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Top, below_row_index, {} });
+        result.append({ &m_context->m_rows[below_row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Top, below_row_index, {} });
     }
 }
 
@@ -1731,7 +1735,7 @@ void TableFormattingContext::BorderConflictFinder::collect_table_box_conflicting
     }
     // Left edge from row group or table. Top and bottom edges of the row group are handled in collect_row_group_conflicting_edges.
     if (cell.column_index == 0 && edge == ConflictingSide::Left) {
-        result.append({ m_context->m_rows[cell.row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Left, cell.row_index, {} });
+        result.append({ &m_context->m_rows[cell.row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Left, cell.row_index, {} });
         if (m_row_group_elements_by_index[cell.row_index].has_value()) {
             result.append({ m_row_group_elements_by_index[cell.row_index]->row_group, Painting::PaintableBox::ConflictingElementKind::RowGroup, ConflictingSide::Left, cell.row_index, {} });
         }
@@ -1739,7 +1743,7 @@ void TableFormattingContext::BorderConflictFinder::collect_table_box_conflicting
     }
     // Right edge from row group or table. Top and bottom edges of the row group are handled in collect_row_group_conflicting_edges.
     if (cell.column_index + cell.column_span == m_context->m_columns.size() && edge == ConflictingSide::Right) {
-        result.append({ m_context->m_rows[cell.row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Right, cell.row_index, {} });
+        result.append({ &m_context->m_rows[cell.row_index].box, Painting::PaintableBox::ConflictingElementKind::Row, ConflictingSide::Right, cell.row_index, {} });
         if (m_row_group_elements_by_index[cell.row_index].has_value()) {
             result.append({ m_row_group_elements_by_index[cell.row_index]->row_group, Painting::PaintableBox::ConflictingElementKind::RowGroup, ConflictingSide::Right, cell.row_index, {} });
         }
@@ -1931,7 +1935,7 @@ template<>
 double TableFormattingContext::cell_percentage_contribution<TableFormattingContext::Row>(TableFormattingContext::Cell const& cell)
 {
     // Definition of percentage contribution: https://www.w3.org/TR/css-tables-3/#percentage-contribution
-    auto const& computed_values = cell.box->computed_values();
+    auto const& computed_values = cell.box.computed_values();
     auto max_height_percentage = computed_values.max_height().is_percentage() ? computed_values.max_height().percentage().value() : static_cast<double>(INFINITY);
     auto height_percentage = computed_values.height().is_percentage() ? computed_values.height().percentage().value() : 0;
     return min(height_percentage, max_height_percentage);
@@ -1941,7 +1945,7 @@ template<>
 double TableFormattingContext::cell_percentage_contribution<TableFormattingContext::Column>(TableFormattingContext::Cell const& cell)
 {
     // Definition of percentage contribution: https://www.w3.org/TR/css-tables-3/#percentage-contribution
-    auto const& computed_values = cell.box->computed_values();
+    auto const& computed_values = cell.box.computed_values();
     auto max_width_percentage = computed_values.max_width().is_percentage() ? computed_values.max_width().percentage().value() : static_cast<double>(INFINITY);
     auto width_percentage = computed_values.width().is_percentage() ? computed_values.width().percentage().value() : 0;
     return min(width_percentage, max_width_percentage);
@@ -1950,20 +1954,20 @@ double TableFormattingContext::cell_percentage_contribution<TableFormattingConte
 template<>
 bool TableFormattingContext::cell_has_intrinsic_percentage<TableFormattingContext::Row>(TableFormattingContext::Cell const& cell)
 {
-    return cell.box->computed_values().height().is_percentage();
+    return cell.box.computed_values().height().is_percentage();
 }
 
 template<>
 bool TableFormattingContext::cell_has_intrinsic_percentage<TableFormattingContext::Column>(TableFormattingContext::Cell const& cell)
 {
-    return cell.box->computed_values().width().is_percentage();
+    return cell.box.computed_values().width().is_percentage();
 }
 
 template<>
 void TableFormattingContext::initialize_intrinsic_percentages_from_rows_or_columns<TableFormattingContext::Row>()
 {
     for (auto& row : m_rows) {
-        auto const& computed_values = row.box->computed_values();
+        auto const& computed_values = row.box.computed_values();
         // Definition of percentage contribution: https://www.w3.org/TR/css-tables-3/#percentage-contribution
         auto max_height_percentage = computed_values.max_height().is_percentage() ? computed_values.max_height().percentage().value() : static_cast<double>(INFINITY);
         auto height_percentage = computed_values.height().is_percentage() ? computed_values.height().percentage().value() : 0;

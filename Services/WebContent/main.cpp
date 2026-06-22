@@ -15,7 +15,6 @@
 #include <LibCrypto/OpenSSLForward.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/Font/PathFontProvider.h>
-#include <LibGfx/SkiaBackendContext.h>
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibMain/Main.h>
@@ -37,6 +36,7 @@
 #include <LibWebView/Plugins/ImageCodecPlugin.h>
 #include <LibWebView/SiteIsolation.h>
 #include <LibWebView/Utilities.h>
+#include <Services/RendererSandbox.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/WebContentCompositorHost.h>
@@ -84,7 +84,7 @@ static void crash_signal_handler(int signo)
     }
     warnln("\n\033[31;1mCRASH\033[0m: Received signal {} ({})", name, signo);
     dump_backtrace(2, 100);
-    exit(128 + signo);
+    Core::Process::terminate_immediately(128 + signo);
 }
 
 static void install_crash_signal_handlers()
@@ -127,7 +127,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         return -1;
     }
 
-    Core::EventLoop event_loop;
+    auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
     WebView::platform_init();
 
@@ -144,12 +144,13 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     bool disable_site_isolation = false;
     bool enable_idl_tracing = false;
     bool enable_http_memory_cache = false;
-    bool force_cpu_painting = false;
     bool force_fontconfig = false;
     bool collect_garbage_on_every_allocation = false;
     bool is_headless = false;
     bool disable_scrollbar_painting = false;
     bool disable_async_scrolling = false;
+    bool disable_sandbox = false;
+    bool report_session_history_updates_in_test_mode = false;
     StringView echo_server_port_string_view {};
     StringView default_time_zone {};
     StringView style_invalidation_counter_dump_interval {};
@@ -167,11 +168,12 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(disable_site_isolation, "Disable site isolation", "disable-site-isolation");
     args_parser.add_option(enable_idl_tracing, "Enable IDL tracing", "enable-idl-tracing");
     args_parser.add_option(enable_http_memory_cache, "Enable HTTP cache", "enable-http-memory-cache");
-    args_parser.add_option(force_cpu_painting, "Force CPU painting", "force-cpu-painting");
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation");
     args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical viewport scrollbars", "disable-scrollbar-painting");
     args_parser.add_option(disable_async_scrolling, "Disable async scrolling", "disable-async-scrolling");
+    args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
+    args_parser.add_option(report_session_history_updates_in_test_mode, "Report session history updates in test mode", "report-session-history-updates-in-test-mode");
     args_parser.add_option(echo_server_port_string_view, "Echo server port used in test internals", "echo-server-port", 0, "echo_server_port");
     args_parser.add_option(is_headless, "Report that the browser is running in headless mode", "headless");
     args_parser.add_option(default_time_zone, "Default time zone", "default-time-zone", 0, "time-zone-id");
@@ -205,14 +207,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     }
     font_provider.load_all_fonts_from_uri("resource://fonts"sv);
 
-    // Always use the CPU backend for tests, as the GPU backend is not deterministic
-    if (force_cpu_painting) {
-        WebContent::PageClient::set_use_skia_painter(WebContent::PageClient::UseSkiaPainter::CPUBackend);
-    } else {
-        Gfx::SkiaBackendContext::initialize_gpu_backend();
-        WebContent::PageClient::set_use_skia_painter(WebContent::PageClient::UseSkiaPainter::GPUBackendIfAvailable);
-    }
-
     WebContent::PageClient::set_is_headless(is_headless);
 
     if (disable_site_isolation)
@@ -223,6 +217,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     Web::Painting::set_paint_viewport_scrollbars(!disable_scrollbar_painting);
     WebContent::PageClient::set_async_scrolling_enabled(!disable_async_scrolling);
+    WebContent::PageClient::set_should_report_session_history_updates_in_test_mode(report_session_history_updates_in_test_mode);
 
     if (!echo_server_port_string_view.is_empty()) {
         if (auto maybe_echo_server_port = echo_server_port_string_view.to_number<u16>(); maybe_echo_server_port.has_value())
@@ -255,6 +250,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto maybe_content_blocker_error = load_content_blockers(config_path);
     if (maybe_content_blocker_error.is_error())
         dbgln("Failed to load content blockers: {}", maybe_content_blocker_error.error());
+
+    if (!disable_sandbox)
+        TRY(RendererSandbox::apply_sandbox(config_path));
 
 #if defined(AK_OS_MACOS)
     auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));

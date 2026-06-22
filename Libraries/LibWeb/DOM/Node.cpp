@@ -10,7 +10,9 @@
 
 #include <AK/HashTable.h>
 #include <AK/JsonObjectSerializer.h>
+#include <AK/NeverDestroyed.h>
 #include <AK/StringBuilder.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibGC/DeferGC.h>
 #include <LibGC/WeakHashMap.h>
 #include <LibJS/Runtime/ExternalMemory.h>
@@ -82,8 +84,8 @@ namespace Web::DOM {
 static UniqueNodeID s_next_unique_id;
 static GC::WeakHashMap<UniqueNodeID, Node>& node_directory()
 {
-    static GC::WeakHashMap<UniqueNodeID, Node> directory;
-    return directory;
+    static NeverDestroyed<GC::WeakHashMap<UniqueNodeID, Node>> directory;
+    return *directory;
 }
 
 static UniqueNodeID allocate_unique_id(Node& node)
@@ -136,7 +138,6 @@ void Node::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_document);
     visitor.visit(m_child_nodes);
 
-    visitor.visit(m_layout_node);
     if (m_registered_observer_list) {
         visitor.visit(*m_registered_observer_list);
     }
@@ -191,14 +192,14 @@ Optional<String> Node::alternative_text() const
 // https://dom.spec.whatwg.org/#concept-descendant-text-content
 Utf16String Node::descendant_text_content() const
 {
-    StringBuilder builder(StringBuilder::Mode::UTF16);
+    Utf16StringBuilder builder;
 
     for_each_in_subtree_of_type<Text>([&](auto& text_node) {
         builder.append(text_node.data());
         return TraversalDecision::Continue;
     });
 
-    return builder.to_utf16_string();
+    return builder.to_string();
 }
 
 // https://dom.spec.whatwg.org/#dom-node-textcontent
@@ -310,12 +311,12 @@ WebIDL::ExceptionOr<void> Node::normalize()
         }
 
         // 3. Let data be the concatenation of the data of node’s contiguous exclusive Text nodes (excluding itself), in tree order.
-        StringBuilder data(StringBuilder::Mode::UTF16);
+        Utf16StringBuilder data;
         for (auto const& text_node : contiguous_exclusive_text_nodes_excluding_self(node))
             data.append(text_node->data());
 
         // 4. Replace data with node node, offset length, count 0, and data data.
-        TRY(character_data.replace_data(length, 0, data.to_utf16_string()));
+        TRY(character_data.replace_data(length, 0, data.to_string()));
 
         // 5. Let currentNode be node’s next sibling.
         auto* current_node = node.next_sibling();
@@ -471,7 +472,7 @@ Utf16String Node::child_text_content() const
     if (!parent_node)
         return {};
 
-    StringBuilder builder(StringBuilder::Mode::UTF16);
+    Utf16StringBuilder builder;
 
     parent_node->for_each_child_of_type<Text>([&](auto const& child) {
         if (auto content = child.text_content(); content.has_value())
@@ -479,7 +480,7 @@ Utf16String Node::child_text_content() const
         return IterationDecision::Continue;
     });
 
-    return builder.to_utf16_string();
+    return builder.to_string();
 }
 
 // https://dom.spec.whatwg.org/#concept-shadow-including-root
@@ -749,7 +750,7 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
 
     if (is_connected()) {
         // NB: Called during DOM insertion, layout is not up to date.
-        if (unsafe_layout_node() && unsafe_layout_node()->display().is_contents() && parent_element()) {
+        if (auto* element = as_if<Element>(*this); element && element->computed_properties() && element->computed_properties()->display().is_contents() && parent_element()) {
             parent_element()->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBeforeWithDisplayContents);
         }
         set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
@@ -1527,12 +1528,7 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_node_binding(bool subtree)
     return clone_node(nullptr, subtree);
 }
 
-void Node::set_document(Badge<Document>, Document& document)
-{
-    set_document(document);
-}
-
-void Node::set_document(Badge<NamedNodeMap>, Document& document)
+void Node::set_document(Badge<Document, NamedNodeMap>, Document& document)
 {
     set_document(document);
 }
@@ -1672,7 +1668,7 @@ GC::Ptr<Node> Node::editing_host()
     return {};
 }
 
-void Node::set_layout_node(Badge<Layout::Node>, GC::Ref<Layout::Node> layout_node)
+void Node::set_layout_node(Badge<Layout::Node>, Layout::Node& layout_node)
 {
     m_layout_node = layout_node;
 }
@@ -1757,7 +1753,7 @@ void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReas
             // If the layout node has an anonymous parent, rebuild from the nearest non-anonymous ancestor.
             // FIXME: This is not optimal, and we should figure out how to rebuild a smaller part of the tree.
             if (layout_node->parent() && layout_node->parent()->is_anonymous()) {
-                GC::Ptr<Layout::Node> ancestor = layout_node->parent();
+                auto* ancestor = layout_node->parent();
                 while (ancestor && ancestor->is_anonymous())
                     ancestor = ancestor->parent();
                 if (ancestor)
@@ -1804,13 +1800,29 @@ void Node::inserted()
     set_needs_style_update(true);
 }
 
+void Node::clear_layout_node_paintables()
+{
+    if (!m_layout_node)
+        return;
+
+    m_layout_node->clear_paintables();
+
+    // NB: Block-in-inline splitting can create multiple layout nodes for a single DOM node. Only the last one is stored
+    //     in m_layout_node so we need to clear the paintables for the continued nodes as well
+    auto* node_with_metrics = as_if<Layout::NodeWithStyleAndBoxModelMetrics>(*m_layout_node);
+    if (!node_with_metrics)
+        return;
+
+    for (auto* continuation = node_with_metrics->continuation_of_node(); continuation; continuation = continuation->continuation_of_node())
+        continuation->clear_paintables();
+}
+
 void Node::removed_from(IsSubtreeRoot, Node*, Node&)
 {
     m_is_connected = false;
     m_in_editable_subtree = false;
     m_inside_blocking_wheel_event_handler = false;
-    if (m_layout_node)
-        m_layout_node->clear_paintables();
+    clear_layout_node_paintables();
     m_layout_node = nullptr;
     m_paintable = nullptr;
 
@@ -3351,13 +3363,13 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
     // aria-labelledby or aria-describedby and/or un-hidden. See the comment for substep A above.
     if (is_text() && (!parent_element() || (parent_element()->is_referenced() || !parent_element()->is_hidden() || !parent_element()->has_hidden_ancestor() || parent_element()->has_referenced_and_hidden_ancestor()))) {
         if (layout_node()) {
-            StringBuilder builder { StringBuilder::Mode::UTF16 };
+            Utf16StringBuilder builder;
             Layout::TextOffsetMapping mapping { static_cast<DOM::Text const&>(*this) };
             mapping.for_each_fragment([&](Layout::TextNode const& slice) {
                 builder.append(slice.text_for_rendering());
             });
             if (!builder.is_empty())
-                return builder.to_utf16_string().to_utf8_but_should_be_ported_to_utf16();
+                return builder.to_string().to_utf8_but_should_be_ported_to_utf16();
         }
         return text_content()->to_utf8_but_should_be_ported_to_utf16();
     }

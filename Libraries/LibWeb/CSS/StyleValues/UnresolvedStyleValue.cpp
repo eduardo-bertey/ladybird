@@ -19,37 +19,95 @@
 
 namespace Web::CSS {
 
-ValueComparingNonnullRefPtr<UnresolvedStyleValue const> UnresolvedStyleValue::create(Vector<Parser::ComponentValue>&& values, Parser::SubstitutionFunctionsPresence substitution_presence, Optional<String> original_source_text)
+static String source_text_from_component_values(Vector<Parser::ComponentValue> const& values, UnresolvedStyleValue::SourceTextMode source_text_mode)
 {
-    return adopt_ref(*new (nothrow) UnresolvedStyleValue(move(values), substitution_presence, move(original_source_text)));
+    StringBuilder builder;
+    for (auto const& value : values) {
+        auto original_source_text = value.original_source_text();
+        if (original_source_text.is_empty()) {
+            auto serialized_values = serialize_a_series_of_component_values(values);
+            if (source_text_mode == UnresolvedStyleValue::SourceTextMode::Trim)
+                return MUST(serialized_values.trim_ascii_whitespace());
+            return serialized_values;
+        }
+        builder.append(original_source_text);
+    }
+
+    auto source_text = builder.to_string_without_validation();
+    if (source_text_mode == UnresolvedStyleValue::SourceTextMode::Trim)
+        return MUST(source_text.trim_ascii_whitespace());
+    return source_text;
 }
 
-UnresolvedStyleValue::UnresolvedStyleValue(Vector<Parser::ComponentValue>&& values, Parser::SubstitutionFunctionsPresence substitution_presence, Optional<String> original_source_text)
+static void mark_as_attr_tainted(Vector<Parser::ComponentValue>& values)
+{
+    for (auto& value : values)
+        value.set_attr_tainted();
+}
+
+StringView UnresolvedStyleValue::comparison_text() const
+{
+    if (!m_value_comparison_text.is_empty())
+        return m_value_comparison_text.bytes_as_string_view();
+    return m_source_text.bytes_as_string_view().trim_whitespace();
+}
+
+ValueComparingNonnullRefPtr<UnresolvedStyleValue const> UnresolvedStyleValue::create(Vector<Parser::ComponentValue>&& values, Parser::SubstitutionFunctionsPresence substitution_presence, Optional<String> original_source_text, SourceTextMode source_text_mode, bool contains_attr_tainted_values)
+{
+    auto has_original_source_text = original_source_text.has_value();
+    auto source_text = [&] {
+        if (has_original_source_text)
+            return MUST(original_source_text.release_value().trim_ascii_whitespace());
+
+        if (source_text_mode == SourceTextMode::Trim)
+            return MUST(serialize_a_series_of_component_values_preserving_original_source_text(values).trim_ascii_whitespace());
+
+        return source_text_from_component_values(values, source_text_mode);
+    }();
+    // NB: The comparison text is a normalized serialization, only used when we have separate original source text.
+    //     Don't pay for serializing it otherwise.
+    auto value_comparison_text = has_original_source_text ? MUST(serialize_a_series_of_component_values(values).trim_ascii_whitespace()) : String {};
+    return adopt_ref(*new (nothrow) UnresolvedStyleValue(move(source_text), move(value_comparison_text), substitution_presence, contains_attr_tainted_values));
+}
+
+UnresolvedStyleValue::UnresolvedStyleValue(String source_text, String value_comparison_text, Parser::SubstitutionFunctionsPresence substitution_presence, bool contains_attr_tainted_values)
     : StyleValue(Type::Unresolved)
-    , m_values(move(values))
+    , m_source_text(move(source_text))
+    , m_value_comparison_text(move(value_comparison_text))
     , m_substitution_functions_presence(substitution_presence)
-    , m_original_source_text(move(original_source_text))
+    , m_contains_attr_tainted_values(contains_attr_tainted_values)
 {
 }
 
 void UnresolvedStyleValue::serialize(StringBuilder& builder, SerializationMode) const
 {
-    if (m_original_source_text.has_value()) {
-        builder.append(*m_original_source_text);
-        return;
-    }
+    builder.append(m_source_text);
+}
 
-    builder.append(MUST(serialize_a_series_of_component_values(m_values).trim_ascii_whitespace()));
+Vector<Parser::ComponentValue> UnresolvedStyleValue::values() const
+{
+    auto parser = Parser::Parser::create(Parser::ParsingParams {}, m_value_comparison_text.is_empty() ? m_source_text : m_value_comparison_text);
+    auto values = parser.parse_as_list_of_component_values();
+    if (m_contains_attr_tainted_values)
+        mark_as_attr_tainted(values);
+    return values;
+}
+
+Vector<Parser::ComponentValue> UnresolvedStyleValue::tokenize() const
+{
+    return values();
 }
 
 bool UnresolvedStyleValue::equals(StyleValue const& other) const
 {
     if (type() != other.type())
         return false;
-    return values() == other.as_unresolved().values();
+
+    auto const& other_unresolved = other.as_unresolved();
+    return comparison_text() == other_unresolved.comparison_text();
 }
 
-static GC::Ref<CSSUnparsedValue> reify_a_list_of_component_values(JS::Realm&, Vector<Parser::ComponentValue>);
+static GC::Ref<CSSUnparsedValue> reify_a_list_of_component_values(JS::Realm&, ReadonlySpan<Parser::ComponentValue>);
 
 // https://drafts.css-houdini.org/css-typed-om-1/#reify-var
 static GC::Ptr<CSSVariableReferenceValue> reify_a_var_reference(JS::Realm& realm, Parser::Function function)
@@ -90,7 +148,7 @@ static GC::Ptr<CSSVariableReferenceValue> reify_a_var_reference(JS::Realm& realm
 
 class Reifier {
 public:
-    static Vector<CSSUnparsedSegment> reify(JS::Realm& realm, Vector<Parser::ComponentValue> const& source_values)
+    static Vector<CSSUnparsedSegment> reify(JS::Realm& realm, ReadonlySpan<Parser::ComponentValue> source_values)
     {
         Reifier reifier;
         reifier.process_values(realm, source_values);
@@ -100,7 +158,7 @@ public:
     }
 
 private:
-    void process_values(JS::Realm& realm, Vector<Parser::ComponentValue> const& source_values)
+    void process_values(JS::Realm& realm, ReadonlySpan<Parser::ComponentValue> source_values)
     {
         // NB: var() could be arbitrarily nested within other functions and blocks, so we have to walk the tree.
         //     Also, a var() might not be representable, if it has an ASF in place of its name, so those will be part
@@ -119,17 +177,17 @@ private:
 
             if (component_value.is_function()) {
                 auto& function = component_value.function();
-                m_unserialized_values.append(function.name_token);
+                m_unserialized_values.append(Parser::Token::create_function(function.name, function.name_token.original_source_text()));
                 process_values(realm, function.value);
-                m_unserialized_values.append(function.end_token);
+                m_unserialized_values.append(Parser::Token::create(function.end_token.type(), function.end_token.original_source_text()));
                 continue;
             }
 
             if (component_value.is_block()) {
                 auto& block = component_value.block();
-                m_unserialized_values.append(block.token);
+                m_unserialized_values.append(Parser::Token::create(block.token.type(), block.token.original_source_text()));
                 process_values(realm, block.value);
-                m_unserialized_values.append(block.end_token);
+                m_unserialized_values.append(Parser::Token::create(block.end_token.type(), block.end_token.original_source_text()));
                 continue;
             }
 
@@ -139,7 +197,7 @@ private:
 
     void serialize_unserialized_values()
     {
-        m_reified_values.append(serialize_a_series_of_component_values(m_unserialized_values));
+        m_reified_values.append(Utf16String::from_utf8(serialize_a_series_of_component_values(m_unserialized_values)));
         m_unserialized_values.clear_with_capacity();
     }
 
@@ -147,7 +205,7 @@ private:
     Vector<Parser::ComponentValue> m_unserialized_values {};
 };
 
-static GC::Ref<CSSUnparsedValue> reify_a_list_of_component_values(JS::Realm& realm, Vector<Parser::ComponentValue> component_values)
+static GC::Ref<CSSUnparsedValue> reify_a_list_of_component_values(JS::Realm& realm, ReadonlySpan<Parser::ComponentValue> component_values)
 {
     // To reify a list of component values from a list:
     // 1. Replace all var() references in list with CSSVariableReferenceValue objects, as described in §5.4 var() References.
@@ -159,9 +217,10 @@ static GC::Ref<CSSUnparsedValue> reify_a_list_of_component_values(JS::Realm& rea
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#reify-a-list-of-component-values
-GC::Ref<CSSStyleValue> UnresolvedStyleValue::reify(JS::Realm& realm, FlyString const&) const
+GC::Ref<CSSStyleValue> UnresolvedStyleValue::reify(JS::Realm& realm, Utf16FlyString const&) const
 {
-    return reify_a_list_of_component_values(realm, m_values);
+    auto component_values = values();
+    return reify_a_list_of_component_values(realm, component_values);
 }
 
 }

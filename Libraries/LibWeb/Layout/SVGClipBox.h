@@ -13,11 +13,10 @@
 namespace Web::Layout {
 
 class SVGClipBox final : public SVGBox {
-    GC_CELL(SVGClipBox, SVGBox);
-    GC_DECLARE_ALLOCATOR(SVGClipBox);
+    LAYOUT_NODE(SVGClipBox, SVGBox);
 
 public:
-    SVGClipBox(DOM::Document&, SVG::SVGClipPathElement&, GC::Ref<CSS::ComputedProperties>);
+    SVGClipBox(DOM::Document&, SVG::SVGClipPathElement&, CSS::ComputedProperties const&);
     virtual ~SVGClipBox() override = default;
 
     SVG::SVGClipPathElement& dom_node() { return as<SVG::SVGClipPathElement>(SVGBox::dom_node()); }

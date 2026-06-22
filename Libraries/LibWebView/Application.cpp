@@ -22,6 +22,8 @@
 #include <LibDevTools/DevToolsServer.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibImageDecoderClient/Client.h>
+#include <LibURL/InternalURLs.h>
+#include <LibURL/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/Loader/UserAgent.h>
 #include <LibWeb/Page/InputEvent.h>
@@ -63,9 +65,9 @@ static double sanitized_display_refresh_rate(double refresh_rate)
 }
 
 struct ApplicationSettingsObserver final : public SettingsObserver {
-    virtual void show_bookmarks_bar_changed() override
+    virtual void tab_settings_changed() override
     {
-        Application::the().show_bookmarks_bar_changed({});
+        Application::the().tab_settings_changed({});
     }
 
     virtual void browsing_data_settings_changed() override
@@ -168,6 +170,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<int> window_width;
     Optional<int> window_height;
     Optional<u32> screenshot_delay;
+    Optional<StringView> screenshot_path;
     bool new_window = false;
     bool force_new_process = false;
     bool allow_popups = false;
@@ -190,6 +193,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool disable_http_memory_cache = false;
     bool disable_http_disk_cache = false;
     bool disable_content_blocker = false;
+    bool disable_sandbox = false;
     Vector<StringView> content_blocker_list_paths;
     Optional<StringView> resource_substitution_map_path;
     bool enable_autoplay = false;
@@ -230,6 +234,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     });
 
     args_parser.add_option(screenshot_delay, "Set the number of seconds to wait before taking a screenshot (only supported for headless screenshot mode)", "screenshot-delay", 0, "seconds");
+    args_parser.add_option(screenshot_path, "Save screenshots to the given location (only supported for headless screenshot mode)", "screenshot-path", 0, "path");
     args_parser.add_option(window_width, "Set viewport width in pixels (default: 800) (currently only supported for headless mode)", "window-width", 0, "pixels");
     args_parser.add_option(window_height, "Set viewport height in pixels (default: 600) (currently only supported for headless mode)", "window-height", 0, "pixels");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
@@ -264,6 +269,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(disable_http_memory_cache, "Disable HTTP memory cache", "disable-http-memory-cache");
     args_parser.add_option(disable_http_disk_cache, "Disable HTTP disk cache", "disable-http-disk-cache");
     args_parser.add_option(disable_content_blocker, "Disable content blocker", "disable-content-blocker");
+    args_parser.add_option(disable_sandbox, "Disable helper process sandboxing", "disable-sandbox");
     args_parser.add_option(Core::ArgsParser::Option {
         .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
         .help_string = "Path to a content blocker list. May be specified multiple times.",
@@ -387,11 +393,14 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
                 : OptionalNone()),
         .devtools_port = devtools_port,
         .enable_content_blocker = disable_content_blocker ? EnableContentBlocker::No : EnableContentBlocker::Yes,
+        .disable_sandbox = disable_sandbox ? DisableSandbox::Yes : DisableSandbox::No,
         .content_blocker_list_paths = move(content_blocker_list_paths_as_byte_strings),
     };
 
     if (screenshot_delay.has_value())
         m_browser_options.screenshot_delay = *screenshot_delay;
+    if (screenshot_path.has_value())
+        m_browser_options.screenshot_path = *screenshot_path;
     if (window_width.has_value())
         m_browser_options.window_width = *window_width;
     if (window_height.has_value())
@@ -444,11 +453,14 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     if (m_web_content_options.file_scheme_urls_have_tuple_origins == FileSchemeUrlsHaveTupleOrigins::Yes)
         URL::set_file_scheme_urls_have_tuple_origins();
 
-    TRY(load_content_blocker_lists());
+    if (auto result = load_content_blocker_lists(); result.is_error()) {
+        warnln("\033[31;1mUnable to load all content blocker lists:\033[0m {}", result.error());
+        warnln("    Configured lists: {}", m_browser_options.content_blocker_list_paths);
+    }
 
     initialize_actions();
 
-    m_event_loop = create_platform_event_loop();
+    m_event_loop = &create_platform_event_loop();
     TRY(launch_services());
 
     return {};
@@ -633,6 +645,17 @@ bool Application::handle_mouse_event_in_compositor(Web::Compositor::CompositorCo
     return result.release_value();
 }
 
+bool Application::handle_pinch_event_in_compositor(Web::Compositor::CompositorContextId context_id, Web::PinchEvent const& event)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return false;
+
+    auto result = m_compositor_client->try_handle_pinch_event(context_id, event);
+    if (result.is_error())
+        return false;
+    return result.release_value();
+}
+
 bool Application::dispatch_mouse_event_to_web_content(Web::Compositor::CompositorContextId context_id, Web::MouseEvent const& event)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
@@ -652,6 +675,17 @@ void Application::notify_compositor_presented_bitmap_ready_to_paint(Web::Composi
     VERIFY(m_compositor_client);
 
     m_compositor_client->async_presented_bitmap_ready_to_paint(context_id, bitmap_id);
+}
+
+void Application::crash_compositor_process()
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client)) {
+        warnln("Unable to crash Compositor process: process is not available");
+        return;
+    }
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_crash();
 }
 
 ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process(ViewImplementation& view)
@@ -841,7 +875,7 @@ void Application::recover_compositor_process()
         }
     }
     for (auto& client : clients)
-        client->update_compositor_viewports_after_reconnect({});
+        client->replay_compositor_view_state_after_reconnect({});
     for (auto& client : clients)
         client->notify_compositor_process_reconnected({});
 }
@@ -1022,9 +1056,9 @@ ErrorOr<int> Application::execute()
     return m_event_loop->exec();
 }
 
-NonnullOwnPtr<Core::EventLoop> Application::create_platform_event_loop()
+Core::EventLoop& Application::create_platform_event_loop()
 {
-    return make<Core::EventLoop>();
+    return Core::EventLoop::initialize_for_current_thread();
 }
 
 void Application::add_child_process(WebView::Process&& process)
@@ -1223,14 +1257,6 @@ void Application::clear_browsing_data(ClearBrowsingDataOptions const& options)
         on_recently_closed_entries_changed();
 }
 
-void Application::clear_history()
-{
-    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Clearing browsing history");
-
-    m_history_store->clear();
-    on_recently_closed_entries_changed();
-}
-
 void Application::initialize_actions()
 {
     auto debug_request = [this](auto request) {
@@ -1365,6 +1391,18 @@ void Application::initialize_actions()
     m_motion_menu->add_action(Action::create_checkable("No Preference"sv, ActionID::PreferredMotion, set_motion(Web::CSS::PreferredMotion::NoPreference)));
     m_motion_menu->items().first().get<NonnullRefPtr<Action>>()->set_checked(true);
 
+    m_toggle_vertical_tabs_expanded_action = Action::create("Toggle Vertical Tabs Expanded"sv, ActionID::ToggleVerticalTabsExpanded, [this]() {
+        auto tab_settings = m_settings.tab_settings();
+        tab_settings.vertical_tabs_expanded = !tab_settings.vertical_tabs_expanded;
+        m_settings.set_tab_settings(tab_settings);
+    });
+    update_vertical_tabs_action();
+
+    m_toggle_menu_bar_action = Action::create_checkable("Show Menubar"sv, ActionID::ToggleMenuBar, [this]() {
+        m_settings.set_show_menu_bar(!m_settings.show_menu_bar());
+    });
+    m_toggle_menu_bar_action->set_checked(m_settings.show_menu_bar());
+
     m_bookmarks_menu = Menu::create("Bookmarks"sv);
     m_bookmarks_menu->add_action(Action::create("Manage Bookmarks"sv, ActionID::ManageBookmarks, [this]() {
         open_url_in_new_tab(URL::about_bookmarks(), Web::HTML::ActivateTab::Yes);
@@ -1384,11 +1422,11 @@ void Application::initialize_actions()
     m_bookmarks_menu->add_action(*m_toggle_bookmark_action);
     update_bookmark_action_for_current_web_view();
 
-    m_toggle_bookmark_bar_action = Action::create("Toggle Bookmarks Bar"sv, ActionID::ToggleBookmarksBar, [this]() {
+    m_toggle_bookmark_bar_action = Action::create_checkable("Show Bookmarks Bar"sv, ActionID::ToggleBookmarksBar, [this]() {
         m_settings.set_show_bookmarks_bar(!m_settings.show_bookmarks_bar());
     });
+    m_toggle_bookmark_bar_action->set_checked(m_settings.show_bookmarks_bar());
     m_bookmarks_menu->add_action(*m_toggle_bookmark_bar_action);
-    update_bookmarks_bar_action();
 
     m_bookmarks_menu->add_separator();
     m_bookmarks_menu_static_size = m_bookmarks_menu->size();
@@ -1484,6 +1522,12 @@ void Application::initialize_actions()
     m_bookmark_folder_context_menu->add_action(add_bookmark_action);
     m_bookmark_folder_context_menu->add_action(add_bookmark_folder_action);
 
+    m_history_menu = Menu::create("History"sv);
+    m_history_menu->add_action(Action::create("View History"sv, ActionID::ViewHistory, [this]() {
+        if (!activate_tab_with_url(URL::about_history()))
+            open_url_in_new_tab(URL::about_history(), Web::HTML::ActivateTab::Yes);
+    }));
+
     m_inspect_menu = Menu::create("Inspect"sv);
 
     m_view_source_action = Action::create("View Source"sv, ActionID::ViewSource, [this]() {
@@ -1515,6 +1559,7 @@ void Application::initialize_actions()
     m_debug_menu->add_action(Action::create("Dump CSS Errors"sv, ActionID::DumpCSSErrors, debug_request("dump-all-css-errors"sv)));
     m_debug_menu->add_action(Action::create("Dump Cookies"sv, ActionID::DumpCookies, [this]() { m_cookie_jar->dump_cookies(); }));
     m_debug_menu->add_action(Action::create("Dump Local Storage"sv, ActionID::DumpLocalStorage, debug_request("dump-local-storage"sv)));
+    m_debug_menu->add_action(Action::create("Dump Session Storage"sv, ActionID::DumpSessionStorage, debug_request("dump-session-storage"sv)));
     m_debug_menu->add_action(Action::create("Dump WASM Stats"sv, ActionID::DumpWasmStats, debug_request("dump-wasm-stats"sv)));
     m_debug_menu->add_action(Action::create("Dump GC graph"sv, ActionID::DumpGCGraph, [this]() {
         if (auto view = active_web_view(); view.has_value()) {
@@ -1539,6 +1584,7 @@ void Application::initialize_actions()
 
     m_debug_menu->add_action(Action::create("Collect Garbage"sv, ActionID::CollectGarbage, debug_request("collect-garbage"sv)));
     m_debug_menu->add_action(Action::create("Crash Current Page"sv, ActionID::CrashCurrentPage, debug_request("crash-current-page"sv)));
+    m_debug_menu->add_action(Action::create("Crash Compositor Process"sv, ActionID::CrashCompositorProcess, [this]() { crash_compositor_process(); }));
     m_debug_menu->add_separator();
 
     auto spoof_user_agent_menu = Menu::create_group("Spoof User Agent"sv);
@@ -1591,6 +1637,20 @@ void Application::apply_view_options(Badge<ViewImplementation>, ViewImplementati
     view.debug_request("navigator-compatibility-mode"sv, m_navigator_compatibility_mode);
 }
 
+void Application::update_vertical_tabs_action()
+{
+    auto const& settings = m_settings.tab_settings();
+    m_toggle_vertical_tabs_expanded_action->set_visible(settings.vertical_tabs_enabled);
+    m_toggle_vertical_tabs_expanded_action->set_engaged(settings.vertical_tabs_expanded);
+    m_toggle_vertical_tabs_expanded_action->set_tooltip(settings.vertical_tabs_expanded ? "Minimize Tabs"sv : "Expand Tabs"sv);
+}
+
+void Application::tab_settings_changed(Badge<ApplicationSettingsObserver>)
+{
+    update_vertical_tabs_action();
+    update_tabs_display();
+}
+
 void Application::update_bookmark_action_for_current_web_view()
 {
     auto view = active_web_view();
@@ -1605,17 +1665,6 @@ void Application::bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>)
     m_bookmarks_menu->shrink(m_bookmarks_menu_static_size);
     create_bookmark_menu_items();
     rebuild_bookmarks_menu();
-}
-
-void Application::update_bookmarks_bar_action()
-{
-    m_toggle_bookmark_bar_action->set_text(m_settings.show_bookmarks_bar() ? "Hide Bookmark Bar"sv : "Show Bookmark Bar"sv);
-}
-
-void Application::show_bookmarks_bar_changed(Badge<ApplicationSettingsObserver>)
-{
-    update_bookmarks_bar_action();
-    update_bookmarks_bar_display(m_settings.show_bookmarks_bar());
 }
 
 void Application::create_bookmark_menu_items(Optional<MenuData> data)
@@ -1634,6 +1683,8 @@ void Application::create_bookmark_menu_items(Optional<MenuData> data)
                 auto action = Action::create(bookmark.title.value_or({}), ActionID::BookmarkItem, [this, url = bookmark.url]() {
                     if (auto view = active_web_view(); view.has_value())
                         view->load(url);
+                    else
+                        open_url_in_new_tab(url, Web::HTML::ActivateTab::Yes);
                 });
 
                 action->set_base64_png_icon(bookmark.favicon_base64_png);
@@ -1759,6 +1810,242 @@ Vector<DevTools::CSSProperty> Application::css_property_list() const
     return property_list;
 }
 
+void Application::reload_tab(DevTools::TabDescription const& description, bool) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->reload();
+}
+
+void Application::navigate_tab(DevTools::TabDescription const& description, String const& url) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
+        return;
+
+    auto parsed_url = sanitize_url(url, Application::settings().search_engine());
+    if (!parsed_url.has_value())
+        return;
+
+    view->load(*parsed_url);
+}
+
+void Application::traverse_the_history_by_delta(DevTools::TabDescription const& description, int delta) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        (void)view->traverse_the_history_by_delta(delta);
+}
+
+Vector<HTTP::Cookie::Cookie> Application::cookies(DevTools::TabDescription const& description) const
+{
+    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+        return {};
+
+    return Application::cookie_jar().get_all_cookies();
+}
+
+ErrorOr<void> Application::set_cookie(DevTools::TabDescription const& description, Optional<HTTP::Cookie::Cookie> old_cookie, HTTP::Cookie::Cookie cookie) const
+{
+    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+        return Error::from_string_literal("Unable to locate tab");
+
+    auto url = URL::Parser::basic_parse(description.url);
+    if (!url.has_value())
+        return Error::from_string_literal("Unable to parse tab URL");
+
+    Optional<CookieStorageKey> old_key;
+    if (old_cookie.has_value())
+        old_key = CookieStorageKey { old_cookie->name, old_cookie->domain, old_cookie->path };
+
+    TRY(Application::cookie_jar().set_cookie_from_devtools(*url, move(old_key), move(cookie)));
+    return {};
+}
+
+void Application::delete_cookies(DevTools::TabDescription const& description, Vector<HTTP::Cookie::Cookie> cookies) const
+{
+    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+        return;
+
+    for (auto const& cookie : cookies)
+        Application::cookie_jar().delete_cookie({ cookie.name, cookie.domain, cookie.path });
+}
+
+void Application::listen_for_host_cookie_changes(DevTools::TabDescription const& description, OnHostCookieChange on_host_cookie_change) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->listen_for_host_cookie_changes(move(on_host_cookie_change));
+}
+
+void Application::stop_listening_for_host_cookie_changes(DevTools::TabDescription const& description) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->stop_listening_for_host_cookie_changes();
+}
+
+static ErrorOr<Optional<String>> storage_set_result_to_error_or_old_value(StorageSetResult result)
+{
+    if (result.has<StorageOperationError>())
+        return Error::from_string_literal("Unable to store more than the storage quota");
+
+    return result.get<Optional<String>>();
+}
+
+void Application::inspect_storage(DevTools::TabDescription const& description, Web::StorageAPI::StorageEndpointType storage_endpoint, OnStorageItemsReceived on_complete) const
+{
+    static u64 next_request_id = 0;
+
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    auto request_id = next_request_id++;
+    view->on_received_storage_items.set(request_id, move(on_complete));
+    view->inspect_storage(storage_endpoint, request_id);
+}
+
+ErrorOr<Optional<String>> Application::set_storage_item(DevTools::TabDescription const& description, Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, String const& key, String const& value) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
+        return Error::from_string_literal("Unable to locate tab");
+
+    if (storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage) {
+        auto result = view->set_session_storage_item(key, value);
+        if (!result.has_value())
+            return Error::from_string_literal("Unable to locate session storage");
+        return TRY(storage_set_result_to_error_or_old_value(result.release_value()));
+    }
+
+    auto old_value = TRY(storage_set_result_to_error_or_old_value(Application::storage_jar().set_item(storage_endpoint, storage_key, key, value)));
+    if (!old_value.has_value()) {
+        view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Added, key });
+    } else if (*old_value != value) {
+        view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Changed, key });
+    }
+
+    return old_value;
+}
+
+ErrorOr<Optional<String>> Application::remove_storage_item(DevTools::TabDescription const& description, Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, String const& key) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
+        return Error::from_string_literal("Unable to locate tab");
+
+    if (storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage)
+        return view->remove_session_storage_item(key);
+
+    auto old_value = Application::storage_jar().get_item(storage_endpoint, storage_key, key);
+    if (!old_value.has_value())
+        return Optional<String> {};
+
+    Application::storage_jar().remove_item(storage_endpoint, storage_key, key);
+    view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Deleted, key });
+    return old_value;
+}
+
+ErrorOr<void> Application::clear_storage(DevTools::TabDescription const& description, Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
+        return Error::from_string_literal("Unable to locate tab");
+
+    if (storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage) {
+        view->clear_session_storage();
+        return {};
+    }
+
+    auto keys = Application::storage_jar().get_all_keys(storage_endpoint, storage_key);
+    if (keys.is_empty())
+        return {};
+
+    Application::storage_jar().clear_storage_key(storage_endpoint, storage_key);
+    view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Cleared, {} });
+    return {};
+}
+
+u64 Application::add_storage_change_listener(DevTools::TabDescription const& description, OnStorageChange on_storage_change) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        return view->add_storage_change_listener(move(on_storage_change));
+    return 0;
+}
+
+void Application::remove_storage_change_listener(DevTools::TabDescription const& description, u64 listener_id) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->remove_storage_change_listener(listener_id);
+}
+
+void Application::inspect_indexed_database_storage(DevTools::TabDescription const& description, OnIndexedDBInspectionComplete on_complete) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    view->inspect_indexed_database_storage(move(on_complete));
+}
+
+void Application::inspect_indexed_database_objects(DevTools::TabDescription const& description, String const& host, Optional<JsonArray> names, JsonObject options, OnIndexedDBInspectionComplete on_complete) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    view->inspect_indexed_database_objects(host, move(names), move(options), move(on_complete));
+}
+
+void Application::delete_indexed_database(DevTools::TabDescription const& description, String const& host, String const& name, OnIndexedDBInspectionComplete on_complete) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    view->delete_indexed_database(host, name, move(on_complete));
+}
+
+void Application::clear_indexed_database_object_store(DevTools::TabDescription const& description, String const& host, String const& name, OnIndexedDBInspectionComplete on_complete) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    view->clear_indexed_database_object_store(host, name, move(on_complete));
+}
+
+void Application::delete_indexed_database_record(DevTools::TabDescription const& description, String const& host, String const& name, OnIndexedDBInspectionComplete on_complete) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    view->delete_indexed_database_record(host, name, move(on_complete));
+}
+
+u64 Application::add_indexed_database_change_listener(DevTools::TabDescription const& description, OnIndexedDatabaseChange on_indexed_database_change) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        return view->add_indexed_database_change_listener(move(on_indexed_database_change));
+    return 0;
+}
+
+void Application::remove_indexed_database_change_listener(DevTools::TabDescription const& description, u64 listener_id) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->remove_indexed_database_change_listener(listener_id);
+}
+
 void Application::inspect_tab(DevTools::TabDescription const& description, OnTabInspectionComplete on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
@@ -1809,13 +2096,13 @@ void Application::stop_listening_for_dom_properties(DevTools::TabDescription con
     view->on_received_dom_node_properties = nullptr;
 }
 
-void Application::inspect_dom_node(DevTools::TabDescription const& description, DOMNodeProperties::Type property_type, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element) const
+void Application::inspect_dom_node(DevTools::TabDescription const& description, DOMNodeProperties::Type property_type, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element, JsonObject options) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value())
         return;
 
-    view->inspect_dom_node(node_id, property_type, pseudo_element);
+    view->inspect_dom_node(node_id, property_type, pseudo_element, JsonValue { move(options) });
 }
 
 void Application::inspect_grid_layouts(DevTools::TabDescription const& description, Web::UniqueNodeID root_node_id, OnGridLayoutsReceived on_grid_layouts_received) const

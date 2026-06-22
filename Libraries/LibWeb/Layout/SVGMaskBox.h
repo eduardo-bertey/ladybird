@@ -13,11 +13,10 @@
 namespace Web::Layout {
 
 class SVGMaskBox : public SVGGraphicsBox {
-    GC_CELL(SVGMaskBox, SVGGraphicsBox);
-    GC_DECLARE_ALLOCATOR(SVGMaskBox);
+    LAYOUT_NODE(SVGMaskBox, SVGGraphicsBox);
 
 public:
-    SVGMaskBox(DOM::Document&, SVG::SVGMaskElement&, GC::Ref<CSS::ComputedProperties>);
+    SVGMaskBox(DOM::Document&, SVG::SVGMaskElement&, CSS::ComputedProperties const&);
     virtual ~SVGMaskBox() override = default;
 
     virtual bool is_svg_mask_box() const override { return true; }

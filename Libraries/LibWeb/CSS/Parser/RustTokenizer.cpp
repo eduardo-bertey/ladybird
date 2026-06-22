@@ -102,9 +102,11 @@ static Number::Type css_number_type_from_ffi(FFI::CssNumberType number_type)
     VERIFY_NOT_REACHED();
 }
 
-static Token::Position position_from_ffi(size_t line, size_t column)
+static SourcePosition position_from_ffi(size_t line, size_t column)
 {
-    return { line, column };
+    VERIFY(line <= NumericLimits<u32>::max());
+    VERIFY(column <= NumericLimits<u32>::max());
+    return { static_cast<u32>(line), static_cast<u32>(column) };
 }
 
 Token RustTokenizer::token_from_ffi(FFI::CssToken const& ffi_token)

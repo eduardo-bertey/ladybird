@@ -47,6 +47,7 @@ struct QualifiedRule {
     Vector<ComponentValue> prelude;
     Vector<Declaration> declarations;
     Vector<RuleOrListOfDeclarations> child_rules;
+    Optional<SourcePosition> source_position = {};
 
     void for_each_as_declaration_list(FlyString const& rule_name, DeclarationVisitor&& visit) const;
 };
@@ -58,6 +59,7 @@ struct Declaration {
     Important important = Important::No;
     Optional<String> original_value_text = {};
     Optional<String> original_full_text = {};
+    Optional<SourcePosition> source_position = {};
 };
 
 struct SubstitutionFunctionsPresence {
@@ -70,11 +72,35 @@ struct SubstitutionFunctionsPresence {
     bool has_any() const { return attr || env || if_ || inherit || var; }
 };
 
+class ComponentValueToken {
+public:
+    ComponentValueToken() = default;
+    ComponentValueToken(Token const&);
+
+    bool is(Token::Type type) const { return m_type == type; }
+    Token::Type type() const { return m_type; }
+    Token::Type mirror_variant() const;
+    StringView bracket_string() const;
+    StringView bracket_mirror_string() const;
+
+    String const& original_source_text() const { return m_original_source_text; }
+    SourcePosition const& start_position() const { return m_start_position; }
+    SourcePosition const& end_position() const { return m_end_position; }
+
+    bool operator==(ComponentValueToken const& other) const { return m_type == other.m_type; }
+
+private:
+    Token::Type m_type { Token::Type::Invalid };
+    String m_original_source_text;
+    SourcePosition m_start_position;
+    SourcePosition m_end_position;
+};
+
 // https://drafts.csswg.org/css-syntax/#simple-block
 struct SimpleBlock {
-    Token token;
+    ComponentValueToken token;
     Vector<ComponentValue> value;
-    Token end_token = {};
+    ComponentValueToken end_token = {};
 
     bool is_curly() const { return token.is(Token::Type::OpenCurly); }
     bool is_paren() const { return token.is(Token::Type::OpenParen); }
@@ -90,8 +116,8 @@ struct SimpleBlock {
 struct Function {
     FlyString name;
     Vector<ComponentValue> value;
-    Token name_token = {};
-    Token end_token = {};
+    ComponentValueToken name_token = {};
+    ComponentValueToken end_token = {};
 
     String to_string() const;
     String original_source_text() const;

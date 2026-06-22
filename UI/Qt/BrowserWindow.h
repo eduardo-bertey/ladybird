@@ -11,12 +11,14 @@
 #include <LibWeb/HTML/ActivateTab.h>
 #include <LibWeb/HTML/AudioPlayState.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/Settings.h>
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/TabBar.h>
 
 #include <QIcon>
 #include <QMainWindow>
 #include <QPushButton>
+#include <QRect>
 #include <QTabBar>
 
 class QPropertyAnimation;
@@ -29,6 +31,7 @@ namespace Ladybird {
 class Tab;
 class WebContentView;
 class BrowserWindow;
+class DevToolsBanner;
 
 class ExitFullscreenButton : public QPushButton {
     Q_OBJECT
@@ -80,7 +83,9 @@ private:
     bool m_debounce { false };
 };
 
-class BrowserWindow : public QMainWindow {
+class BrowserWindow
+    : public QMainWindow
+    , public WebView::SettingsObserver {
     Q_OBJECT
 
 public:
@@ -99,15 +104,18 @@ public:
 
     Tab& create_new_tab(Web::HTML::ActivateTab activate_tab);
     Tab* current_tab() const { return m_current_tab; }
+    bool activate_tab_with_url(URL::URL const&);
     FullscreenMode& fullscreen_mode();
 
     QMenu& hamburger_menu() const { return *m_hamburger_menu; }
+    static bool uses_client_side_decorations();
 
     QAction& new_window_action() const { return *m_new_window_action; }
     QAction& find_action() const { return *m_find_in_page_action; }
 
+    void update_tabs_display();
+
     void rebuild_bookmarks_menu();
-    void update_bookmarks_bar_display(bool show_bookmarks_bar);
     void update_reopen_recently_closed_action();
     void detach_tab_to_new_window(int index, QPoint global_position);
     void move_tab_to_window(int index, BrowserWindow& target_window, int target_index);
@@ -147,18 +155,32 @@ private:
     virtual void resizeEvent(QResizeEvent*) override;
     virtual void changeEvent(QEvent* event) override;
     virtual void moveEvent(QMoveEvent*) override;
+    virtual void paintEvent(QPaintEvent*) override;
     virtual void wheelEvent(QWheelEvent*) override;
     virtual void closeEvent(QCloseEvent*) override;
+
+    virtual void show_menu_bar_changed() override;
+    virtual void show_bookmarks_bar_changed() override;
+    virtual void config_variable_changed(WebView::ConfigVariableID) override;
 
     Tab& create_new_tab(Web::HTML::ActivateTab, Tab& parent, Optional<u64> page_index);
     void initialize_tab(Tab*);
     void uninitialize_tab(Tab*);
 
     void set_current_tab(Tab* tab);
+    bool position_is_in_rounded_corner_cutout(QPoint const&) const;
     Qt::Edges resize_edges_for_position(QPoint const&) const;
     Optional<Qt::CursorShape> resize_cursor_for_edges(Qt::Edges) const;
+    bool start_window_resize(Qt::Edges, QPoint const& global_position);
+    void update_window_resize(QPoint const& global_position);
+    void finish_window_resize();
     void update_resize_cursor(QPoint const&);
+    void refresh_resize_cursor_at_current_position(bool force_reapply = false);
     void clear_resize_cursor();
+    void update_window_corners();
+    void update_appkit_window_resizability();
+    bool should_draw_window_border() const;
+    void update_window_border();
 
     template<typename Callback>
     void for_each_tab(Callback&& callback)
@@ -169,10 +191,11 @@ private:
 
     void initialize_tab_buttons(Tab*);
     void create_menu_bar_window_controls();
-    void update_tab_close_button_icons();
+    void update_tab_button_icons();
     void update_menu_bar_style();
-    void update_menu_bar_visibility(bool);
+    void update_menu_bar_visibility();
     void update_menu_bar_window_control_icons();
+    void update_window_decoration_state();
     void toggle_window_maximized();
     bool start_window_move();
     bool connect_window_screen_changed_signal();
@@ -193,9 +216,11 @@ private:
 
     TabWidget* m_tabs_container { nullptr };
     Tab* m_current_tab { nullptr };
+    DevToolsBanner* m_devtools_banner { nullptr };
 
     QMenu* m_hamburger_menu { nullptr };
     QMenu* m_bookmarks_menu { nullptr };
+    QMenu* m_history_menu { nullptr };
     QWidget* m_menu_bar_window_controls { nullptr };
     QToolButton* m_menu_bar_minimize_window_button { nullptr };
     QToolButton* m_menu_bar_maximize_window_button { nullptr };
@@ -214,6 +239,10 @@ private:
     bool m_restore_to_maximized { false };
     bool m_should_record_closed_window_on_close { true };
     bool m_resize_cursor_active { false };
+    bool m_is_resizing_window { false };
+    Qt::Edges m_resize_edges {};
+    QPoint m_resize_start_global_position;
+    QRect m_resize_start_geometry;
 };
 
 }

@@ -30,7 +30,7 @@ public:
 
     virtual bool is_html_select_element() const final { return true; }
 
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
+    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
     WebIDL::UnsignedLong size() const;
     void set_size(WebIDL::UnsignedLong);
@@ -166,6 +166,9 @@ private:
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
     bool m_user_validity { false };
 };
+
+GC::Ptr<HTMLSelectElement> get_nearest_ancestor_select(DOM::Element&);
+GC::Ptr<HTMLSelectElement const> get_nearest_ancestor_select(DOM::Element const&);
 
 }
 

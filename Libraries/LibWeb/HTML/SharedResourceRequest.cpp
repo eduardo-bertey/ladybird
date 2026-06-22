@@ -16,7 +16,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Statuses.h>
-#include <LibWeb/HTML/AnimatedDecodedImageData.h>
+#include <LibWeb/HTML/AnimatedBitmapDecodedImageData.h>
 #include <LibWeb/HTML/BitmapDecodedImageData.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
@@ -108,6 +108,8 @@ void SharedResourceRequest::set_fetch_controller(GC::Ptr<Fetch::Infrastructure::
 
 void SharedResourceRequest::fetch_resource(JS::Realm& realm, GC::Ref<Fetch::Infrastructure::Request> request)
 {
+    VERIFY(needs_fetching());
+
     if (!ResourceLoader::is_initialized()) {
         handle_failed_fetch();
         return;
@@ -120,18 +122,20 @@ void SharedResourceRequest::fetch_resource(JS::Realm& realm, GC::Ref<Fetch::Infr
         if (!self)
             return;
 
+        auto image_data_is_cors_cross_origin = response->is_cors_cross_origin();
+
         // FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
         //        https://github.com/whatwg/html/issues/9355
         response = response->unsafe_response();
 
-        auto process_body = GC::create_function(self->heap(), [weak_this, request, response](ByteBuffer data) {
+        auto process_body = GC::create_function(self->heap(), [weak_this, request, response, image_data_is_cors_cross_origin](ByteBuffer data) {
             auto self = weak_this.ptr();
             if (!self)
                 return;
 
             auto extracted_mime_type = Fetch::Infrastructure::extract_mime_type(response->header_list());
             auto mime_type = extracted_mime_type.has_value() ? extracted_mime_type.value().essence().bytes_as_string_view() : StringView {};
-            self->handle_successful_fetch(request->url(), mime_type, move(data));
+            self->handle_successful_fetch(request->url(), mime_type, move(data), image_data_is_cors_cross_origin);
         });
         auto process_body_error = GC::create_function(self->heap(), [weak_this](JS::Value) {
             auto self = weak_this.ptr();
@@ -184,7 +188,7 @@ void SharedResourceRequest::add_callbacks(Function<void()> on_finish, Function<v
     m_callbacks.append(move(callbacks));
 }
 
-void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, StringView mime_type, ByteBuffer data)
+void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, StringView mime_type, ByteBuffer data, bool image_data_is_cors_cross_origin)
 {
     // AD-HOC: At this point, things gets very ad-hoc.
     // FIXME: Bring this closer to spec.
@@ -198,14 +202,15 @@ void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, 
             handle_failed_fetch();
         } else {
             m_image_data = result.release_value();
+            m_image_data->set_is_cors_cross_origin(image_data_is_cors_cross_origin);
             handle_successful_resource_load();
         }
         return;
     }
 
-    auto handle_successful_bitmap_decode = [strong_this = GC::Root(*this)](Web::Platform::DecodedImage& result) -> ErrorOr<void> {
+    auto handle_successful_bitmap_decode = [strong_this = GC::Root(*this), image_data_is_cors_cross_origin](Web::Platform::DecodedImage& result) -> ErrorOr<void> {
         if (result.session_id != 0) {
-            // Streaming animated decode: create AnimatedDecodedImageData.
+            // Streaming animated decode: create AnimatedBitmapDecodedImageData.
             Vector<NonnullRefPtr<Gfx::Bitmap>> initial_bitmaps;
             initial_bitmaps.ensure_capacity(result.frames.size());
             for (auto& frame : result.frames)
@@ -214,8 +219,9 @@ void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, 
             auto first_bitmap = result.frames.first().bitmap;
             auto size = first_bitmap->size();
 
-            strong_this->m_image_data = AnimatedDecodedImageData::create(
+            strong_this->m_image_data = AnimatedBitmapDecodedImageData::create(
                 strong_this->m_document->realm(),
+                *strong_this->m_document,
                 result.session_id,
                 result.frame_count,
                 result.loop_count,
@@ -224,16 +230,12 @@ void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, 
                 move(result.all_durations),
                 move(initial_bitmaps));
         } else {
-            // Single-shot decode: create BitmapDecodedImageData as before.
-            Vector<BitmapDecodedImageData::Frame> frames;
-            for (auto& frame : result.frames) {
-                frames.append(BitmapDecodedImageData::Frame {
-                    .frame = Gfx::DecodedImageFrame { *frame.bitmap, result.color_space },
-                    .duration = static_cast<int>(frame.duration),
-                });
-            }
-            strong_this->m_image_data = BitmapDecodedImageData::create(strong_this->m_document->realm(), move(frames), result.loop_count, result.is_animated).release_value_but_fixme_should_propagate_errors();
+            // Non animated decode: create a single framed BitmapDecodedImageData.
+            VERIFY(result.frames.size() == 1);
+
+            strong_this->m_image_data = BitmapDecodedImageData::create(strong_this->m_document->realm(), { *result.frames[0].bitmap, result.color_space });
         }
+        strong_this->m_image_data->set_is_cors_cross_origin(image_data_is_cors_cross_origin);
         strong_this->handle_successful_resource_load();
         return {};
     };

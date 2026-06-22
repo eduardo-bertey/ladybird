@@ -120,14 +120,15 @@ static Optional<EventResult> dispatch_event_to_nested_navigable(Painting::Painta
     return {};
 }
 
-static bool parent_element_for_event_dispatch(Painting::Paintable& paintable, GC::Ptr<DOM::Node>& node, GC::Ptr<Layout::Node>& layout_node)
+static bool parent_element_for_event_dispatch(Painting::Paintable& paintable, GC::Ptr<DOM::Node>& node, Layout::Node*& layout_node)
 {
     layout_node = &paintable.layout_node();
     if (layout_node->is_generated_for_backdrop_pseudo_element()
         || layout_node->is_generated_for_after_pseudo_element()
         || layout_node->is_generated_for_before_pseudo_element()) {
         node = layout_node->pseudo_element_generator();
-        layout_node = node->layout_node();
+        if (auto* generator_layout_node = node->layout_node())
+            layout_node = generator_layout_node;
     }
 
     auto* current_ancestor_node = node.ptr();
@@ -214,7 +215,7 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
     // https://www.w3.org/TR/uievents/#topmost-event-target
     // The topmost event target MUST be the element highest in the rendering order which is capable of being an
     // event target.
-    GC::Ptr<Layout::Node> layout_node;
+    Layout::Node* layout_node = nullptr;
     if (!parent_element_for_event_dispatch(*paintable, node, layout_node))
         return EventResult::Dropped;
 
@@ -365,7 +366,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
         // https://www.w3.org/TR/uievents/#topmost-event-target
         // The topmost event target MUST be the element highest in the rendering order which is capable of being an
         // event target.
-        GC::Ptr<Layout::Node> layout_node;
+        Layout::Node* layout_node = nullptr;
         bool found_parent_element = parent_element_for_event_dispatch(*paintable, node, layout_node);
 
         if (found_parent_element) {
@@ -492,7 +493,7 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
     // https://www.w3.org/TR/uievents/#topmost-event-target
     // The topmost event target MUST be the element highest in the rendering order which is capable of being an
     // event target.
-    GC::Ptr<Layout::Node> layout_node;
+    Layout::Node* layout_node = nullptr;
     if (!parent_element_for_event_dispatch(*paintable, node, layout_node))
         return EventResult::Dropped;
 
@@ -695,7 +696,7 @@ EventResult EventHandler::dispatch_wheel_event(Painting::Paintable& paintable, C
         return EventResult::Dropped;
 
     // NB: Search for the first parent of the hit target that's an element.
-    GC::Ptr<Layout::Node> layout_node;
+    Layout::Node* layout_node = nullptr;
     if (!parent_element_for_event_dispatch(paintable, node, layout_node))
         return EventResult::Dropped;
 
@@ -824,7 +825,7 @@ void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_posit
         return;
     }
 
-    GC::Ptr<Layout::Node> layout_node;
+    Layout::Node* layout_node = nullptr;
     if (!parent_element_for_event_dispatch(*paintable, node, layout_node))
         return;
 
@@ -869,16 +870,24 @@ static constexpr bool is_enter_key_or_interoperable_enter_key_combo(UIEvents::Ke
     return false;
 }
 
-static constexpr bool should_ignore_keydown_event(u32 code_point, u32 modifiers)
+static bool should_ignore_keydown_event(u32 code_point, u32 modifiers, bool should_insert_text)
 {
-    if (modifiers & (UIEvents::KeyModifier::Mod_Ctrl | UIEvents::KeyModifier::Mod_Alt | UIEvents::KeyModifier::Mod_Super))
+    if (code_point == 0 || code_point == 27)
         return true;
 
-    // FIXME: There are probably also keys with non-zero code points that should be filtered out.
-    return code_point == 0 || code_point == 27;
+    if (modifiers & UIEvents::KeyModifier::Mod_Super)
+        return true;
+
+    if ((modifiers & UIEvents::KeyModifier::Mod_Ctrl) && !(modifiers & UIEvents::KeyModifier::Mod_Alt))
+        return true;
+
+    if ((modifiers & UIEvents::KeyModifier::Mod_Alt) && !should_insert_text)
+        return true;
+
+    return false;
 }
 
-EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u32 code_point, bool repeat)
+EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u32 code_point, bool repeat, bool should_insert_text)
 {
     if (!m_navigable->active_document())
         return EventResult::Dropped;
@@ -1047,7 +1056,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         }
 
         // FIXME: Text editing shortcut keys (copy/paste etc.) should be handled here.
-        if (!should_ignore_keydown_event(code_point, modifiers)) {
+        if (!should_ignore_keydown_event(code_point, modifiers, should_insert_text)) {
             FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::insertText, m_navigable, code_point));
             target->handle_insert(UIEvents::InputTypes::insertText, Utf16String::from_code_point(code_point));
             return EventResult::Handled;
@@ -1599,7 +1608,7 @@ void EventHandler::run_mousedown_default_actions(DOM::Document& document, CSSPix
         return;
 
     // NB: Now we can do selection with a caret-position hit test.
-    auto caret_position = document.caret_position_from_point(visual_viewport_position);
+    auto caret_position = document.caret_position_from_point_for_selection_start(visual_viewport_position);
     if (!caret_position.has_value())
         return;
 
@@ -1827,7 +1836,7 @@ static void set_user_selection(GC::Ptr<DOM::Node> anchor_node, size_t anchor_off
         //     focus node, as this means they are inside the same contain element, or not in a contain element at all.
         //     This takes care of the "selection trying to escape from a contain" case.
         while (
-            (!potential_contain_node->is_element() || potential_contain_node->layout_node()->user_select_used_value() != CSS::UserSelect::Contain) && potential_contain_node->parent() && !potential_contain_node->is_inclusive_ancestor_of(*focus_node)) {
+            (!potential_contain_node->is_element() || !potential_contain_node->layout_node() || potential_contain_node->layout_node()->user_select_used_value() != CSS::UserSelect::Contain) && potential_contain_node->parent() && !potential_contain_node->is_inclusive_ancestor_of(*focus_node)) {
             potential_contain_node = potential_contain_node->parent();
         }
 
@@ -1852,7 +1861,7 @@ static void set_user_selection(GC::Ptr<DOM::Node> anchor_node, size_t anchor_off
             auto target_node = potential_contain_node;
             potential_contain_node = focus_node;
             while (
-                (!potential_contain_node->is_element() || potential_contain_node->layout_node()->user_select_used_value() != CSS::UserSelect::Contain) && potential_contain_node->parent() && potential_contain_node != target_node) {
+                (!potential_contain_node->is_element() || !potential_contain_node->layout_node() || potential_contain_node->layout_node()->user_select_used_value() != CSS::UserSelect::Contain) && potential_contain_node->parent() && potential_contain_node != target_node) {
                 potential_contain_node = potential_contain_node->parent();
             }
             if (
@@ -2095,7 +2104,7 @@ void EventHandler::update_mouse_selection(CSSPixelPoint visual_viewport_position
 void EventHandler::apply_mouse_selection(CSSPixelPoint visual_viewport_position)
 {
     auto& document = *m_navigable->active_document();
-    auto caret_position = document.caret_position_from_point(visual_viewport_position);
+    auto caret_position = document.caret_position_from_point_for_selection(visual_viewport_position);
     if (!caret_position.has_value())
         return;
 

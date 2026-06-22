@@ -19,14 +19,34 @@
 #include <LibWebView/ViewImplementation.h>
 
 #include <QMenu>
+#include <QPixmap>
 #include <QTimer>
 #include <QUrl>
-#include <QWidget>
+
+#ifdef AK_OS_MACOS
+#    define LADYBIRD_QT_USE_METAL_RHI_WIDGET 1
+#    define LADYBIRD_QT_USE_RHI_WIDGET 1
+#elif defined(USE_VULKAN_DMABUF_IMAGES) && QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
+#    define LADYBIRD_QT_USE_VULKAN_WINDOW 1
+#endif
+
+#ifdef LADYBIRD_QT_USE_RHI_WIDGET
+#    include <QRhiWidget>
+#else
+#    include <QWidget>
+#endif
 
 class QKeyEvent;
 class QSinglePointEvent;
+class QCursor;
 
 namespace Ladybird {
+
+#ifdef LADYBIRD_QT_USE_RHI_WIDGET
+using WebContentViewBase = QRhiWidget;
+#else
+using WebContentViewBase = QWidget;
+#endif
 
 struct WebContentViewInitialState {
     double maximum_frames_per_second { 60.0 };
@@ -34,14 +54,16 @@ struct WebContentViewInitialState {
 };
 
 class WebContentView final
-    : public QWidget
+    : public WebContentViewBase
     , public WebView::ViewImplementation {
     Q_OBJECT
 public:
     WebContentView(QWidget* window, RefPtr<WebView::WebContentClient> parent_client = nullptr, size_t page_index = 0, WebContentViewInitialState initial_state = {});
     virtual ~WebContentView() override;
 
+#ifndef LADYBIRD_QT_USE_RHI_WIDGET
     virtual void paintEvent(QPaintEvent*) override;
+#endif
     virtual void resizeEvent(QResizeEvent*) override;
     virtual void leaveEvent(QEvent* event) override;
     virtual void mouseMoveEvent(QMouseEvent*) override;
@@ -74,6 +96,7 @@ public:
         Dark,
     };
     void update_palette(PaletteMode = PaletteMode::Default);
+    Optional<QPixmap> tab_preview_pixmap(QSize const& maximum_size) const;
 
     using ViewImplementation::client;
 
@@ -93,8 +116,24 @@ private:
     virtual Gfx::IntPoint to_content_position(Gfx::IntPoint widget_position) const override;
     virtual Gfx::IntPoint to_widget_position(Gfx::IntPoint content_position) const override;
 
+#ifdef LADYBIRD_QT_USE_RHI_WIDGET
+    // ^QRhiWidget
+    virtual void initialize(QRhiCommandBuffer*) override;
+    virtual void render(QRhiCommandBuffer*) override;
+    virtual void releaseResources() override;
+#endif
+
+    struct Paintable {
+        Gfx::SharedImageBuffer const* shared_image_buffer { nullptr };
+        Gfx::IntSize bitmap_size;
+    };
+
+    Optional<Paintable> current_paintable() const;
+
     void update_viewport_size();
     void update_cursor(Gfx::Cursor cursor);
+    void apply_web_content_cursor(QCursor const&);
+    void schedule_repaint();
     void update_compositor_display_metadata();
 
     Web::DevicePixelPoint node_picker_position_for(QSinglePointEvent const&) const;
@@ -120,7 +159,40 @@ private:
     int m_click_count { 0 };
 
     QMenu* m_select_dropdown { nullptr };
-    Optional<u64> m_display_id;
+
+#ifdef AK_OS_MACOS
+    bool prepare_metal_renderer(unsigned long render_target_pixel_format);
+    bool update_imported_iosurface_texture(Gfx::SharedImageBuffer const&);
+    void release_metal_resources();
+    void release_imported_iosurface_texture();
+
+    void* m_metal_device { nullptr };
+    void* m_metal_library { nullptr };
+    void* m_metal_pipeline_state { nullptr };
+    void* m_metal_sampler_state { nullptr };
+    void* m_imported_iosurface_texture { nullptr };
+    Gfx::SharedImageBuffer const* m_imported_shared_image_buffer { nullptr };
+    unsigned long m_render_target_pixel_format { 0 };
+#endif
+
+#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
+    struct VulkanRenderer;
+    struct VulkanWindow;
+    struct VulkanWindowRenderer;
+    friend struct VulkanWindow;
+    friend struct VulkanWindowRenderer;
+
+    void create_vulkan_window();
+    void destroy_vulkan_window();
+    bool current_paintable_can_use_vulkan_window() const;
+    void schedule_vulkan_window_update();
+    void update_vulkan_window_geometry();
+    void set_vulkan_window_cursor(QCursor const&);
+    bool handle_vulkan_window_event(QEvent*);
+
+    VulkanWindow* m_vulkan_window { nullptr };
+    QWidget* m_vulkan_window_container { nullptr };
+#endif
 };
 
 }

@@ -142,9 +142,7 @@ def main():
     if "target" in args:
         if platform.host_system != HostSystem.Windows and args.target == "ladybird":
             args.target = "Ladybird"
-        if not args.target and not (
-            args.command in ("build", "rebuild") or (args.preset == "Host_Tools" and args.command == "install")
-        ):
+        if not args.target and args.command not in ("build", "rebuild"):
             args.target = "ladybird" if platform.host_system == HostSystem.Windows else "Ladybird"
 
     if args.command == "build":
@@ -295,7 +293,6 @@ def configure_build_env(platform: Platform, preset: str, jobs: Optional[str] = N
         "Distribution": build_root_dir / "distribution",
         "Release": build_root_dir / "release",
         "Sanitizer": build_root_dir / "sanitizers",
-        "Host_Tools": build_root_dir / "host-tools-build",
     }
 
     build_preset_dir = known_presets.get(preset, None)
@@ -310,16 +307,14 @@ def configure_build_env(platform: Platform, preset: str, jobs: Optional[str] = N
     if jobs:
         os.environ["VCPKG_MAX_CONCURRENCY"] = jobs
 
-    if platform.host_architecture == HostArchitecture.riscv64:
-        # vcpkg refuses to build ports on riscv64 and other less common architectures without this flag.
-        # With it set vcpkg will use the system provided CMake and Ninja binaries but will still download,
-        # build and use its own pinned versions of gn, meson and pkg-config.
+    needs_system_binaries = platform.host_architecture == HostArchitecture.riscv64 or (
+        platform.host_system == HostSystem.Linux and platform.host_architecture == HostArchitecture.AArch64
+    )
+    if needs_system_binaries:
+        # vcpkg does not ship prebuilt tool binaries for riscv64 or arm64 Linux and refuses to build
+        # ports on these hosts without this flag. With it set vcpkg uses the system provided CMake and
+        # Ninja binaries but still downloads, builds and uses its own pinned gn, meson and pkg-config.
         os.environ["VCPKG_FORCE_SYSTEM_BINARIES"] = "1"
-
-    if "XDG_CACHE_HOME" not in os.environ:
-        # vcpkg requires this variable to set and in some cases like the Android build environment it might
-        # not be present, so we need to ensure that it is set
-        os.environ["XDG_CACHE_HOME"] = str(ladybird_source_dir / "Build" / "caches")
 
     return ladybird_source_dir, build_preset_dir
 

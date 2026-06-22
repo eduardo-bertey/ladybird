@@ -59,7 +59,12 @@ namespace Web {
 static void dump_session_history_entry(StringBuilder& builder, HTML::SessionHistoryEntry const& session_history_entry, int indent_levels)
 {
     dump_indent(builder, indent_levels);
-    builder.appendff("step=({}) url=({})\n", session_history_entry.step().get<int>(), session_history_entry.url());
+    builder.appendff("step=({}) url=({})", session_history_entry.step().get<int>(), session_history_entry.url());
+    if (session_history_entry.scroll_position_data().viewport_scroll_position.has_value()) {
+        auto const& viewport_scroll_position = *session_history_entry.scroll_position_data().viewport_scroll_position;
+        builder.appendff(" viewport-scroll=({}, {})", viewport_scroll_position.x(), viewport_scroll_position.y());
+    }
+    builder.append('\n');
     for (auto const& nested_history : session_history_entry.document_state()->nested_histories()) {
         for (auto const& nested_she : nested_history.entries) {
             dump_session_history_entry(builder, *nested_she, indent_levels + 1);
@@ -365,6 +370,13 @@ void dump_tree(StringBuilder& builder, Layout::Node const& layout_node, bool sho
     }
 
     auto dump_fragment = [&](auto& fragment, size_t fragment_index) {
+        auto fragment_has_paintable = fragment.layout_node().first_paintable();
+        auto fragment_rect = [&] {
+            if (fragment_has_paintable)
+                return fragment.absolute_rect();
+            return CSSPixelRect { fragment.offset(), fragment.size() };
+        }();
+
         builder.append_repeated("  "sv, indent);
         builder.appendff("  {}frag {}{} from {} ",
             fragment_color_on,
@@ -374,9 +386,9 @@ void dump_tree(StringBuilder& builder, Layout::Node const& layout_node, bool sho
         builder.appendff("start: {}, length: {}, rect: {} baseline: {}\n",
             fragment.start_offset(),
             fragment.length_in_code_units(),
-            fragment.absolute_rect(),
+            fragment_rect,
             fragment.baseline());
-        if (fragment.length_in_code_units() > 0) {
+        if (fragment_has_paintable && fragment.length_in_code_units() > 0) {
             builder.append_repeated("  "sv, indent);
             builder.appendff("      \"{}\"\n", fragment.text());
         }

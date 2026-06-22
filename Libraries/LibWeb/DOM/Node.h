@@ -82,6 +82,7 @@ enum class SetNeedsLayoutReason {
 [[nodiscard]] StringView to_string(SetNeedsLayoutReason);
 
 #define ENUMERATE_SET_NEEDS_LAYOUT_TREE_UPDATE_REASONS(X) \
+    X(CharacterDataReplaceData)                           \
     X(ElementSetInnerHTML)                                \
     X(ElementSetShadowRoot)                               \
     X(DetailsElementOpenedOrClosed)                       \
@@ -153,6 +154,10 @@ public:
     virtual bool is_svg_a_element() const { return false; }
     virtual bool is_svg_g_element() const { return false; }
     virtual bool is_svg_foreign_object_element() const { return false; }
+    virtual bool is_svg_gradient_element() const { return false; }
+    virtual bool is_svg_pattern_element() const { return false; }
+    virtual bool is_svg_clip_path_element() const { return false; }
+    virtual bool is_svg_text_content_element() const { return false; }
 
     bool in_a_document_tree() const;
 
@@ -327,8 +332,8 @@ public:
     Layout::Node const* layout_node() const;
     Layout::Node* layout_node();
 
-    Layout::Node const* unsafe_layout_node() const { return m_layout_node; }
-    Layout::Node* unsafe_layout_node() { return m_layout_node; }
+    Layout::Node const* unsafe_layout_node() const { return m_layout_node.ptr(); }
+    Layout::Node* unsafe_layout_node() { return m_layout_node.ptr(); }
 
     RefPtr<Painting::PaintableBox const> paintable_box() const;
     RefPtr<Painting::PaintableBox> paintable_box();
@@ -347,7 +352,7 @@ public:
     void set_needs_layout_update(SetNeedsLayoutReason);
 
     void clear_layout_node_and_paintable(Badge<Document>);
-    void set_layout_node(Badge<Layout::Node>, GC::Ref<Layout::Node>);
+    void set_layout_node(Badge<Layout::Node>, Layout::Node&);
     void detach_layout_node(Badge<Layout::TreeBuilder>);
 
     virtual bool is_child_allowed(Node const&) const { return true; }
@@ -377,8 +382,7 @@ public:
     CSS::StyleScope const& style_scope() const { return const_cast<Node*>(this)->style_scope(); }
     void for_each_style_scope_which_may_observe_the_node(Function<void(CSS::StyleScope&)> const&);
 
-    void set_document(Badge<Document>, Document&);
-    void set_document(Badge<NamedNodeMap>, Document&);
+    void set_document(Badge<Document, NamedNodeMap>, Document&);
 
     virtual EventTarget* get_parent(Event const&) override;
 
@@ -506,7 +510,7 @@ protected:
     virtual size_t external_memory_size() const override;
 
     GC::Ptr<Document> m_document;
-    GC::Ptr<Layout::Node> m_layout_node;
+    WeakPtr<Layout::Node> m_layout_node;
     WeakPtr<Painting::Paintable> m_paintable;
     NodeType m_type { NodeType::INVALID };
     bool m_needs_layout_tree_update { false };
@@ -538,6 +542,7 @@ private:
     void insert_before_impl(GC::Ref<Node>, GC::Ptr<Node> child);
     void append_child_impl(GC::Ref<Node>);
     void remove_child_impl(GC::Ref<Node>);
+    void clear_layout_node_paintables();
 
     static Optional<StringView> first_valid_id(StringView, Document const&);
 

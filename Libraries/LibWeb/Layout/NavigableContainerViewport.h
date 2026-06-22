@@ -12,11 +12,10 @@
 namespace Web::Layout {
 
 class NavigableContainerViewport final : public ReplacedBox {
-    GC_CELL(NavigableContainerViewport, ReplacedBox);
-    GC_DECLARE_ALLOCATOR(NavigableContainerViewport);
+    LAYOUT_NODE(NavigableContainerViewport, ReplacedBox);
 
 public:
-    NavigableContainerViewport(DOM::Document&, HTML::NavigableContainer&, GC::Ref<CSS::ComputedProperties>);
+    NavigableContainerViewport(DOM::Document&, HTML::NavigableContainer&, CSS::ComputedProperties const&);
     virtual ~NavigableContainerViewport() override;
 
     [[nodiscard]] HTML::NavigableContainer const& dom_node() const { return as<HTML::NavigableContainer>(*ReplacedBox::dom_node()); }

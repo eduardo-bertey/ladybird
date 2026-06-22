@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibCore/EventLoop.h>
+#include <LibCore/Process.h>
+#include <LibCore/System.h>
 #include <LibWeb/HTML/BroadcastChannel.h>
 #include <LibWeb/HTML/WorkerAgentParent.h>
 #include <WebWorker/ConnectionFromClient.h>
@@ -12,6 +13,15 @@
 #include <WebWorker/WorkerHost.h>
 
 namespace WebWorker {
+
+Messages::WebWorkerServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
+{
+#ifdef AK_OS_WINDOWS
+    m_transport->set_peer_pid(peer_pid);
+    return Core::System::getpid();
+#endif
+    VERIFY_NOT_REACHED();
+}
 
 void ConnectionFromClient::connect_to_request_server(IPC::TransportHandle handle)
 {
@@ -39,7 +49,7 @@ void ConnectionFromClient::die()
 {
     // FIXME: When handling multiple workers in the same process,
     //     this logic needs to be smarter (only when all workers are dead, etc).
-    Core::EventLoop::current().quit(0);
+    Core::Process::terminate_immediately(0);
 }
 
 void ConnectionFromClient::request_file(Web::FileRequest request)

@@ -7,14 +7,12 @@
 
 #pragma once
 
-#include <AK/Array.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <LibGfx/Forward.h>
 #include <LibWeb/CSS/StyleValues/GridTrackSizeListStyleValue.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/FlexLayoutData.h>
 #include <LibWeb/Layout/GridLayoutData.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
@@ -153,11 +151,7 @@ public:
 
     [[nodiscard]] bool has_css_transform() const
     {
-        auto const& computed_values = this->computed_values();
-        return !computed_values.transformations().is_empty()
-            || computed_values.rotate()
-            || computed_values.translate()
-            || computed_values.scale();
+        return layout_node().has_css_transform();
     }
 
     [[nodiscard]] bool has_non_invertible_css_transform() const { return m_has_non_invertible_css_transform; }
@@ -276,11 +270,18 @@ public:
     RefPtr<PaintableBox const> nearest_scrollable_ancestor() const;
 
     using StickyInsets = Painting::StickyInsets;
+    bool has_sticky_insets() const { return !!m_sticky_insets; }
     StickyInsets const& sticky_insets() const { return *m_sticky_insets; }
     void set_sticky_insets(OwnPtr<StickyInsets> sticky_insets) { m_sticky_insets = move(sticky_insets); }
 
     [[nodiscard]] bool could_be_scrolled_by_wheel_event() const;
     [[nodiscard]] bool could_be_scrolled_by_wheel_event(ScrollDirection direction) const;
+
+    void set_used_values_for_grid_template_columns(RefPtr<CSS::GridTrackSizeListStyleValue const> style_value) { m_used_values_for_grid_template_columns = move(style_value); }
+    RefPtr<CSS::GridTrackSizeListStyleValue const> const& used_values_for_grid_template_columns() const { return m_used_values_for_grid_template_columns; }
+
+    void set_used_values_for_grid_template_rows(RefPtr<CSS::GridTrackSizeListStyleValue const> style_value) { m_used_values_for_grid_template_rows = move(style_value); }
+    RefPtr<CSS::GridTrackSizeListStyleValue const> const& used_values_for_grid_template_rows() const { return m_used_values_for_grid_template_rows; }
 
     void set_grid_layout_data(OwnPtr<Layout::GridLayoutData> grid_layout_data) { m_grid_layout_data = move(grid_layout_data); }
     Layout::GridLayoutData const* grid_layout_data() const { return m_grid_layout_data.ptr(); }
@@ -299,27 +300,16 @@ public:
 
     Optional<CSSPixelPoint> transform_point_to_local(CSSPixelPoint screen_position) const;
     Optional<CSSPixelPoint> transform_point_to_local_for_descendants(CSSPixelPoint screen_position) const;
-    CSSPixelRect transform_rect_to_viewport(CSSPixelRect const& rect) const;
+    CSSPixelRect transform_rect_to_viewport(CSSPixelRect const& rect, AccumulatedVisualContextTree::IncludeVisualViewportTransform = AccumulatedVisualContextTree::IncludeVisualViewportTransform::Yes) const;
     CSSPixelPoint inverse_transform_point(CSSPixelPoint screen_position) const;
 
     static constexpr size_t paint_phase_count = to_underlying(PaintPhase::Overlay) + 1;
 
-    void invalidate_paint_cache() const { m_cached_phase_commands = {}; }
+    void invalidate_paint_cache() const;
 
-    bool has_cached_commands(PaintPhase phase) const
-    {
-        return m_cached_phase_commands[to_underlying(phase)].has_value();
-    }
-
-    DisplayListCommandSequence const& cached_commands(PaintPhase phase) const
-    {
-        return m_cached_phase_commands[to_underlying(phase)].value();
-    }
-
-    void set_cached_commands(PaintPhase phase, DisplayListCommandSequence commands) const
-    {
-        m_cached_phase_commands[to_underlying(phase)] = move(commands);
-    }
+    bool has_cached_commands(PaintPhase) const;
+    ReadonlyBytes cached_commands(PaintPhase) const;
+    void set_cached_commands(PaintPhase phase, ByteBuffer const& commands) const;
 
     void set_fixed_background_visual_context(VisualContextIndex index) { m_fixed_background_visual_context = index; }
     [[nodiscard]] Optional<VisualContextIndex> fixed_background_visual_context() const { return m_fixed_background_visual_context; }
@@ -345,9 +335,13 @@ protected:
     Optional<CSSPixelRect> absolute_resizer_rect(ChromeMetrics const& chrome_metrics) const;
 
 private:
+    struct CachedPaintData;
+
     [[nodiscard]] virtual bool is_paintable_box() const final { return true; }
 
     void paint_middle_button_scroll_indicator(DisplayListRecordingContext&) const;
+    void acquire_cache_references_for_cached_commands(ReadonlyBytes) const;
+    void release_cache_references_for_cached_commands(ReadonlyBytes) const;
 
     RefPtr<StackingContext> m_stacking_context;
 
@@ -362,8 +356,8 @@ private:
 
     ScrollFrameIndex m_enclosing_scroll_frame_index {};
     ScrollFrameIndex m_own_scroll_frame_index {};
-    VisualContextIndex m_accumulated_visual_context_index {};
-    VisualContextIndex m_accumulated_visual_context_for_descendants_index {};
+    VisualContextIndex m_accumulated_visual_context_index { VISUAL_VIEWPORT_NODE_INDEX };
+    VisualContextIndex m_accumulated_visual_context_for_descendants_index { VISUAL_VIEWPORT_NODE_INDEX };
     Optional<VisualContextIndex> m_fixed_background_visual_context;
 
     Optional<BordersDataWithElementKind> m_override_borders_data;
@@ -379,6 +373,8 @@ private:
 
     OwnPtr<StickyInsets> m_sticky_insets;
 
+    RefPtr<CSS::GridTrackSizeListStyleValue const> m_used_values_for_grid_template_columns;
+    RefPtr<CSS::GridTrackSizeListStyleValue const> m_used_values_for_grid_template_rows;
     OwnPtr<Layout::GridLayoutData> m_grid_layout_data;
     OwnPtr<Layout::FlexLayoutData> m_flex_layout_data;
 
@@ -392,7 +388,7 @@ private:
     bool m_fragment_right_edge_away { false };
     bool m_fragment_bottom_edge_away { false };
 
-    mutable Array<Optional<DisplayListCommandSequence>, paint_phase_count> m_cached_phase_commands;
+    mutable OwnPtr<CachedPaintData> m_cached_paint_data;
 };
 
 }

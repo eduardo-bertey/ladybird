@@ -12,6 +12,7 @@
 #include <AK/Base64.h>
 #include <AK/Debug.h>
 #include <AK/ScopeGuard.h>
+#include <AK/Utf16String.h>
 #include <LibHTTP/Cache/MemoryCache.h>
 #include <LibHTTP/Cache/Utilities.h>
 #include <LibHTTP/Method.h>
@@ -45,6 +46,7 @@
 #include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/Fetch/Infrastructure/NoSniffBlocking.h>
 #include <LibWeb/Fetch/Infrastructure/PortBlocking.h>
+#include <LibWeb/Fetch/Infrastructure/PreflightCache.h>
 #include <LibWeb/Fetch/Infrastructure/Task.h>
 #include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/FileAPI/Blob.h>
@@ -93,10 +95,18 @@ public:
         });
     }
 
+    HTTP::MemoryCache* get_if_exists(Infrastructure::NetworkPartitionKey const& key)
+    {
+        auto it = m_cache.find(key);
+        if (it == m_cache.end())
+            return nullptr;
+        return it->value.ptr();
+    }
+
     static HTTPCache& the()
     {
-        static HTTPCache s_cache;
-        return s_cache;
+        static HTTPCache& cache = *new HTTPCache;
+        return cache;
     }
 
     void clear_cache()
@@ -138,6 +148,9 @@ static GC::Ptr<Infrastructure::Response> select_response_from_cache(JS::Realm& r
     response->set_status(cache_entry->status_code);
     response->set_status_message(cache_entry->reason_phrase);
     response->set_header_list(cache_entry->response_headers);
+    response->set_javascript_bytecode_cache(cache_entry->javascript_bytecode_cache);
+    response->set_javascript_bytecode_cache_vary_key(cache_entry->javascript_bytecode_cache_vary_key);
+    response->set_javascript_bytecode_cache_memory_cache_request_headers(HTTP::HeaderList::create(cache_entry->request_headers->headers()));
 
     auto [response_body, _] = safely_extract_body(realm, cache_entry->response_body.bytes());
     response->set_body(response_body);
@@ -145,14 +158,15 @@ static GC::Ptr<Infrastructure::Response> select_response_from_cache(JS::Realm& r
     return response;
 }
 
-static void store_response_in_cache(HTTP::MemoryCache& http_cache, Infrastructure::Request const& request, Infrastructure::Response const& response)
+static void store_response_in_cache(HTTP::MemoryCache& http_cache, Infrastructure::Request const& request, Infrastructure::Response& response)
 {
     if (!g_http_memory_cache_enabled)
         return;
     if (request.cache_mode() == HTTP::CacheMode::NoStore)
         return;
 
-    http_cache.create_entry(request.current_url(), request.method(), request.header_list(), request.request_time(), response.status(), response.status_message(), response.header_list());
+    response.set_javascript_bytecode_cache_memory_cache_request_headers(HTTP::HeaderList::create(request.header_list()->headers()));
+    http_cache.create_entry(request.current_url(), request.method(), request.header_list(), request.request_time(), response.status(), response.status_message(), response.header_list(), response.javascript_bytecode_cache(), response.javascript_bytecode_cache_vary_key());
 }
 
 // https://fetch.spec.whatwg.org/#concept-fetch
@@ -563,11 +577,11 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
 
             // 2. Let corsWithPreflightResponse be the result of running HTTP fetch given fetchParams and true.
             auto cors_with_preflight_response = http_fetch(realm, fetch_params, MakeCORSPreflight::Yes);
-            cors_with_preflight_response->when_loaded([returned_pending_response](GC::Ref<Infrastructure::Response> cors_with_preflight_response) {
+            cors_with_preflight_response->when_loaded([request, returned_pending_response](GC::Ref<Infrastructure::Response> cors_with_preflight_response) {
                 dbgln_if(WEB_FETCH_DEBUG, "Fetch: Running 'main fetch' cors_with_preflight_response load callback");
                 // 3. If corsWithPreflightResponse is a network error, then clear cache entries using request.
                 if (cors_with_preflight_response->is_network_error()) {
-                    // FIXME: Clear cache entries
+                    Infrastructure::PreflightCache::the().clear_cache_entries(request);
                 }
 
                 // 4. Return corsWithPreflightResponse.
@@ -1300,25 +1314,31 @@ GC::Ref<PendingResponse> http_fetch(JS::Realm& realm, Infrastructure::FetchParam
     // 4. If response is null, then:
     if (!response) {
         // 1. If makeCORSPreflight is true and one of these conditions is true:
-        // NOTE: This step checks the CORS-preflight cache and if there is no suitable entry it performs a
-        //       CORS-preflight fetch which, if successful, populates the cache. The purpose of the CORS-preflight
-        //       fetch is to ensure the fetched resource is familiar with the CORS protocol. The cache is there to
-        //       minimize the number of CORS-preflight fetches.
         GC::Ptr<PendingResponse> pending_preflight_response;
-        if (make_cors_preflight == MakeCORSPreflight::Yes && (
-                // - There is no method cache entry match for request’s method using request, and either request’s
-                //   method is not a CORS-safelisted method or request’s use-CORS-preflight flag is set.
-                //   FIXME: We currently have no cache, so there will always be no method cache entry.
-                (!HTTP::is_cors_safelisted_method(request->method()) || request->use_cors_preflight())
-                // - There is at least one item in the CORS-unsafe request-header names with request’s header list for
-                //   which there is no header-name cache entry match using request.
-                //   FIXME: We currently have no cache, so there will always be no header-name cache entry.
-                || !Infrastructure::get_cors_unsafe_header_names(request->header_list()).is_empty())) {
+        auto& preflight_cache = Infrastructure::PreflightCache::the();
+
+        // - There is no method cache entry match for request's method using request,
+        //   and either request's method is not a CORS-safelisted method or request's use-CORS-preflight flag is set.
+        bool method_needs_preflight = !preflight_cache.is_a_method_cache_entry_match(*request, request->method())
+            && (!HTTP::is_cors_safelisted_method(request->method()) || request->use_cors_preflight());
+
+        // - There is at least one item in the CORS-unsafe request-header names with request's header list for
+        //   which there is no header-name cache entry match using request.
+        bool headers_need_preflight = any_of(Infrastructure::get_cors_unsafe_header_names(request->header_list()),
+            [&](auto const& name) {
+                return !preflight_cache.is_a_header_name_cache_entry_match(*request, name);
+            });
+
+        if (make_cors_preflight == MakeCORSPreflight::Yes && (method_needs_preflight || headers_need_preflight)) {
             // 1. Let preflightResponse be the result of running CORS-preflight fetch given request.
             pending_preflight_response = cors_preflight_fetch(realm, request);
 
             // NOTE: Step 2 is performed in pending_preflight_response's load callback below.
         }
+        // NOTE: This step checks the CORS-preflight cache and if there is no suitable entry it performs a
+        //       CORS-preflight fetch which, if successful, populates the cache. The purpose of the CORS-preflight
+        //       fetch is to ensure the fetched resource is familiar with the CORS protocol. The cache is there to
+        //       minimize the number of CORS-preflight fetches.
 
         auto fetch_main_content = GC::create_function(realm.heap(), [request, realm = GC::Ref { realm }, fetch_params = GC::Ref { fetch_params }]() -> GC::Ref<PendingResponse> {
             // 2. If request’s redirect mode is "follow", then set request’s service-workers mode to "none".
@@ -2284,13 +2304,13 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
             fetched_data_receiver->handle_network_data(Requests::ResponseData::from_bytes({}), FetchedDataReceiver::NetworkState::Complete);
         } else {
             // 16.1.2.2. Otherwise, if stream is readable, error stream with a TypeError.
-            auto error = MUST(String::formatted("Load failed: {}", error_message.value_or("Unknown error"sv)));
+            auto error = Utf16String::formatted("Load failed: {}", error_message.value_or("Unknown error"sv));
 
             if (stream->is_readable())
                 stream->error(JS::TypeError::create(realm, error));
 
             if (!pending_response->is_resolved())
-                pending_response->resolve(Infrastructure::Response::network_error(vm, error));
+                pending_response->resolve(Infrastructure::Response::network_error(vm, error.to_utf8_but_should_be_ported_to_utf16()));
         }
     });
 
@@ -2452,24 +2472,39 @@ GC::Ref<PendingResponse> cors_preflight_fetch(JS::Realm& realm, Infrastructure::
                 }
             }
 
-            // FIXME: 8. Let max-age be the result of extracting header list values given `Access-Control-Max-Age` and response’s header list.
-            // FIXME: 9. If max-age is failure or null, then set max-age to 5.
-            // FIXME: 10. If max-age is greater than an imposed limit on max-age, then set max-age to the imposed limit.
+            // 8. Let max-age be the result of extracting header list values given `Access-Control-Max-Age` and response's header list.
+            auto max_age_result = response->header_list()->extract_header_list_values("Access-Control-Max-Age"sv);
+            auto* maybe_max_age = max_age_result.get_pointer<Vector<ByteString>>();
+
+            // 9. If max-age is failure or null, then set max-age to 5.
+            // 10. If max-age is greater than an imposed limit on max-age, then set max-age to the imposed limit.
+            auto max_age = AK::Duration::from_seconds(5);
+            if (maybe_max_age && maybe_max_age->size() == 1) {
+                if (auto maybe_number = maybe_max_age->first().to_number<i32>(); maybe_number.has_value())
+                    max_age = min(AK::Duration::from_seconds(maybe_number.value()), Infrastructure::PreflightCache::MAX_AGE_LIMIT);
+            }
 
             // 11. If the user agent does not provide for a cache, then return response.
-            // NOTE: Since we don't currently have a cache, this is always true.
+            // NB: We do provide for a cache, so continue.
+
+            // 12. For each method in methods for which there is a method cache entry match using request, set matching entry's max-age
+            //     to max-age.
+            // 13. For each method in methods for which there is no method cache entry match using request, create a new cache entry
+            //     with request, max-age, method, and null.
+            auto& preflight_cache = Infrastructure::PreflightCache::the();
+            for (auto const& method : methods)
+                preflight_cache.cache_method(request, method, max_age);
+
+            // 14. For each headerName in headerNames for which there is a header-name cache entry match using request, set matching
+            //     entry's max-age to max-age.
+            // 15. For each headerName in headerNames for which there is no header-name cache entry match using request, create a
+            //     new cache entry with request, max-age, null, and headerName.
+            for (auto const& header_name : header_names)
+                preflight_cache.cache_header_name(request, header_name, max_age);
+
+            // 16. Return response.
             returned_pending_response->resolve(response);
             return;
-
-            // FIXME: 12. For each method in methods for which there is a method cache entry match using request, set matching entry’s max-age
-            //            to max-age.
-            // FIXME: 13. For each method in methods for which there is no method cache entry match using request, create a new cache entry
-            //            with request, max-age, method, and null.
-            // FIXME: 14. For each headerName in headerNames for which there is a header-name cache entry match using request, set matching
-            //            entry’s max-age to max-age.
-            // FIXME: 15. For each headerName in headerNames for which there is no header-name cache entry match using request, create a
-            //            new cache entry with request, max-age, null, and headerName.
-            // FIXME: 16. Return response.
         }
 
         // 8. Otherwise, return a network error.
@@ -2569,7 +2604,7 @@ void set_sec_fetch_user_header(Infrastructure::Request& request)
 
     // 4. Set header’s value to true.
     // NOTE: See https://datatracker.ietf.org/doc/html/rfc8941#name-booleans for boolean format in RFC 8941.
-    static ByteString value = "?1"sv;
+    static ByteString const& value = *new ByteString("?1"sv);
 
     // 5. Set a structured field value `Sec-Fetch-User`/header in r’s header list.
     request.header_list()->append({ "Sec-Fetch-User"sv, value });
@@ -2608,6 +2643,16 @@ bool http_memory_cache_enabled()
 void clear_http_memory_cache()
 {
     HTTPCache::the().clear_cache();
+}
+
+void update_javascript_bytecode_cache_in_http_memory_cache(Infrastructure::NetworkPartitionKey const& partition_key, URL::URL const& url, ByteString const& method, HTTP::HeaderList const& request_headers, u64 vary_key, Core::ImmutableBytes javascript_bytecode_cache)
+{
+    if (!g_http_memory_cache_enabled)
+        return;
+
+    // Only back-fill into a partition that already has a cache; do not create an empty one just to drop bytecode into.
+    if (auto* http_cache = HTTPCache::the().get_if_exists(partition_key))
+        http_cache->update_javascript_bytecode_cache(url, method, request_headers, vary_key, move(javascript_bytecode_cache));
 }
 
 }

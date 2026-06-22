@@ -32,7 +32,7 @@ void FillRect::dump(StringBuilder& builder) const
 
 void DrawScaledDecodedImageFrame::dump(StringBuilder& builder) const
 {
-    builder.appendff(" dst_rect={} clip_rect={}", dst_rect, clip_rect);
+    builder.appendff(" dst_rect={}", dst_rect);
 }
 
 void DrawRepeatedDecodedImageFrame::dump(StringBuilder& builder) const
@@ -40,7 +40,12 @@ void DrawRepeatedDecodedImageFrame::dump(StringBuilder& builder) const
     builder.appendff(" dst_rect={} clip_rect={}", dst_rect, clip_rect);
 }
 
-void DrawCompositorSurface::dump(StringBuilder& builder) const
+void DrawCompositedContext::dump(StringBuilder& builder) const
+{
+    builder.appendff(" dst_rect={}", dst_rect);
+}
+
+void DrawCanvas::dump(StringBuilder& builder) const
 {
     builder.appendff(" dst_rect={}", dst_rect);
 }
@@ -184,6 +189,11 @@ void CompositorBlockingWheelEventRegion::dump(StringBuilder& builder) const
 }
 
 void CompositorWheelHitTestTarget::dump(StringBuilder& builder) const
+{
+    builder.appendff(" target_scroll_frame_index={} rect={}", target_scroll_frame_index, rect);
+}
+
+void CompositorWheelHitTestTargetWithCornerRadii::dump(StringBuilder& builder) const
 {
     builder.appendff(" target_scroll_frame_index={} rect={}", target_scroll_frame_index, rect);
     if (corner_radii.has_any_radius()) {

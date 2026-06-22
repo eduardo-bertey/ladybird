@@ -24,6 +24,7 @@
 #include <LibGfx/Rect.h>
 #include <LibGfx/ScalingMode.h>
 #include <LibGfx/Size.h>
+#include <LibWeb/Compositor/Types.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/DisplayListResourceIds.h>
@@ -38,7 +39,8 @@ class DisplayList;
     V(FillRect, fill_rect)                                                             \
     V(DrawScaledDecodedImageFrame, draw_scaled_decoded_image_frame)                    \
     V(DrawRepeatedDecodedImageFrame, draw_repeated_decoded_image_frame)                \
-    V(DrawCompositorSurface, draw_compositor_surface)                                  \
+    V(DrawCompositedContext, draw_composited_context)                                  \
+    V(DrawCanvas, draw_canvas)                                                         \
     V(DrawVideoFrame, draw_video_frame)                                                \
     V(Save, save)                                                                      \
     V(SaveLayer, save_layer)                                                           \
@@ -64,6 +66,8 @@ class DisplayList;
     V(CompositorScrollNode, compositor_scroll_node)                                    \
     V(CompositorStickyArea, compositor_sticky_area)                                    \
     V(CompositorWheelHitTestTarget, compositor_wheel_hit_test_target)                  \
+    V(CompositorWheelHitTestTargetWithCornerRadii,                                     \
+        compositor_wheel_hit_test_target_with_corner_radii)                            \
     V(CompositorMainThreadWheelEventRegion, compositor_main_thread_wheel_event_region) \
     V(CompositorViewportScrollbar, compositor_viewport_scrollbar)                      \
     V(CompositorBlockingWheelEventRegion, compositor_blocking_wheel_event_region)      \
@@ -75,6 +79,22 @@ enum class DisplayListCommandType : u8 {
     ENUMERATE_DISPLAY_LIST_COMMANDS(ENUMERATE_DISPLAY_LIST_COMMAND_TYPE)
 #undef ENUMERATE_DISPLAY_LIST_COMMAND_TYPE
 };
+
+constexpr bool display_list_command_is_compositor_metadata(DisplayListCommandType type)
+{
+    switch (type) {
+    case DisplayListCommandType::CompositorScrollNode:
+    case DisplayListCommandType::CompositorStickyArea:
+    case DisplayListCommandType::CompositorWheelHitTestTarget:
+    case DisplayListCommandType::CompositorWheelHitTestTargetWithCornerRadii:
+    case DisplayListCommandType::CompositorMainThreadWheelEventRegion:
+    case DisplayListCommandType::CompositorViewportScrollbar:
+    case DisplayListCommandType::CompositorBlockingWheelEventRegion:
+        return true;
+    default:
+        return false;
+    }
+}
 
 enum class CompositorScrollNodeKind : u8 {
     Viewport,
@@ -99,10 +119,15 @@ struct DisplayListGradientColorStops {
 struct DisplayListCommandHeader {
     DisplayListCommandType type;
     u32 payload_size { 0 };
-    VisualContextIndex context_index {};
+    VisualContextIndex context_index { VISUAL_VIEWPORT_NODE_INDEX };
     bool has_bounding_rect { false };
     bool is_clip { false };
     Gfx::IntRect bounding_rect {};
+};
+
+struct DisplayListGlyph {
+    Gfx::FloatPoint position;
+    u32 glyph_id { 0 };
 };
 
 struct DrawGlyphRun {
@@ -138,11 +163,10 @@ struct DrawScaledDecodedImageFrame {
     static constexpr DisplayListCommandType command_type = DisplayListCommandType::DrawScaledDecodedImageFrame;
 
     Gfx::IntRect dst_rect;
-    Gfx::IntRect clip_rect;
     ImageFrameResourceId frame_id;
     Gfx::ScalingMode scaling_mode;
 
-    [[nodiscard]] Gfx::IntRect bounding_rect() const { return clip_rect; }
+    [[nodiscard]] Gfx::IntRect bounding_rect() const { return dst_rect; }
     void dump(StringBuilder&) const;
 };
 
@@ -165,12 +189,24 @@ struct DrawRepeatedDecodedImageFrame {
     void dump(StringBuilder&) const;
 };
 
-struct DrawCompositorSurface {
-    static constexpr StringView command_name = "DrawCompositorSurface"sv;
-    static constexpr DisplayListCommandType command_type = DisplayListCommandType::DrawCompositorSurface;
+struct DrawCompositedContext {
+    static constexpr StringView command_name = "DrawCompositedContext"sv;
+    static constexpr DisplayListCommandType command_type = DisplayListCommandType::DrawCompositedContext;
 
     Gfx::IntRect dst_rect;
-    CompositorSurfaceId surface_id;
+    Web::Compositor::CompositorContextId child_context_id;
+    Gfx::ScalingMode scaling_mode;
+
+    [[nodiscard]] Gfx::IntRect bounding_rect() const { return dst_rect; }
+    void dump(StringBuilder&) const;
+};
+
+struct DrawCanvas {
+    static constexpr StringView command_name = "DrawCanvas"sv;
+    static constexpr DisplayListCommandType command_type = DisplayListCommandType::DrawCanvas;
+
+    Gfx::IntRect dst_rect;
+    CanvasId canvas_id;
     Gfx::ScalingMode scaling_mode;
 
     [[nodiscard]] Gfx::IntRect bounding_rect() const { return dst_rect; }
@@ -505,7 +541,6 @@ struct PaintNestedDisplayList {
     static constexpr DisplayListCommandType command_type = DisplayListCommandType::PaintNestedDisplayList;
 
     DisplayListResourceId display_list_id;
-    DisplayListDataSpan command_bytes;
     Gfx::IntRect rect;
 
     [[nodiscard]] Gfx::IntRect bounding_rect() const { return rect; }
@@ -565,6 +600,17 @@ struct CompositorBlockingWheelEventRegion {
 struct CompositorWheelHitTestTarget {
     static constexpr StringView command_name = "CompositorWheelHitTestTarget"sv;
     static constexpr DisplayListCommandType command_type = DisplayListCommandType::CompositorWheelHitTestTarget;
+
+    UniqueNodeID document_id;
+    ScrollFrameIndex target_scroll_frame_index;
+    Gfx::FloatRect rect;
+
+    void dump(StringBuilder&) const;
+};
+
+struct CompositorWheelHitTestTargetWithCornerRadii {
+    static constexpr StringView command_name = "CompositorWheelHitTestTargetWithCornerRadii"sv;
+    static constexpr DisplayListCommandType command_type = DisplayListCommandType::CompositorWheelHitTestTargetWithCornerRadii;
 
     UniqueNodeID document_id;
     ScrollFrameIndex target_scroll_frame_index;
@@ -709,6 +755,7 @@ inline int display_list_command_nesting_level_change(DisplayListCommandType comm
 }
 
 static_assert(IsTriviallyCopyable<DisplayListCommandHeader>);
+static_assert(IsTriviallyCopyable<DisplayListGlyph>);
 
 #define VERIFY_DISPLAY_LIST_COMMAND(command, player_method) static_assert(IsTriviallyCopyable<command>);
 ENUMERATE_DISPLAY_LIST_COMMANDS(VERIFY_DISPLAY_LIST_COMMAND)

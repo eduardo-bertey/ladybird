@@ -1,5 +1,5 @@
 {
-  "builtin-baseline": "48cfe1e0e928341709d97fc3d2eff10ad6262c96",
+  "builtin-baseline": "81de6771512413aaf89ea77add5ad1fda126b9d0",
   "dependencies": [
     {
       "name": "angle",
@@ -99,6 +99,11 @@
       "name": "libproxy",
       "platform": "!(android | bsd)"
     },
+    "libpsl",
+    {
+      "name": "libedit",
+      "platform": "!windows & !android"
+    },
     "libtommath",
     {
       "name": "libwebp",
@@ -145,7 +150,7 @@
         "freetype",
         "harfbuzz",
         "icu",
-        "vulkan"
+        "direct3d"
       ]
     },
     {
@@ -175,9 +180,16 @@
         "zstd"
       ]
     },
-    "vulkan",
-    "vulkan-headers",
+    {
+      "name": "vulkan",
+      "platform": "linux | bsd | android"
+    },
+    {
+      "name": "vulkan-headers",
+      "platform": "linux | bsd | android"
+    },
     "woff2",
+    "wuffs",
     "zlib"
   ],
   "features": {
@@ -186,7 +198,7 @@
       "dependencies": [
         {
           "name": "libadwaita",
-          "platform": "linux"
+          "platform": "linux | osx"
         },
         {
           "name": "wayland",
@@ -248,7 +260,6 @@
             "pcre2",
             "png",
             "thread",
-            "vulkan",
             "widgets",
             "zstd"
           ]
@@ -267,7 +278,7 @@
     },
     {
       "name": "curl",
-      "version": "8.19.0#0"
+      "version": "8.20.0#2"
     },
     {
       "name": "dav1d",
@@ -302,6 +313,10 @@
       "version": "2.17.1#1"
     },
     {
+      "name": "freetype",
+      "version": "2.13.3#0"
+    },
+    {
       "name": "harfbuzz",
       "version": "10.2.0#0"
     },
@@ -311,7 +326,7 @@
     },
     {
       "name": "icu",
-      "version": "78.2#0"
+      "version": "78.3#1"
     },
     {
       "name": "libadwaita",
@@ -324,6 +339,10 @@
     {
       "name": "libdwarf",
       "version": "2.3.0#0"
+    },
+    {
+      "name": "libedit",
+      "version": "2024-08-08#0"
     },
     {
       "name": "libjpeg-turbo",
@@ -340,6 +359,10 @@
     {
       "name": "libproxy",
       "version": "0.4.18#3"
+    },
+    {
+      "name": "libpsl",
+      "version": "0.21.5#1"
     },
     {
       "name": "libtommath",
@@ -424,6 +447,10 @@
     {
       "name": "woff2",
       "version": "1.0.2#5"
+    },
+    {
+      "name": "wuffs",
+      "version": "0.3.4#0"
     },
     {
       "name": "zlib",

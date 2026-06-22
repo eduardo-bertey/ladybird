@@ -11,6 +11,7 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/Layout/ReplacedBox.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
 #include <LibWeb/Layout/Viewport.h>
@@ -26,6 +27,7 @@
 namespace Web::Painting {
 
 AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaintable&);
+void update_visual_viewport_accumulated_visual_context(ViewportPaintable&);
 
 NonnullRefPtr<ViewportPaintable> ViewportPaintable::create(Layout::Viewport const& layout_viewport)
 {
@@ -94,6 +96,7 @@ void ViewportPaintable::reset_for_relayout()
     m_needs_to_refresh_scroll_state = true;
     m_paintable_boxes_with_auto_content_visibility.clear();
     m_visual_context_tree.clear();
+    m_visual_context_tree_needs_compositor_update = false;
 }
 
 void ViewportPaintable::build_stacking_context_tree_if_needed()
@@ -116,6 +119,8 @@ void ViewportPaintable::build_stacking_context_tree()
             parent_context->m_positioned_descendants_and_stacking_contexts_with_stack_level_0.append(paintable_box);
         if (!paintable_box.is_positioned() && paintable_box.is_floating())
             parent_context->m_non_positioned_floating_descendants.append(paintable_box);
+        if (!establishes_stacking_context && (paintable_box.is_inline() || is<Layout::ReplacedBox>(paintable_box.layout_node())))
+            parent_context->m_contains_inline_or_replaced_descendants = true;
         if (!establishes_stacking_context) {
             VERIFY(!paintable_box.stacking_context());
             return TraversalDecision::Continue;
@@ -170,7 +175,7 @@ void ViewportPaintable::assign_scroll_frames()
 
     for_each_in_inclusive_subtree_of_type<PaintableBox>([&](auto& paintable_box) {
         ScrollFrameIndex sticky_scroll_frame_index;
-        if (paintable_box.is_sticky_position()) {
+        if (paintable_box.is_sticky_position() && paintable_box.has_sticky_insets()) {
             auto parent_index = paintable_box.nearest_scroll_frame_index();
             sticky_scroll_frame_index = m_scroll_state.create_sticky_frame_for(paintable_box, parent_index);
             precompute_sticky_constraints(sticky_scroll_frame_index, paintable_box);
@@ -213,7 +218,21 @@ void ViewportPaintable::assign_scroll_frames()
 
 void ViewportPaintable::assign_accumulated_visual_contexts()
 {
-    m_visual_context_tree = build_accumulated_visual_context_tree(*this);
+    auto visual_context_tree = build_accumulated_visual_context_tree(*this);
+    if (m_visual_context_tree.has_value() && visual_context_tree.is_compatible_with(*m_visual_context_tree))
+        visual_context_tree.reuse_version_from(*m_visual_context_tree);
+    m_visual_context_tree = move(visual_context_tree);
+    m_visual_context_tree_needs_compositor_update = true;
+}
+
+void ViewportPaintable::update_visual_viewport_accumulated_visual_context()
+{
+    if (!m_visual_context_tree.has_value()) {
+        assign_accumulated_visual_contexts();
+        return;
+    }
+    Painting::update_visual_viewport_accumulated_visual_context(*this);
+    m_visual_context_tree_needs_compositor_update = true;
 }
 
 void ViewportPaintable::refresh_scroll_state()

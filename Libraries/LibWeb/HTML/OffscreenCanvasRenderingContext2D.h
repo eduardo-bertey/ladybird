@@ -11,7 +11,6 @@
 #include <LibGfx/AffineTransform.h>
 #include <LibGfx/Color.h>
 #include <LibGfx/Forward.h>
-#include <LibGfx/Painter.h>
 #include <LibGfx/Path.h>
 #include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/DOM/EventTarget.h>
@@ -39,9 +38,9 @@ namespace Web::HTML {
 
 class OffscreenCanvasRenderingContext2D : public Bindings::PlatformObject
     , public CanvasState
-    , public CanvasTransform<OffscreenCanvasRenderingContext2D>
-    , public CanvasFillStrokeStyles<OffscreenCanvasRenderingContext2D>
-    , public CanvasShadowStyles<OffscreenCanvasRenderingContext2D>
+    , public CanvasTransform
+    , public CanvasFillStrokeStyles
+    , public CanvasShadowStyles
     , public CanvasFilters
     , public CanvasRect
     , public CanvasDrawPath
@@ -51,8 +50,8 @@ class OffscreenCanvasRenderingContext2D : public Bindings::PlatformObject
     , public CanvasImageSmoothing
     , public CanvasCompositing
     , public CanvasSettings
-    , public CanvasPathDrawingStyles<OffscreenCanvasRenderingContext2D>
-    , public CanvasTextDrawingStyles<OffscreenCanvasRenderingContext2D, OffscreenCanvas>
+    , public CanvasPathDrawingStyles
+    , public CanvasTextDrawingStyles<OffscreenCanvas>
     , public CanvasPath
 
 {
@@ -83,7 +82,7 @@ public:
 
     virtual WebIDL::ExceptionOr<GC::Ref<ImageData>> create_image_data(int width, int height, Optional<Bindings::ImageDataSettings> const& settings = {}) const override;
     virtual WebIDL::ExceptionOr<GC::Ref<ImageData>> create_image_data(ImageData const& image_data) const override;
-    virtual WebIDL::ExceptionOr<GC::Ptr<ImageData>> get_image_data(int x, int y, int width, int height, Optional<Bindings::ImageDataSettings> const& settings = {}) const override;
+    virtual WebIDL::ExceptionOr<GC::Ptr<ImageData>> get_image_data(int x, int y, int width, int height, Optional<Bindings::ImageDataSettings> const& settings = {}) override;
     virtual WebIDL::ExceptionOr<void> put_image_data(ImageData&, float x, float y) override;
     virtual WebIDL::ExceptionOr<void> put_image_data(ImageData&, float x, float y, float dirty_x, float dirty_y, float dirty_width, float dirty_height) override;
 
@@ -122,25 +121,20 @@ public:
     virtual String shadow_color() const override;
     virtual void set_shadow_color(String) override;
 
-    OffscreenCanvas& canvas_element();
-    OffscreenCanvas const& canvas_element() const;
-
-    [[nodiscard]] Gfx::Painter* painter();
-
     void set_size(Gfx::IntSize const&);
+
+protected:
+    [[nodiscard]] Gfx::CanvasCommandList* canvas_command_list() override;
+    Variant<GC::Ref<HTMLCanvasElement>, GC::Ref<OffscreenCanvas>> canvas_element() override { return m_canvas; }
+    Variant<GC::Ref<HTMLCanvasElement>, GC::Ref<OffscreenCanvas>> canvas_element() const override { return m_canvas; }
+    JS::Realm& my_realm() override { return realm(); }
+    Gfx::Path& mutable_path() override { return path(); }
 
 private:
     explicit OffscreenCanvasRenderingContext2D(JS::Realm&, OffscreenCanvas&, Bindings::CanvasRenderingContext2DSettings);
 
     virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
-
-    virtual Gfx::Painter* painter_for_canvas_state() override
-    {
-        dbgln("(STUBBED) OffscreenCanvasRenderingContext2D::painter_for_canvas_state()");
-        return nullptr;
-    }
-    virtual Gfx::Path& path_for_canvas_state() override { return path(); }
 
     GC::Ref<OffscreenCanvas> m_canvas;
     Gfx::IntSize m_size;

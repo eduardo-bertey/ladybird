@@ -12,11 +12,10 @@
 namespace Web::Layout {
 
 class RangeInputBox final : public BlockContainer {
-    GC_CELL(RangeInputBox, BlockContainer);
-    GC_DECLARE_ALLOCATOR(RangeInputBox);
+    LAYOUT_NODE(RangeInputBox, BlockContainer);
 
 public:
-    RangeInputBox(DOM::Document&, GC::Ptr<DOM::Element>, GC::Ref<CSS::ComputedProperties>);
+    RangeInputBox(DOM::Document&, GC::Ptr<DOM::Element>, CSS::ComputedProperties const&);
 
     virtual ~RangeInputBox() override = default;
 

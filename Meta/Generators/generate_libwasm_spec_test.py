@@ -64,6 +64,13 @@ class ModuleCommand:
     name: Optional[str]
 
 
+# An anonymous `(module definition ...)`.
+@dataclass
+class ModuleDefinitionCommand:
+    line: int
+    file_name: Path
+
+
 @dataclass
 class Invoke:
     field: str
@@ -122,6 +129,7 @@ class AssertInvalid:
 
 Command = Union[
     ModuleCommand,
+    ModuleDefinitionCommand,
     AssertReturn,
     AssertTrap,
     ActionCommand,
@@ -157,6 +165,19 @@ class GeneratedAnyFuncRef:
     pass
 
 
+# `(ref.extern)` with no index: any non-null extern reference.
+@dataclass
+class GeneratedAnyExternRef:
+    pass
+
+
+# A gc reference expectation with no concrete index, e.g. `(ref.struct)`: any non-null
+# reference. The harness cannot inspect the heap type, so only non-nullness is checked.
+@dataclass
+class GeneratedAnyGCRef:
+    kind: str
+
+
 GeneratedValue = Union[
     str,
     ArithmeticNan,
@@ -164,6 +185,8 @@ GeneratedValue = Union[
     GeneratedVector,
     GeneratedEitherOf,
     GeneratedAnyFuncRef,
+    GeneratedAnyExternRef,
+    GeneratedAnyGCRef,
 ]
 
 
@@ -241,7 +264,7 @@ def parse(raw: dict[str, Any]) -> WastDescription:
             if "name" in raw_cmd:
                 defined_modules[raw_cmd["name"]] = module_binary_filename(raw_cmd)
                 continue
-            cmd = ModuleCommand(line, module_binary_filename(raw_cmd), None)
+            cmd = ModuleDefinitionCommand(line, module_binary_filename(raw_cmd))
         elif cmd_type == "module_instance":
             cmd = ModuleCommand(line, defined_modules[raw_cmd["module"]], raw_cmd.get("instance"))
         elif cmd_type == "action":
@@ -312,7 +335,11 @@ def gen_vector(vec: WasmVector, *, array=False) -> str:
 
 def gen_value_arg(value: WasmValue) -> str:
     if isinstance(value, WasmGCValue):
-        return "null"
+        if value.value is None or value.value == "null":
+            return "null"
+        # A host reference (e.g. `(ref.host 2)` passed as anyref); the harness passes host
+        # references by their address.
+        return value.value
 
     if isinstance(value, WasmVector):
         return gen_vector(value)
@@ -374,8 +401,22 @@ def gen_value_result(value: WasmValue) -> GeneratedValue:
     if isinstance(value, EitherOf):
         return GeneratedEitherOf([gen_value_result(option) for option in value.options])
 
+    if isinstance(value, WasmGCValue):
+        if value.value == "null":
+            return "null"
+        # A bottom-type reference (e.g. `(ref.null none)`) can only ever be null.
+        if value.kind in ("nullref", "nullexnref", "nullexternref"):
+            return "null"
+        if value.value is None:
+            return GeneratedAnyGCRef(value.kind)
+        # A host reference result, surfaced by its address (e.g. `(ref.host 1)` as anyref).
+        return value.value
+
     if value.kind == "funcref" and value.value is None:
         return GeneratedAnyFuncRef()
+
+    if value.kind == "externref" and value.value is None:
+        return GeneratedAnyExternRef()
 
     if value.kind == "f32" or value.kind == "f64":
         assert value.value is not None
@@ -428,6 +469,23 @@ _test.skip = test.skip;
     ctx.has_unclosed = True
 
 
+def gen_module_definition_command(command: ModuleDefinitionCommand, ctx: Context):
+    if ctx.has_unclosed:
+        print("});")
+        ctx.has_unclosed = False
+    stem = command.file_name.stem
+    print(
+        f"""
+describe("{stem}", () => {{
+let _test = test;
+{gen_test_command_for_module(command.file_name)}("validate (line {command.line})", () => {{
+content = readBinaryWasmFile("Fixtures/SpecTests/{command.file_name}");
+validateWebAssemblyModule(content);
+}});
+}});"""
+    )
+
+
 def gen_invalid(invalid: AssertInvalid, ctx: Context):
     # TODO: Remove this once the multiple memories proposal is standardized.
     # We support the multiple memories proposal, so spec-tests that check that
@@ -451,7 +509,7 @@ expect(() => parseWebAssemblyModule(content, globalImportObject)).toThrow(Error,
 
 
 def gen_pretty_expect(expr: str, got: str, expect: str):
-    print(f"if (!{expr}) {{ expect().fail(`Failed with ${{{got}}}, expected {expect}`); }}")
+    print(f"if (!({expr})) {{ expect().fail(`Failed with ${{{got}}}, expected {expect}`); }}")
 
 
 def gen_expectation(gen_result: GeneratedValue, module: str):
@@ -464,6 +522,25 @@ def gen_expectation(gen_result: GeneratedValue, module: str):
             f"isValidFuncrefIn(_result, {module})",
             "_result",
             "(ref.func)",
+        )
+        return
+    if isinstance(gen_result, GeneratedAnyExternRef):
+        # Null extern references surface as JS null; live ones as their address.
+        print(f"/* {gen_result} */ ", end="")
+        gen_pretty_expect(
+            "_result !== null",
+            "_result",
+            "(ref.extern)",
+        )
+        return
+    if isinstance(gen_result, GeneratedAnyGCRef):
+        # Null gc references surface as JS null; the harness cannot check the heap type of a
+        # live one, only that it is not null.
+        print(f"/* {gen_result} */ ", end="")
+        gen_pretty_expect(
+            "_result !== null",
+            "_result",
+            f"(ref.{gen_result.kind})",
         )
         return
     if isinstance(gen_result, ArithmeticNan):
@@ -572,6 +649,9 @@ def gen_register(register: Register, _: Context):
 def gen_command(command: Command, ctx: Context):
     if isinstance(command, ModuleCommand):
         gen_module_command(command, ctx)
+        return
+    if isinstance(command, ModuleDefinitionCommand):
+        gen_module_definition_command(command, ctx)
         return
     if isinstance(command, ActionCommand):
         if isinstance(command.action, Invoke):

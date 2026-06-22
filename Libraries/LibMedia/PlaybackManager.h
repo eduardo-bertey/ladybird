@@ -55,7 +55,7 @@ public:
 
     AK::Duration duration() const { return m_duration; }
     void set_duration(AK::Duration duration) { m_duration = duration; }
-    AK::Duration current_time() const { return min(m_time_provider->current_time(), duration()); }
+    AK::Duration current_time() const;
 
     Optional<AK::UnixDateTime> start_time_realtime() const { return m_start_time_realtime; }
 
@@ -89,6 +89,7 @@ public:
     TimeRanges buffered_time_ranges() const;
 
     void set_volume(double);
+    void set_playback_rate(float);
 
     Function<void()> on_metadata_parsed;
     Function<void(DecoderError&&)> on_unsupported_format_error;
@@ -100,13 +101,12 @@ public:
     void add_media_source(NonnullRefPtr<MediaStream> const&);
     void add_media_source(NonnullRefPtr<Demuxer> const&);
 
-    WeakPlaybackManager weak();
-
 private:
     struct VideoTrackData {
         Track track;
         NonnullRefPtr<DecodedVideoProducer> producer;
         RefPtr<DisplayingVideoSink> display;
+        PipelineStatus sink_status { PipelineStatus::HaveData };
     };
     using VideoTrackDatas = Vector<VideoTrackData, EXPECTED_VIDEO_TRACK_COUNT>;
 
@@ -119,13 +119,17 @@ private:
 
     PlaybackManager();
 
+    WeakPlaybackManager weak();
+
     void set_time_provider(NonnullRefPtr<MediaTimeProvider> const&);
     void disable_audio();
 
     void set_up_producers();
     void on_audio_sink_state_changed(PipelineStatus);
     void on_video_sink_state_changed(Track const&, PipelineStatus);
-    void update_buffering_state();
+    void update_pipeline_state();
+    void reset_pipeline_state();
+    PipelineStatus combined_pipeline_status() const;
     void check_for_duration_change(AK::Duration);
     void dispatch_error(DecoderError&&);
 
@@ -151,7 +155,7 @@ private:
     }
 
     static DecoderErrorOr<NonnullRefPtr<Demuxer>> create_demuxer_for_stream(NonnullRefPtr<MediaStream> const&);
-    static DecoderErrorOr<void> prepare_playback_from_demuxer(WeakPlaybackManager const&, NonnullRefPtr<Demuxer> const&, NonnullRefPtr<Core::WeakEventLoopReference> const&);
+    static DecoderErrorOr<void> prepare_playback_from_demuxer(WeakPlaybackManager const&, NonnullRefPtr<Demuxer> const&, Core::EventLoop&);
 
     template<typename T, typename... Args>
     void replace_state_handler(Args&&... args);
@@ -162,6 +166,7 @@ private:
     NonnullRefPtr<WeakPlaybackManagerLink> m_weak_link;
 
     NonnullRefPtr<MediaTimeProvider> m_time_provider;
+    float m_playback_rate { 1.0f };
 
     bool m_audio_output_disabled { false };
 
@@ -169,6 +174,7 @@ private:
     VideoTrackDatas m_video_track_datas;
 
     RefPtr<AudioMixer> m_audio_mixer;
+    RefPtr<AudioTimeStretchProcessor> m_audio_time_stretch_processor;
     RefPtr<AudioPlaybackSink> m_audio_sink;
     AudioTracks m_audio_tracks;
     AudioTrackDatas m_audio_track_datas;
@@ -179,9 +185,7 @@ private:
     AK::Duration m_duration;
     Optional<AK::UnixDateTime> m_start_time_realtime;
 
-    bool m_audio_buffering { false };
-    HashTable<Track> m_video_tracks_buffering;
-    bool m_was_buffering { false };
+    PipelineStatus m_audio_sink_status { PipelineStatus::HaveData };
 
     bool m_is_in_error_state { false };
 };

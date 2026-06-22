@@ -14,6 +14,7 @@
 #include <LibWeb/CSS/CSSImportRule.h>
 #include <LibWeb/CSS/CSSKeyframesRule.h>
 #include <LibWeb/CSS/CSSNestedDeclarations.h>
+#include <LibWeb/CSS/CSSScopeRule.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/FontComputer.h>
@@ -437,11 +438,11 @@ void CSSStyleSheet::for_each_owning_style_scope(Function<void(StyleScope&)> cons
     }
 }
 
-NonnullRefPtr<StyleCache> CSSStyleSheet::shared_single_constructed_sheet_style_cache(StyleScope& style_scope)
+NonnullRefPtr<StyleCache> CSSStyleSheet::shared_single_constructed_sheet_style_cache()
 {
     VERIFY(constructed());
     if (!m_shared_single_constructed_sheet_style_cache)
-        m_shared_single_constructed_sheet_style_cache = StyleCache::create_for_style_scope(style_scope);
+        m_shared_single_constructed_sheet_style_cache = StyleCache::create();
     return *m_shared_single_constructed_sheet_style_cache;
 }
 
@@ -463,17 +464,40 @@ SelectorInsights const& CSSStyleSheet::selector_insights() const
         return *m_selector_insights;
 
     SelectorInsights insights;
-    for_each_effective_style_producing_rule([&](auto const& rule) {
-        SelectorList const& absolutized_selectors = [&]() -> SelectorList const& {
-            if (rule.type() == CSSRule::Type::Style)
-                return static_cast<CSSStyleRule const&>(rule).absolutized_selectors();
-            if (rule.type() == CSSRule::Type::NestedDeclarations)
-                return static_cast<CSSNestedDeclarations const&>(rule).absolutized_selectors();
-            VERIFY_NOT_REACHED();
-        }();
+    for_each_effective_rule(TraversalOrder::Preorder, [&](CSSRule const& rule) {
+        auto collect_selector_list = [&](SelectorList const& selectors) {
+            for (auto const& selector : selectors)
+                StyleScope::collect_selector_insights(selector, insights);
+        };
+        auto collect_optional_selector_list = [&](Optional<SelectorList> const& selectors) {
+            if (!selectors.has_value())
+                return;
+            collect_selector_list(*selectors);
+        };
 
-        for (auto const& selector : absolutized_selectors)
-            StyleScope::collect_selector_insights(selector, insights);
+        if (rule.type() == CSSRule::Type::Scope) {
+            auto const& scope_rule = as<CSSScopeRule>(rule);
+            collect_optional_selector_list(scope_rule.start_selectors_for_matching());
+            collect_optional_selector_list(scope_rule.end_selectors_for_matching());
+            return;
+        }
+
+        if (rule.type() == CSSRule::Type::Import) {
+            auto const& import_rule = as<CSSImportRule>(rule);
+            if (import_rule.has_scope()) {
+                collect_optional_selector_list(import_rule.scope_start_selectors_for_matching());
+                collect_optional_selector_list(import_rule.scope_end_selectors_for_matching());
+            }
+            return;
+        }
+
+        if (rule.type() == CSSRule::Type::Style) {
+            collect_selector_list(static_cast<CSSStyleRule const&>(rule).absolutized_selectors());
+            return;
+        }
+
+        if (rule.type() == CSSRule::Type::NestedDeclarations)
+            collect_selector_list(static_cast<CSSNestedDeclarations const&>(rule).absolutized_selectors());
     });
     m_selector_insights = insights;
     return *m_selector_insights;
@@ -511,8 +535,10 @@ void CSSStyleSheet::load_pending_image_resources(DOM::Document& document)
 
     auto pending = move(m_pending_image_values);
     for (auto const& weak_image_value : pending) {
-        if (auto* image_value = weak_image_value.ptr())
+        if (auto* image_value = weak_image_value.ptr()) {
+            image_value->update_style_sheet_resource_context(*this);
             image_value->load_any_resources(document);
+        }
     }
 }
 
@@ -617,16 +643,6 @@ void CSSStyleSheet::recalculate_rule_caches()
             return;
         }
     }
-}
-
-void CSSStyleSheet::set_source_text(String source)
-{
-    m_source_text = move(source);
-}
-
-Optional<String> CSSStyleSheet::source_text(Badge<DOM::Document>) const
-{
-    return m_source_text;
 }
 
 void CSSStyleSheet::add_critical_subresource(Subresource& subresource)

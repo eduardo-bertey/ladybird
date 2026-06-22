@@ -6,12 +6,71 @@
 
 #include <LibGfx/Filter.h>
 #include <LibGfx/Font/Font.h>
-#include <LibGfx/SharedImageBuffer.h>
+#include <LibGfx/SkiaBackendContext.h>
+#include <LibGfx/SkiaUtils.h>
 #include <LibMedia/VideoFrame.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListResourceStorage.h>
 
+#include <core/SkImage.h>
+#include <gpu/ganesh/GrDirectContext.h>
+#include <gpu/ganesh/SkImageGanesh.h>
+
 namespace Web::Painting {
+
+struct DisplayListStoredImageFrameResource {
+    explicit DisplayListStoredImageFrameResource(Gfx::DecodedImageFrame frame)
+        : frame(move(frame))
+    {
+    }
+
+    Gfx::DecodedImageFrame frame;
+    mutable sk_sp<SkImage> skia_image;
+    mutable RefPtr<Gfx::SkiaBackendContext> skia_backend_context;
+};
+
+static sk_sp<SkImage> create_skia_image(Gfx::DecodedImageFrame const& frame, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
+{
+    auto raster_image = Gfx::sk_image_from_bitmap(frame.bitmap(), frame.color_space());
+    auto* gr_context = skia_backend_context ? skia_backend_context->sk_context() : nullptr;
+    if (!gr_context)
+        return raster_image;
+
+    auto texture_image = SkImages::TextureFromImage(gr_context, raster_image.get(), skgpu::Mipmapped::kNo, skgpu::Budgeted::kYes);
+    if (texture_image)
+        return texture_image;
+    return raster_image;
+}
+
+static sk_sp<SkImage> skia_image_for_stored_image_frame(DisplayListStoredImageFrameResource const& resource, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
+{
+    if (resource.skia_image && resource.skia_backend_context.ptr() == skia_backend_context.ptr())
+        return resource.skia_image;
+
+    resource.skia_image = create_skia_image(resource.frame, skia_backend_context);
+    resource.skia_backend_context = skia_backend_context;
+    return resource.skia_image;
+}
+
+bool DisplayListResourceSet::is_empty() const
+{
+    return fonts.is_empty()
+        && image_frames.is_empty()
+        && video_frames.is_empty()
+        && display_lists.is_empty();
+}
+
+void DisplayListResourceSet::include(DisplayListResourceSet const& other)
+{
+    for (auto id : other.fonts)
+        fonts.set(id, AK::HashSetExistingEntryBehavior::Keep);
+    for (auto id : other.image_frames)
+        image_frames.set(id, AK::HashSetExistingEntryBehavior::Keep);
+    for (auto id : other.video_frames)
+        video_frames.set(id, AK::HashSetExistingEntryBehavior::Keep);
+    for (auto id : other.display_lists)
+        display_lists.set(id, AK::HashSetExistingEntryBehavior::Keep);
+}
 
 DisplayListResource::DisplayListResource(NonnullRefPtr<DisplayList> display_list, AccumulatedVisualContextTree visual_context_tree)
     : display_list(move(display_list))
@@ -31,6 +90,9 @@ DisplayListResource::DisplayListResource(DisplayList const& display_list, Accumu
 {
 }
 
+DisplayListResourceStorage::DisplayListResourceStorage() = default;
+DisplayListResourceStorage::DisplayListResourceStorage(DisplayListResourceStorage&&) = default;
+DisplayListResourceStorage& DisplayListResourceStorage::operator=(DisplayListResourceStorage&&) = default;
 DisplayListResourceStorage::~DisplayListResourceStorage() = default;
 
 FontResourceId DisplayListResourceStorage::add_font(Gfx::Font const& font)
@@ -43,7 +105,7 @@ FontResourceId DisplayListResourceStorage::add_font(Gfx::Font const& font)
 ImageFrameResourceId DisplayListResourceStorage::add_image_frame(Gfx::DecodedImageFrame const& frame)
 {
     auto id = frame.id();
-    m_image_frames.ensure(id, [&] { return frame; });
+    m_image_frames.ensure(id, [&] { return make<DisplayListStoredImageFrameResource>(frame); });
     return { id };
 }
 
@@ -76,7 +138,17 @@ void DisplayListResourceStorage::set_font(FontResourceId id, NonnullRefPtr<Gfx::
 
 void DisplayListResourceStorage::set_image_frame(ImageFrameResourceId id, Gfx::DecodedImageFrame frame)
 {
-    m_image_frames.set(id.value(), move(frame));
+    m_image_frames.set(id.value(), make<DisplayListStoredImageFrameResource>(move(frame)));
+}
+
+Gfx::DecodedImageFrame const& DisplayListResourceStorage::image_frame(ImageFrameResourceId id) const
+{
+    return m_image_frames.get(id.value()).value()->frame;
+}
+
+sk_sp<SkImage> DisplayListResourceStorage::skia_image_for_image_frame(ImageFrameResourceId id, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context) const
+{
+    return skia_image_for_stored_image_frame(*m_image_frames.get(id.value()).value(), skia_backend_context);
 }
 
 static ReadonlyBytes inline_data(ReadonlyBytes payload, DisplayListDataSpan span)
@@ -85,32 +157,15 @@ static ReadonlyBytes inline_data(ReadonlyBytes payload, DisplayListDataSpan span
     return payload.slice(span.offset, span.size);
 }
 
-void DisplayListResourceStorage::append_referenced_resources_from(
-    DisplayListResourceStorage const& source,
-    ReadonlyBytes command_bytes)
-{
-    auto referenced_resources = source.collect_referenced_resources(command_bytes);
-    for (auto id : referenced_resources.fonts)
-        add_font(source.font(id));
-    for (auto id : referenced_resources.image_frames)
-        add_image_frame(source.image_frame(id));
-    for (auto id : referenced_resources.video_frames)
-        add_video_frame(id, source.video_frame(id));
-    for (auto id : referenced_resources.display_lists) {
-        auto const& display_list_resource = source.display_list_resource(id);
-        add_display_list(display_list_resource.display_list, display_list_resource.visual_context_tree);
-    }
-}
-
 void DisplayListResourceStorage::collect_referenced_resources(
     ReadonlyBytes command_bytes,
     DisplayListResourceSet& referenced_resources) const
 {
-    auto add_display_list_resource = [&](DisplayListResourceId id, Optional<ReadonlyBytes> command_bytes_to_collect) {
+    auto add_display_list_resource = [&](DisplayListResourceId id) {
         if (referenced_resources.display_lists.set(id, AK::HashSetExistingEntryBehavior::Keep) != HashSetResult::InsertedNewEntry)
             return;
         auto const& nested_display_list = display_list(id);
-        collect_referenced_resources(command_bytes_to_collect.value_or(nested_display_list.command_bytes()), referenced_resources);
+        collect_referenced_resources(nested_display_list.command_bytes(), referenced_resources);
     };
 
     DisplayList::for_each_command_header(command_bytes, [&](DisplayListCommandHeader const& header, ReadonlyBytes payload) {
@@ -124,7 +179,7 @@ void DisplayListResourceStorage::collect_referenced_resources(
             if constexpr (requires { command.paint_style; command.paint_kind; }) {
                 if (command.paint_kind == decltype(command.paint_kind)::PaintStyle
                     && command.paint_style.type == DisplayListPaintStyleType::Pattern)
-                    add_display_list_resource(command.paint_style.pattern_tile_display_list_id, {});
+                    add_display_list_resource(command.paint_style.pattern_tile_display_list_id);
             }
             if constexpr (requires { command.backdrop_filter_data; }) {
                 if (command.has_backdrop_filter) {
@@ -143,10 +198,7 @@ void DisplayListResourceStorage::collect_referenced_resources(
                 }
             }
             if constexpr (requires { command.display_list_id; }) {
-                if constexpr (requires { command.command_bytes; })
-                    add_display_list_resource(command.display_list_id, inline_data(payload, command.command_bytes));
-                else
-                    add_display_list_resource(command.display_list_id, {});
+                add_display_list_resource(command.display_list_id);
             }
         });
     });
@@ -162,6 +214,58 @@ DisplayListResourceSet DisplayListResourceStorage::collect_referenced_resources(
 DisplayListResourceSet DisplayListResourceStorage::collect_referenced_resources(DisplayList const& display_list) const
 {
     return collect_referenced_resources(display_list.command_bytes());
+}
+
+template<typename ResourceId>
+static void increment_cache_reference_counts(HashMap<u64, size_t>& counts, HashTable<ResourceId> const& ids)
+{
+    for (auto id : ids) {
+        auto& count = counts.ensure(id.value(), [] { return 0; });
+        ++count;
+    }
+}
+
+template<typename ResourceId>
+static void decrement_cache_reference_counts(HashMap<u64, size_t>& counts, HashTable<ResourceId> const& ids)
+{
+    for (auto id : ids) {
+        auto it = counts.find(id.value());
+        VERIFY(it != counts.end());
+        VERIFY(it->value > 0);
+        --it->value;
+        if (it->value == 0)
+            counts.remove(it);
+    }
+}
+
+void DisplayListResourceStorage::acquire_cache_references(DisplayListResourceSet const& resource_set)
+{
+    increment_cache_reference_counts(m_font_cache_reference_counts, resource_set.fonts);
+    increment_cache_reference_counts(m_image_frame_cache_reference_counts, resource_set.image_frames);
+    increment_cache_reference_counts(m_video_frame_cache_reference_counts, resource_set.video_frames);
+    increment_cache_reference_counts(m_display_list_cache_reference_counts, resource_set.display_lists);
+}
+
+void DisplayListResourceStorage::release_cache_references(DisplayListResourceSet const& resource_set)
+{
+    decrement_cache_reference_counts(m_font_cache_reference_counts, resource_set.fonts);
+    decrement_cache_reference_counts(m_image_frame_cache_reference_counts, resource_set.image_frames);
+    decrement_cache_reference_counts(m_video_frame_cache_reference_counts, resource_set.video_frames);
+    decrement_cache_reference_counts(m_display_list_cache_reference_counts, resource_set.display_lists);
+}
+
+DisplayListResourceSet DisplayListResourceStorage::cache_referenced_resources() const
+{
+    DisplayListResourceSet resource_set;
+    for (auto id : m_font_cache_reference_counts.keys())
+        resource_set.fonts.set(FontResourceId { id });
+    for (auto id : m_image_frame_cache_reference_counts.keys())
+        resource_set.image_frames.set(ImageFrameResourceId { id });
+    for (auto id : m_video_frame_cache_reference_counts.keys())
+        resource_set.video_frames.set(VideoFrameResourceId { id });
+    for (auto id : m_display_list_cache_reference_counts.keys())
+        resource_set.display_lists.set(DisplayListResourceId { id });
+    return resource_set;
 }
 
 DisplayListResourceTransaction DisplayListResourceStorage::create_transaction(
@@ -229,10 +333,23 @@ void DisplayListResourceStorage::apply_transaction(DisplayListResourceTransactio
 
 void DisplayListResourceStorage::retain_only(DisplayListResourceSet const& resource_set)
 {
-    m_fonts.remove_all_matching([&](auto id, auto const&) { return !resource_set.fonts.contains(FontResourceId { id }); });
-    m_image_frames.remove_all_matching([&](auto id, auto const&) { return !resource_set.image_frames.contains(ImageFrameResourceId { id }); });
-    m_video_frames.remove_all_matching([&](auto id, auto const&) { return !resource_set.video_frames.contains(VideoFrameResourceId { id }); });
-    m_display_lists.remove_all_matching([&](auto id, auto const&) { return !resource_set.display_lists.contains(DisplayListResourceId { id }); });
+    m_fonts.remove_all_matching([&](auto id, auto const&) {
+        return !resource_set.fonts.contains(FontResourceId { id })
+            && !m_font_cache_reference_counts.contains(id);
+    });
+    m_image_frames.remove_all_matching([&](auto id, auto const&) {
+        auto image_frame_id = ImageFrameResourceId { id };
+        return !resource_set.image_frames.contains(image_frame_id)
+            && !m_image_frame_cache_reference_counts.contains(id);
+    });
+    m_video_frames.remove_all_matching([&](auto id, auto const&) {
+        return !resource_set.video_frames.contains(VideoFrameResourceId { id })
+            && !m_video_frame_cache_reference_counts.contains(id);
+    });
+    m_display_lists.remove_all_matching([&](auto id, auto const&) {
+        return !resource_set.display_lists.contains(DisplayListResourceId { id })
+            && !m_display_list_cache_reference_counts.contains(id);
+    });
 }
 
 void DisplayListResourceStorage::update_video_frame(VideoFrameResourceId frame_id, NonnullRefPtr<Media::VideoFrame const> frame)
@@ -244,17 +361,6 @@ void DisplayListResourceStorage::clear_video_frame(VideoFrameResourceId frame_id
 {
     if (m_video_frames.contains(frame_id.value()))
         m_video_frames.set(frame_id.value(), nullptr);
-}
-
-void DisplayListResourceStorage::update_compositor_surface(CompositorSurfaceId surface_id, Gfx::SharedImage&& shared_image)
-{
-    auto shared_image_buffer = Gfx::SharedImageBuffer::import_from_shared_image(move(shared_image));
-    m_compositor_surfaces.set(surface_id.value(), Gfx::DecodedImageFrame { *shared_image_buffer.bitmap() });
-}
-
-void DisplayListResourceStorage::clear_compositor_surface(CompositorSurfaceId surface_id)
-{
-    m_compositor_surfaces.remove(surface_id.value());
 }
 
 }

@@ -82,6 +82,7 @@ struct InvalidationPlan final : RefCounted<InvalidationPlan> {
 
     bool invalidate_self { false };
     bool invalidate_whole_subtree { false };
+    bool invalidate_self_and_structurally_affected_siblings { false };
     Vector<DescendantInvalidationRule> descendant_rules;
     Vector<SiblingInvalidationRule> sibling_rules;
     Vector<GuardedInvalidationRule> guarded_rules;
@@ -108,6 +109,7 @@ struct StyleInvalidationData {
     bool has_selectors_sensitive_to_featureless_subtree_changes { false };
 
     void build_invalidation_sets_for_selector(Selector const& selector);
+    void build_invalidation_sets_for_scope_boundary_selector(Selector const& selector);
 };
 
 }

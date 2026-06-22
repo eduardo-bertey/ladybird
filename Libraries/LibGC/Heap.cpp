@@ -14,6 +14,7 @@
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/LexicalPath.h>
+#include <AK/NeverDestroyed.h>
 #include <AK/NumberFormat.h>
 #include <AK/Platform.h>
 #include <AK/ScopeGuard.h>
@@ -139,7 +140,13 @@ struct IncrementalSweepStats {
     Vector<IncrementalSweepBatchStats> batches;
     Core::ElapsedTimer timer { Core::TimerType::Precise };
 };
-IncrementalSweepStats g_incremental_sweep_stats;
+
+IncrementalSweepStats& incremental_sweep_stats()
+{
+    static NeverDestroyed<IncrementalSweepStats> stats;
+    return *stats;
+}
+
 bool g_next_incremental_sweep_should_report { false };
 
 // Set by collect_garbage() while a reported collection is in flight. Used by
@@ -196,9 +203,9 @@ void print_gc_report(i64 total_us, size_t live_block_count)
 
 void record_incremental_sweep_batch(size_t blocks_swept, i64 elapsed_us, bool forced)
 {
-    if (!g_incremental_sweep_stats.should_report || blocks_swept == 0)
+    if (!incremental_sweep_stats().should_report || blocks_swept == 0)
         return;
-    g_incremental_sweep_stats.batches.append({
+    incremental_sweep_stats().batches.append({
         .blocks_swept = blocks_swept,
         .elapsed_us = elapsed_us,
         .forced = forced,
@@ -207,30 +214,30 @@ void record_incremental_sweep_batch(size_t blocks_swept, i64 elapsed_us, bool fo
 
 void print_incremental_sweep_report(size_t live_cell_bytes, size_t live_external_bytes, size_t next_gc_bytes_threshold)
 {
-    if (!g_incremental_sweep_stats.should_report)
+    if (!incremental_sweep_stats().should_report)
         return;
 
     size_t swept_blocks = 0;
     i64 batch_time_us = 0;
     i64 shortest_batch_us = NumericLimits<i64>::max();
     i64 longest_batch_us = 0;
-    for (auto const& batch : g_incremental_sweep_stats.batches) {
+    for (auto const& batch : incremental_sweep_stats().batches) {
         swept_blocks += batch.blocks_swept;
         batch_time_us += batch.elapsed_us;
         shortest_batch_us = min(shortest_batch_us, batch.elapsed_us);
         longest_batch_us = max(longest_batch_us, batch.elapsed_us);
     }
 
-    if (g_incremental_sweep_stats.batches.is_empty())
+    if (incremental_sweep_stats().batches.is_empty())
         shortest_batch_us = 0;
 
     dbgln("Incremental sweep report");
     dbgln("=================================================================");
     dbgln("Totals:");
-    dbgln("        Wall time: {} us", g_incremental_sweep_stats.timer.elapsed_time().to_microseconds());
+    dbgln("        Wall time: {} us", incremental_sweep_stats().timer.elapsed_time().to_microseconds());
     dbgln("       Batch time: {} us", batch_time_us);
-    dbgln("          Batches: {}", g_incremental_sweep_stats.batches.size());
-    dbgln("    Swept blocks: {} / {} ({})", swept_blocks, g_incremental_sweep_stats.total_blocks, human_readable_size(swept_blocks * HeapBlock::BLOCK_SIZE));
+    dbgln("          Batches: {}", incremental_sweep_stats().batches.size());
+    dbgln("    Swept blocks: {} / {} ({})", swept_blocks, incremental_sweep_stats().total_blocks, human_readable_size(swept_blocks * HeapBlock::BLOCK_SIZE));
     dbgln("     Live cells: {}", human_readable_size(live_cell_bytes));
     dbgln("  Live external: {}", human_readable_size(live_external_bytes));
     dbgln("  Next threshold: {}", human_readable_size(next_gc_bytes_threshold));
@@ -238,8 +245,8 @@ void print_incremental_sweep_report(size_t live_cell_bytes, size_t live_external
     dbgln("Batch timings:");
     dbgln("  Shortest batch: {} us", shortest_batch_us);
     dbgln("   Longest batch: {} us", longest_batch_us);
-    for (size_t i = 0; i < g_incremental_sweep_stats.batches.size(); ++i) {
-        auto const& batch = g_incremental_sweep_stats.batches[i];
+    for (size_t i = 0; i < incremental_sweep_stats().batches.size(); ++i) {
+        auto const& batch = incremental_sweep_stats().batches[i];
         dbgln("    #{:>3}: {:>5} blocks in {:>8} us{}", i + 1, batch.blocks_swept, batch.elapsed_us, batch.forced ? " (forced)"sv : ""sv);
     }
     dbgln("=================================================================");
@@ -278,10 +285,18 @@ void Heap::set_default_heap_for_testing(Heap& heap)
     s_the = &heap;
 }
 
-Heap::Heap(AK::Function<void(HashMap<Cell*, GC::HeapRoot>&)> gather_embedder_roots)
+CellAllocator& Heap::cell_allocator_for(Badge<CellAllocatorDescriptorBase>, CellAllocatorDescriptorBase& descriptor)
+{
+    return *m_cell_allocators_by_type.ensure(&descriptor, [&] {
+        return make<CellAllocator>(descriptor.cell_size(), descriptor.class_name(), descriptor.overrides_must_survive_garbage_collection(), descriptor.overrides_finalize());
+    });
+}
+
+Heap::Heap(AK::Function<void(HashMap<Cell*, GC::HeapRoot>&)> gather_embedder_roots, BecomeProcessDefault become_process_default)
     : m_gather_embedder_roots(move(gather_embedder_roots))
 {
-    s_the = this;
+    if (become_process_default == BecomeProcessDefault::Yes)
+        s_the = this;
     m_gc_bytes_threshold = GC_MIN_BYTES_THRESHOLD;
     static_assert(HeapBlock::min_possible_cell_size <= 32, "Heap Cell tracking uses too much data!");
 }
@@ -289,6 +304,20 @@ Heap::Heap(AK::Function<void(HashMap<Cell*, GC::HeapRoot>&)> gather_embedder_roo
 Heap::~Heap()
 {
     collect_garbage(CollectionType::CollectEverything);
+
+    for (auto& entry : m_cell_allocators_by_type)
+        entry.key->forget_heap({}, *this);
+    while (auto* allocator = m_all_cell_allocators.first())
+        m_all_cell_allocators.remove(*allocator);
+
+    while (auto* provider = m_conservative_range_providers.first()) {
+        m_conservative_range_providers.remove(*provider);
+        provider->detach_from_heap({});
+    }
+
+    for (auto* member : m_incoming_cross_heap_members)
+        member->detach_from_heap({});
+    m_incoming_cross_heap_members.clear();
 }
 
 void Heap::will_allocate(size_t size)
@@ -485,6 +514,9 @@ public:
                 case HeapRoot::Type::ConservativeVector:
                     node.set("root"sv, "ConservativeVector"sv);
                     break;
+                case HeapRoot::Type::CrossHeapMember:
+                    node.set("root"sv, "CrossHeapMember"sv);
+                    break;
                 case HeapRoot::Type::HeapFunctionCapturedPointer:
                     node.set("root"sv, "HeapFunctionCapturedPointer"sv);
                     break;
@@ -572,6 +604,40 @@ AK::JsonObject Heap::dump_graph()
     return graph;
 }
 
+void Heap::run_post_mark_phases(bool report)
+{
+    {
+        ScopedPhaseTimer timer { report, g_phase_timings.finalize_unmarked_cells_us };
+        finalize_unmarked_cells();
+    }
+    {
+        ScopedPhaseTimer timer { report, g_phase_timings.sweep_weak_blocks_us };
+        sweep_weak_blocks();
+    }
+
+    // Prune weak containers while we're still stop-the-world; doing this
+    // during incremental sweep risks reading cells that have already been
+    // freed and ASAN-poisoned.
+    {
+        ScopedPhaseTimer timer { report, g_phase_timings.prune_weak_containers_us };
+        for (auto& weak_container : m_weak_containers) {
+            if (!weak_container.owner_cell({}).is_marked())
+                continue;
+            weak_container.remove_dead_cells({});
+        }
+    }
+
+    // Run sweep callbacks at STW so they fire for every collection,
+    // not just CollectEverything. Static caches like
+    // StaticPropertyLookupCache prune by mark state and must see valid
+    // marks before incremental sweep starts freeing cells.
+    {
+        ScopedPhaseTimer timer { report, g_phase_timings.sweep_callbacks_us };
+        for (auto& callback : m_sweep_callbacks)
+            callback();
+    }
+}
+
 void Heap::collect_garbage(CollectionType collection_type, bool print_report)
 {
     VERIFY(!m_collecting_garbage);
@@ -611,41 +677,13 @@ void Heap::collect_garbage(CollectionType collection_type, bool print_report)
                 mark_live_cells(roots);
             }
         }
-        {
-            ScopedPhaseTimer timer { report, g_phase_timings.finalize_unmarked_cells_us };
-            finalize_unmarked_cells();
-        }
-        {
-            ScopedPhaseTimer timer { report, g_phase_timings.sweep_weak_blocks_us };
-            sweep_weak_blocks();
-        }
-
-        // Prune weak containers while we're still stop-the-world; doing this
-        // during incremental sweep risks reading cells that have already been
-        // freed and ASAN-poisoned.
-        {
-            ScopedPhaseTimer timer { report, g_phase_timings.prune_weak_containers_us };
-            for (auto& weak_container : m_weak_containers) {
-                if (!weak_container.owner_cell({}).is_marked())
-                    continue;
-                weak_container.remove_dead_cells({});
-            }
-        }
-
-        // Run sweep callbacks at STW so they fire for every collection,
-        // not just CollectEverything. Static caches like
-        // StaticPropertyLookupCache prune by mark state and must see valid
-        // marks before incremental sweep starts freeing cells.
-        {
-            ScopedPhaseTimer timer { report, g_phase_timings.sweep_callbacks_us };
-            for (auto& callback : m_sweep_callbacks)
-                callback();
-        }
+        run_post_mark_phases(report);
 
         // For CollectEverything we must finish sweeping synchronously so that
         // every cell is collected before the Heap destructor returns. All
-        // other collection types defer sweeping to incremental work below.
-        if (collection_type == CollectionType::CollectEverything) {
+        // other collection types defer sweeping to incremental work below,
+        // unless incremental sweeping is disabled (no event loop to run it).
+        if (collection_type == CollectionType::CollectEverything || !m_incremental_sweep_enabled) {
             ScopedPhaseTimer timer { report, g_phase_timings.sweep_dead_cells_us };
             sweep_dead_cells(report, collection_measurement_timer);
         }
@@ -667,7 +705,7 @@ void Heap::collect_garbage(CollectionType collection_type, bool print_report)
     // Arm incremental sweep before running post-GC tasks so any cells those
     // tasks allocate get tagged as allocated-during-sweep and aren't freed
     // by sweep_block before the next mark phase reaches them.
-    if (collection_type != CollectionType::CollectEverything)
+    if (collection_type != CollectionType::CollectEverything && m_incremental_sweep_enabled)
         start_incremental_sweep();
     else
         g_next_incremental_sweep_should_report = false;
@@ -764,8 +802,16 @@ void Heap::register_sweep_callback(AK::Function<void()> callback)
     m_sweep_callbacks.append(move(callback));
 }
 
-void Heap::gather_roots(HashMap<Cell*, HeapRoot>& roots, Vector<StackFrameInfo>* out_stack_frames)
+void Heap::gather_roots(HashMap<Cell*, HeapRoot>& roots, Vector<StackFrameInfo>* out_stack_frames, IncludeIncomingCrossHeapMembers include_incoming_cross_heap_members)
 {
+    // Cross-heap members targeting this heap act as roots for local collections (as the foreign holder is invisible to a local mark).
+    if (include_incoming_cross_heap_members == IncludeIncomingCrossHeapMembers::Yes) {
+        for (auto* member : m_incoming_cross_heap_members) {
+            if (auto* cell = member->cell_base())
+                roots.set(cell, HeapRoot { .type = HeapRoot::Type::CrossHeapMember });
+        }
+    }
+
     {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.gather_must_survive_roots_us };
         for_each_block([&](auto& block) {
@@ -972,6 +1018,13 @@ NO_SANITIZE_ADDRESS void Heap::gather_conservative_roots(HashMap<Cell*, HeapRoot
                 add_possible_value(possible_pointers, possible_value, HeapRoot { .type = HeapRoot::Type::ConservativeVector }, min_block_address, max_block_address);
             }
         }
+
+        for (auto& provider : m_conservative_range_providers) {
+            provider.for_each_conservative_range([&](ReadonlySpan<FlatPtr> range) {
+                for (auto possible_value : range)
+                    add_possible_value(possible_pointers, possible_value, HeapRoot { .type = HeapRoot::Type::ConservativeVector }, min_block_address, max_block_address);
+            });
+        }
     }
 
     for (auto& hash_map : m_conservative_hash_maps) {
@@ -1001,18 +1054,40 @@ NO_SANITIZE_ADDRESS void Heap::gather_conservative_roots(HashMap<Cell*, HeapRoot
 
 class MarkingVisitor final : public Cell::Visitor {
 public:
-    explicit MarkingVisitor(Heap& heap, HashMap<Cell*, HeapRoot> const& roots)
-        : m_heap(heap)
+    // The domain is a set of heaps whose cells this mark phase is responsible for; cells outside the domain are not visited.
+    explicit MarkingVisitor(ReadonlySpan<Heap* const> domain, HashMap<Cell*, HeapRoot> const& roots)
+        : m_domain(domain)
     {
-        m_heap.find_min_and_max_block_addresses(m_min_block_address, m_max_block_address);
+        m_min_block_address = explode_byte(0xff);
+        m_max_block_address = 0;
+        for (auto* heap : m_domain) {
+            FlatPtr min_block_address, max_block_address;
+            heap->find_min_and_max_block_addresses(min_block_address, max_block_address);
+            m_min_block_address = min(m_min_block_address, min_block_address);
+            m_max_block_address = max(m_max_block_address, max_block_address);
+        }
         for (auto* root : roots.keys()) {
             visit(root);
         }
     }
 
+    bool cell_is_in_domain(Cell const& cell) const
+    {
+        auto& heap = HeapBlockBase::from_cell(&cell)->heap();
+        if (m_domain.size() == 1) [[likely]]
+            return m_domain.data()[0] == &heap;
+        for (auto* domain_heap : m_domain) {
+            if (domain_heap == &heap)
+                return true;
+        }
+        return false;
+    }
+
     virtual void visit_impl(Cell& cell) override
     {
         if (cell.is_marked())
+            return;
+        if (!cell_is_in_domain(cell))
             return;
         dbgln_if(HEAP_DEBUG, "  ! {}", &cell);
 
@@ -1030,6 +1105,8 @@ public:
             auto& cell = value.as_cell();
             if (cell.is_marked())
                 continue;
+            if (!cell_is_in_domain(cell))
+                continue;
             dbgln_if(HEAP_DEBUG, "  ! {}", &cell);
 
             cell.set_marked(true);
@@ -1045,14 +1122,16 @@ public:
         for (size_t i = 0; i < (bytes.size() / sizeof(FlatPtr)); ++i)
             add_possible_value(possible_pointers, raw_pointer_sized_values[i], HeapRoot { .type = HeapRoot::Type::HeapFunctionCapturedPointer }, m_min_block_address, m_max_block_address);
 
-        for_each_cell_among_possible_pointers(m_heap.m_live_heap_blocks, possible_pointers, [&](Cell* cell, FlatPtr) {
-            if (cell->is_marked())
-                return;
-            if (cell->state() != Cell::State::Live)
-                return;
-            cell->set_marked(true);
-            m_work_queue.append(*cell);
-        });
+        for (auto* heap : m_domain) {
+            for_each_cell_among_possible_pointers(heap->m_live_heap_blocks, possible_pointers, [&](Cell* cell, FlatPtr) {
+                if (cell->is_marked())
+                    return;
+                if (cell->state() != Cell::State::Live)
+                    return;
+                cell->set_marked(true);
+                m_work_queue.append(*cell);
+            });
+        }
     }
 
     void mark_all_live_cells()
@@ -1063,7 +1142,7 @@ public:
     }
 
 private:
-    Heap& m_heap;
+    ReadonlySpan<Heap* const> m_domain;
     Vector<Ref<Cell>> m_work_queue;
     FlatPtr m_min_block_address;
     FlatPtr m_max_block_address;
@@ -1071,12 +1150,18 @@ private:
 
 void Heap::mark_live_cells(HashMap<Cell*, HeapRoot> const& roots)
 {
+    Heap* domain[] = { this };
+    mark_live_cells_across(domain, roots);
+}
+
+void Heap::mark_live_cells_across(ReadonlySpan<Heap* const> heaps, HashMap<Cell*, HeapRoot> const& roots)
+{
     dbgln_if(HEAP_DEBUG, "mark_live_cells:");
 
     Optional<MarkingVisitor> visitor;
     {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.mark_initial_visit_us };
-        visitor.emplace(*this, roots);
+        visitor.emplace(heaps, roots);
     }
 
     {
@@ -1086,10 +1171,12 @@ void Heap::mark_live_cells(HashMap<Cell*, HeapRoot> const& roots)
 
     {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.mark_clear_uprooted_us };
-        for (auto& inverse_root : m_uprooted_cells)
-            inverse_root->set_marked(false);
+        for (auto* heap : heaps) {
+            for (auto& inverse_root : heap->m_uprooted_cells)
+                inverse_root->set_marked(false);
 
-        m_uprooted_cells.clear();
+            heap->m_uprooted_cells.clear();
+        }
     }
 }
 
@@ -1279,13 +1366,13 @@ void Heap::start_incremental_sweep()
     m_incremental_sweep_active = true;
     m_sweep_live_cell_bytes = 0;
     m_sweep_live_external_bytes = 0;
-    g_incremental_sweep_stats.should_report = false;
-    g_incremental_sweep_stats.total_blocks = 0;
-    g_incremental_sweep_stats.batches.clear();
-    g_incremental_sweep_stats.should_report = g_next_incremental_sweep_should_report;
+    incremental_sweep_stats().should_report = false;
+    incremental_sweep_stats().total_blocks = 0;
+    incremental_sweep_stats().batches.clear();
+    incremental_sweep_stats().should_report = g_next_incremental_sweep_should_report;
     g_next_incremental_sweep_should_report = false;
-    if (g_incremental_sweep_stats.should_report)
-        g_incremental_sweep_stats.timer.start();
+    if (incremental_sweep_stats().should_report)
+        incremental_sweep_stats().timer.start();
 
     // Populate each allocator's pending sweep list with its current blocks.
     // Blocks allocated during incremental sweep won't be on these lists
@@ -1300,7 +1387,7 @@ void Heap::start_incremental_sweep()
         if (allocator.has_blocks_pending_sweep())
             m_allocators_to_sweep.append(allocator);
     }
-    g_incremental_sweep_stats.total_blocks = total_blocks;
+    incremental_sweep_stats().total_blocks = total_blocks;
 
     dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep] {} blocks to sweep", total_blocks);
 

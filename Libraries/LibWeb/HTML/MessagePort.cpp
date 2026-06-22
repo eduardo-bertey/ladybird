@@ -8,6 +8,7 @@
 
 #include <AK/ByteReader.h>
 #include <AK/MemoryStream.h>
+#include <AK/NeverDestroyed.h>
 #include <LibCore/System.h>
 #include <LibGC/WeakHashSet.h>
 #include <LibIPC/Decoder.h>
@@ -34,8 +35,8 @@ GC_DEFINE_ALLOCATOR(MessagePort);
 
 static GC::WeakHashSet<MessagePort>& all_message_ports()
 {
-    static GC::WeakHashSet<MessagePort> ports;
-    return ports;
+    static NeverDestroyed<GC::WeakHashSet<MessagePort>> ports;
+    return *ports;
 }
 
 GC::Ref<MessagePort> MessagePort::create(JS::Realm& realm)
@@ -350,7 +351,7 @@ void MessagePort::drain_transport()
         return;
 
     auto schedule_shutdown = m_transport->read_as_many_messages_as_possible_without_blocking([this](auto&& raw_message) {
-        FixedMemoryStream stream { raw_message.bytes.span(), FixedMemoryStream::Mode::ReadOnly };
+        FixedMemoryStream stream { raw_message.bytes.bytes() };
         IPC::Decoder decoder { stream, raw_message.attachments };
 
         m_pending_incoming_messages.append(MUST(decoder.decode<SerializedTransferRecord>()));

@@ -9,6 +9,7 @@
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <AK/WeakPtr.h>
 #include <LibGfx/TextLayout.h>
 #include <LibUnicode/Segmenter.h>
 #include <LibWeb/CSS/Enums.h>
@@ -18,21 +19,24 @@
 namespace Web::Layout {
 
 class LineBoxFragment;
+class GeneratedTextNode;
 class TextSliceNode;
 
 class TextNode : public Node {
-    GC_CELL(TextNode, Node);
-    GC_DECLARE_ALLOCATOR(TextNode);
+    LAYOUT_NODE(TextNode, Node);
 
 public:
     TextNode(DOM::Document&, DOM::Text&);
     virtual ~TextNode() override;
 
     DOM::Text const& dom_node() const { return static_cast<DOM::Text const&>(*Node::dom_node()); }
+    virtual DOM::Text const* dom_text() const { return &dom_node(); }
 
     virtual size_t dom_start_offset() const { return 0; }
 
-    virtual size_t dom_length() const { return dom_node().data().length_in_code_units(); }
+    virtual size_t dom_length() const { return text().length_in_code_units(); }
+
+    virtual Utf16String const& text() const { return dom_node().data(); }
 
     Utf16String const& text_for_rendering() const;
 
@@ -68,6 +72,7 @@ public:
 
         [[nodiscard]] bool is_at_line_break_opportunity() const;
         [[nodiscard]] Gfx::Font const& font_for_space(size_t at_index, u32 space_code_point) const;
+        [[nodiscard]] Gfx::EmojiPresentationResult emoji_presentation_at(size_t code_unit_offset, u32 code_point) const;
 
         bool const m_should_wrap_lines;
         bool const m_should_respect_linebreaks;
@@ -78,6 +83,7 @@ public:
         Unicode::Segmenter& m_grapheme_segmenter;
         Unicode::Segmenter& m_line_segmenter;
         CSS::WordBreak m_word_break;
+        CSS::FontVariantEmoji m_font_variant_emoji;
         size_t m_current_index { 0 };
 
         Vector<Chunk> m_peek_queue;
@@ -101,6 +107,10 @@ public:
 
 protected:
     TextNode(DOM::Document&, DOM::Text&, AttachToDOMNode);
+    explicit TextNode(DOM::Document&);
+
+    virtual DOM::Element const* parent_element_for_text_transform() const;
+    virtual bool is_password_input() const;
 
 private:
     virtual bool is_text_node() const final { return true; }
@@ -121,6 +131,7 @@ private:
         bool should_respect_linebreaks { false };
         CSS::WhiteSpaceCollapse white_space_collapse { CSS::WhiteSpaceCollapse::Collapse };
         CSS::WordBreak word_break { CSS::WordBreak::Normal };
+        CSS::FontVariantEmoji font_variant_emoji { CSS::FontVariantEmoji::Normal };
         RefPtr<Gfx::FontCascadeList const> font_cascade_list;
 
         bool operator==(ChunkCacheKey const&) const = default;
@@ -146,9 +157,25 @@ private:
     mutable Optional<TextDependentCache> m_text_dependent_cache;
 };
 
+class GeneratedTextNode final : public TextNode {
+    LAYOUT_NODE(GeneratedTextNode, TextNode);
+
+public:
+    GeneratedTextNode(DOM::Document&, Utf16String);
+    virtual ~GeneratedTextNode() override;
+
+    virtual DOM::Text const* dom_text() const override { return nullptr; }
+    virtual Utf16String const& text() const override { return m_text; }
+
+private:
+    virtual DOM::Element const* parent_element_for_text_transform() const override;
+    virtual bool is_password_input() const override { return false; }
+
+    Utf16String m_text;
+};
+
 class TextSliceNode final : public TextNode {
-    GC_CELL(TextSliceNode, TextNode);
-    GC_DECLARE_ALLOCATOR(TextSliceNode);
+    LAYOUT_NODE(TextSliceNode, TextNode);
 
 public:
     TextSliceNode(DOM::Document&, DOM::Text&, AttachToDOMNode, size_t dom_start_offset, size_t dom_length);
@@ -159,18 +186,17 @@ public:
 
     // Only meaningful on a remainder slice. Returns the first-letter slice that renders the leading
     // sub-range of the same DOM::Text, or nullptr if first-letter is not active for this DOM::Text.
-    TextSliceNode const* first_letter_slice() const { return m_first_letter_slice; }
-    TextSliceNode* first_letter_slice() { return m_first_letter_slice; }
+    TextSliceNode const* first_letter_slice() const { return m_first_letter_slice.ptr(); }
+    TextSliceNode* first_letter_slice() { return m_first_letter_slice.ptr(); }
 
     void set_first_letter_slice(TextSliceNode& slice) { m_first_letter_slice = slice; }
 
 private:
     virtual bool is_text_slice_node() const override { return true; }
-    virtual void visit_edges(Cell::Visitor&) override;
 
     size_t m_dom_start_offset { 0 };
     size_t m_dom_length_in_code_units { 0 };
-    GC::Ptr<TextSliceNode> m_first_letter_slice;
+    WeakPtr<TextSliceNode> m_first_letter_slice;
 };
 
 template<>

@@ -8,6 +8,7 @@
 
 #include <LibGC/RootHashTable.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/SVG/AttributeParser.h>
 #include <LibWeb/SVG/SVGAnimatedLength.h>
 #include <LibWeb/SVG/SVGElement.h>
@@ -46,7 +47,7 @@ public:
 
     Optional<Painting::PaintStyle> to_gfx_paint_style(SVGPaintContext const&, DisplayListRecordingContext&, Layout::Node const& target_layout_node) const;
 
-    virtual GC::Ptr<Layout::Node> create_layout_node(GC::Ref<CSS::ComputedProperties>) override { return nullptr; }
+    virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override { return nullptr; }
 
 protected:
     SVGPatternElement(DOM::Document&, DOM::QualifiedName);
@@ -55,6 +56,8 @@ protected:
     virtual void visit_edges(Cell::Visitor&) override;
 
 private:
+    virtual bool is_svg_pattern_element() const final { return true; }
+
     GC::Ptr<SVGPatternElement const> linked_pattern(GC::RootHashTable<SVGPatternElement const*>& seen_patterns) const;
     GC::Ptr<SVGPatternElement const> pattern_content_element_impl(GC::RootHashTable<SVGPatternElement const*>& seen_patterns) const;
 
@@ -74,5 +77,12 @@ private:
     Optional<NumberPercentage> m_width;
     Optional<NumberPercentage> m_height;
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<SVG::SVGPatternElement>() const { return is_svg_pattern_element(); }
 
 }

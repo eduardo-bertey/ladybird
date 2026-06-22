@@ -31,13 +31,23 @@ target_include_directories(webcontentservice PUBLIC $<BUILD_INTERFACE:${CMAKE_CU
 target_include_directories(webcontentservice PUBLIC $<BUILD_INTERFACE:${LADYBIRD_SOURCE_DIR}>)
 target_include_directories(webcontentservice PUBLIC $<BUILD_INTERFACE:${LADYBIRD_SOURCE_DIR}/Services/>)
 
-target_link_libraries(webcontentservice PUBLIC LibCore LibCrypto LibFileSystem LibGfx LibHTTP LibIPC LibJS LibMain LibMedia LibWasm LibWeb LibWebSocket LibRequests LibWebView LibImageDecoderClient LibGC)
+target_link_libraries(webcontentservice PUBLIC LibCore LibCrypto LibDevTools LibFileSystem LibGfx LibHTTP LibIPC LibJS LibMain LibMedia LibWasm LibWeb LibWebSocket LibRequests LibWebView LibImageDecoderClient LibGC)
 target_link_libraries(webcontentservice PRIVATE OpenSSL::Crypto OpenSSL::SSL)
 target_link_libraries(webcontentservice PRIVATE SDL3::SDL3)
+target_compile_options(webcontentservice PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wexit-time-destructors>)
 
 add_executable(WebContent main.cpp)
 
-target_link_libraries(WebContent PRIVATE webcontentservice LibURL)
+if (LINUX)
+    target_sources(WebContent PRIVATE ../RendererSandboxLinux.cpp)
+elseif (APPLE)
+    target_sources(WebContent PRIVATE ../RendererSandboxMacOS.cpp)
+else()
+    target_sources(WebContent PRIVATE ../RendererSandboxUnimplemented.cpp)
+endif()
+
+target_link_libraries(WebContent PRIVATE webcontentservice LibSandbox LibURL)
+target_compile_options(WebContent PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wexit-time-destructors>)
 
 if(WIN32)
     ladybird_windows_bin(WebContent CONSOLE)

@@ -252,10 +252,10 @@ GC::Ref<Shape> Shape::create_configure_transition(PropertyKey const& property_ke
 
 GC::Ref<Shape> Shape::create_prototype_transition(Object* new_prototype)
 {
-    if (new_prototype)
-        new_prototype->convert_to_prototype_if_needed();
     if (auto existing_shape = get_or_prune_cached_prototype_transition(new_prototype))
         return *existing_shape;
+    if (new_prototype)
+        new_prototype->convert_to_prototype_if_needed();
     auto new_shape = heap().allocate<Shape>(*this, new_prototype);
     if (m_dictionary && m_property_count > DescriptorArray::max_descriptor_count) {
         new_shape->become_dictionary_shape();
@@ -356,18 +356,6 @@ Optional<PropertyMetadata> Shape::lookup(PropertyKey const& property_key) const
     if (!descriptors())
         return {};
     return descriptors()->lookup(property_key, m_property_count);
-}
-
-void Shape::for_each_property_in_insertion_order(Function<void(PropertyKey const&, PropertyMetadata const&)> const& callback) const
-{
-    if (m_dictionary) {
-        for (auto const& [property_key, metadata] : property_table())
-            callback(property_key, metadata);
-        return;
-    }
-    if (!descriptors())
-        return;
-    descriptors()->for_each_in_insertion_order(callback, m_property_count);
 }
 
 void Shape::ensure_descriptor_array()
@@ -472,8 +460,11 @@ GC::Ref<Shape> Shape::clone_for_prototype()
     if (m_dictionary && m_property_count > DescriptorArray::max_descriptor_count) {
         new_shape->become_dictionary_shape();
         copy_properties_to_dictionary_shape(*new_shape);
-    } else {
+    } else if (m_dictionary) {
         new_shape->set_descriptors(copy_descriptors());
+        new_shape->m_property_count = m_property_count;
+    } else {
+        new_shape->set_descriptors(descriptors());
         new_shape->m_property_count = m_property_count;
     }
     new_shape->m_prototype_chain_validity = heap().allocate<PrototypeChainValidity>();

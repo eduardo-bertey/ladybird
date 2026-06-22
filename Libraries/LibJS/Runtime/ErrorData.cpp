@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/StringBuilder.h>
+#include <AK/NeverDestroyed.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibJS/Runtime/ErrorData.h>
 #include <LibJS/Runtime/ExecutionContext.h>
 #include <LibJS/Runtime/ExternalMemory.h>
@@ -15,12 +16,16 @@
 
 namespace JS {
 
-static SourceRange dummy_source_range { SourceCode::create({}, Utf16String {}), {} };
+static auto& dummy_source_range()
+{
+    static NeverDestroyed<SourceRange> source_range { SourceRange { SourceCode::create({}, Utf16String {}), {} } };
+    return *source_range;
+}
 
 SourceRange const& TracebackFrame::source_range() const
 {
     if (!cached_source_range.has_value())
-        return dummy_source_range;
+        return dummy_source_range();
     return *cached_source_range;
 }
 
@@ -60,7 +65,7 @@ Utf16String ErrorData::stack_string(CompactTraceback compact) const
     if (m_traceback.is_empty())
         return {};
 
-    StringBuilder stack_string_builder(StringBuilder::Mode::UTF16);
+    Utf16StringBuilder stack_string_builder;
 
     // Note: We roughly follow V8's formatting
     auto append_frame = [&](TracebackFrame const& frame) {
@@ -70,11 +75,11 @@ Utf16String ErrorData::stack_string(CompactTraceback compact) const
         if (!source_range.filename().is_empty() || source_range.start.line != 0 || source_range.start.column != 0) {
 
             if (function_name.is_empty())
-                stack_string_builder.appendff("    at {}:{}:{}\n", source_range.filename(), source_range.start.line, source_range.start.column);
+                stack_string_builder.append(Utf16String::formatted("    at {}:{}:{}\n", source_range.filename(), source_range.start.line, source_range.start.column));
             else
-                stack_string_builder.appendff("    at {} ({}:{}:{})\n", function_name, source_range.filename(), source_range.start.line, source_range.start.column);
+                stack_string_builder.append(Utf16String::formatted("    at {} ({}:{}:{})\n", function_name, source_range.filename(), source_range.start.line, source_range.start.column));
         } else {
-            stack_string_builder.appendff("    at {}\n", function_name.is_empty() ? "<unknown>"_utf16 : function_name);
+            stack_string_builder.append(Utf16String::formatted("    at {}\n", function_name.is_empty() ? "<unknown>"_utf16 : function_name));
         }
     };
 
@@ -105,7 +110,7 @@ Utf16String ErrorData::stack_string(CompactTraceback compact) const
             // the name only once and show the number of repetitions instead. This prevents
             // printing ridiculously large call stacks of recursive functions.
             append_frame(frame);
-            stack_string_builder.appendff("    {} more calls\n", repetitions);
+            stack_string_builder.append(Utf16String::formatted("    {} more calls\n", repetitions));
         } else {
             for (size_t j = 0; j < repetitions + 1; j++)
                 append_frame(frame);
@@ -115,7 +120,7 @@ Utf16String ErrorData::stack_string(CompactTraceback compact) const
     for (size_t j = 0; j < repetitions; j++)
         append_frame(m_traceback[used_frames - 1]);
 
-    return stack_string_builder.to_utf16_string();
+    return stack_string_builder.to_string();
 }
 
 }

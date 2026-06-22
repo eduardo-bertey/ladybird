@@ -215,12 +215,15 @@ bool SourceBuffer::updating() const
 }
 
 // https://w3c.github.io/media-source/#dom-sourcebuffer-buffered
-GC::Ref<HTML::TimeRanges> SourceBuffer::buffered()
+WebIDL::ExceptionOr<GC::Ref<HTML::TimeRanges>> SourceBuffer::buffered()
 {
-    auto time_ranges = realm().create<HTML::TimeRanges>(realm());
+    // 1. If this object has been removed from the sourceBuffers attribute of the parent media source then throw
+    //    an InvalidStateError exception and abort these steps.
 
-    // FIXME: 1. If this object has been removed from the sourceBuffers attribute of the parent media source then throw
-    //           an InvalidStateError exception and abort these steps.
+    if (!m_media_source->source_buffers()->contains(*this))
+        return WebIDL::InvalidStateError::create(realm(), "SourceBuffer has been removed"_utf16);
+
+    auto time_ranges = realm().create<HTML::TimeRanges>(realm());
 
     // NB: Further steps to intersect the buffered ranges of the track buffers are implemented within
     //     SourceBufferProcessor::buffered_ranges() below, since it has access to the track buffers.
@@ -331,7 +334,7 @@ WebIDL::ExceptionOr<void> SourceBuffer::append_buffer(WebIDL::BufferSource data)
 
     // 2. Add data to the end of the [[input buffer]].
     if (auto array_buffer = data.viewed_array_buffer(); array_buffer && !array_buffer->is_detached()) {
-        auto bytes = array_buffer->buffer().bytes().slice(data.byte_offset(), data.byte_length());
+        auto bytes = array_buffer->bytes().slice(data.byte_offset(), data.byte_length());
         m_processor->append_to_input_buffer(bytes);
     }
 

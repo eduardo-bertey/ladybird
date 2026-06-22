@@ -15,10 +15,8 @@
 
 namespace Web::Layout {
 
-GC_DEFINE_ALLOCATOR(Box);
-
-Box::Box(DOM::Document& document, DOM::Node* node, GC::Ref<CSS::ComputedProperties> style)
-    : NodeWithStyleAndBoxModelMetrics(document, node, move(style))
+Box::Box(DOM::Document& document, DOM::Node* node, CSS::ComputedProperties const& style)
+    : NodeWithStyleAndBoxModelMetrics(document, node, style)
 {
 }
 
@@ -40,12 +38,6 @@ CSS::SizeWithAspectRatio Box::auto_content_box_size() const
         return { 0, 0, {} };
 
     return compute_auto_content_box_size();
-}
-
-void Box::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_contained_abspos_children);
 }
 
 RefPtr<Painting::Paintable> Box::create_paintable() const

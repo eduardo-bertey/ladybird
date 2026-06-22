@@ -11,8 +11,6 @@
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibWeb/CSS/ComputedValues.h>
-#include <LibWeb/CSS/PropertyID.h>
-#include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/DOM/Document.h>
@@ -30,6 +28,7 @@
 namespace Web::Painting {
 
 AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaintable&);
+void update_visual_viewport_accumulated_visual_context(ViewportPaintable&);
 
 bool ClipData::contains(DevicePixelPoint point) const
 {
@@ -38,11 +37,21 @@ bool ClipData::contains(DevicePixelPoint point) const
 
 static Atomic<u64> s_next_accumulated_visual_context_tree_version { 1 };
 
+static TransformData identity_visual_viewport_transform()
+{
+    return { Gfx::FloatMatrix4x4::identity(), { 0.f, 0.f } };
+}
+
 AccumulatedVisualContextTree AccumulatedVisualContextTree::create()
 {
+    return create(identity_visual_viewport_transform());
+}
+
+AccumulatedVisualContextTree AccumulatedVisualContextTree::create(TransformData visual_viewport_transform)
+{
     Vector<AccumulatedVisualContextNode> nodes;
-    // Sentinel at index 0 (null context). Data type doesn't matter; it's never accessed.
-    nodes.append({ ScrollData { {}, false }, {}, 0, false });
+    // Visual viewport transform root. This is identity for trees that are not attached to a document viewport.
+    nodes.append({ move(visual_viewport_transform), {}, 0, false });
     return AccumulatedVisualContextTree {
         s_next_accumulated_visual_context_tree_version.fetch_add(1, AK::MemoryOrder::memory_order_relaxed),
         move(nodes)
@@ -71,26 +80,53 @@ static FloatMatrix4x4 scale_matrix_for_device_pixels(FloatMatrix4x4 matrix, floa
     return matrix;
 }
 
+static TransformData visual_viewport_transform_data(DOM::Document& document)
+{
+    auto scale = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
+    auto matrix = scale_matrix_for_device_pixels(document.visual_viewport()->transform().to_matrix(), scale);
+    return TransformData { matrix, { 0.f, 0.f } };
+}
+
+// https://drafts.csswg.org/css-transforms-2/#ctm
 static Optional<TransformData> compute_transform(PaintableBox const& paintable_box, CSS::ComputedValues const& computed_values, double pixel_ratio)
 {
     if (!paintable_box.has_css_transform())
         return {};
 
-    auto matrix = Gfx::FloatMatrix4x4::identity();
+    // The transformation matrix is computed from the transform, transform-origin, translate, rotate, scale, and
+    // offset properties as follows:
+    auto reference_box = paintable_box.transform_reference_box();
+    auto const& css_transform_origin = computed_values.transform_origin();
+    auto origin_x = css_transform_origin.x.to_px(paintable_box.layout_node(), reference_box.width());
+    auto origin_y = css_transform_origin.y.to_px(paintable_box.layout_node(), reference_box.height());
+    auto origin_z = css_transform_origin.z.to_px(paintable_box.layout_node(), 0).to_float();
+
+    // 1. Start with the identity matrix.
+    // 2. Translate by the computed X, Y, and Z values of transform-origin.
+    auto matrix = Gfx::translation_matrix(Vector3 { 0.f, 0.f, origin_z });
+
+    // 3. Translate by the computed X, Y, and Z values of translate.
     if (auto const& translate = computed_values.translate())
         matrix = matrix * translate->to_matrix(paintable_box);
+
+    // 4. Rotate by the computed <angle> about the specified axis of rotate.
     if (auto const& rotate = computed_values.rotate())
         matrix = matrix * rotate->to_matrix(paintable_box);
+
+    // 5. Scale by the computed X, Y, and Z values of scale.
     if (auto const& scale = computed_values.scale())
         matrix = matrix * scale->to_matrix(paintable_box);
+
+    // FIXME: 6. Translate and rotate by the transform specified by offset.
+
+    // 7. Multiply by each of the transform functions in transform from left to right.
     for (auto const& transform : computed_values.transformations())
         matrix = matrix * transform->to_matrix(paintable_box);
-    auto const& css_transform_origin = computed_values.transform_origin();
-    auto reference_box = paintable_box.transform_reference_box();
-    CSSPixelPoint origin {
-        reference_box.left() + css_transform_origin.x.to_px(paintable_box.layout_node(), reference_box.width()),
-        reference_box.top() + css_transform_origin.y.to_px(paintable_box.layout_node(), reference_box.height()),
-    };
+
+    // 8. Translate by the negated computed X, Y and Z values of transform-origin.
+    matrix = matrix * Gfx::translation_matrix(Vector3 { 0.f, 0.f, -origin_z });
+
+    auto origin = reference_box.location() + CSSPixelPoint { origin_x, origin_y };
     auto scale = static_cast<float>(pixel_ratio);
     auto device_origin = origin.to_type<float>() * scale;
     return TransformData { scale_matrix_for_device_pixels(matrix, scale), device_origin };
@@ -99,6 +135,9 @@ static Optional<TransformData> compute_transform(PaintableBox const& paintable_b
 // https://drafts.csswg.org/css-transforms-2/#perspective-matrix
 static Optional<Gfx::FloatMatrix4x4> compute_perspective_matrix(PaintableBox const& paintable_box, CSS::ComputedValues const& computed_values)
 {
+    if (!paintable_box.layout_node().is_transformable())
+        return {};
+
     auto perspective = computed_values.perspective();
     if (!perspective.has_value())
         return {};
@@ -117,13 +156,13 @@ static Optional<Gfx::FloatMatrix4x4> compute_perspective_matrix(PaintableBox con
 
     // 3. Multiply by the matrix that would be obtained from the 'perspective()' transform function, where the
     //    length is provided by the value of the perspective property
-    // NB: Length values less than 1px being clamped to 1px is handled by the perspective() function already.
-    // FIXME: Create the matrix directly.
-    perspective_matrix = perspective_matrix * CSS::TransformationStyleValue::create(CSS::PropertyID::Transform, CSS::TransformFunction::Perspective, CSS::StyleValueVector { CSS::LengthStyleValue::create(CSS::Length::make_px(perspective.value())) })->to_matrix({});
+    // https://drafts.csswg.org/css-transforms-2/#funcdef-perspective
+    // If the depth value is less than '1px', it must be treated as '1px' for the purpose of rendering, [..]
+    auto distance = max(perspective->to_float(), 1.f);
+    perspective_matrix = perspective_matrix * Gfx::perspective_matrix(distance);
 
     // 4. Translate by the negated computed X and Y values of 'perspective-origin'
-    perspective_matrix = perspective_matrix * Gfx::translation_matrix(Vector3<float>(-computed_x, -computed_y, 0));
-    return perspective_matrix;
+    return perspective_matrix * Gfx::translation_matrix(Vector3 { -computed_x, -computed_y, 0.f });
 }
 
 static Optional<ClipData> compute_clip_data(PaintableBox const& paintable_box, CSS::ComputedValues const& computed_values, DevicePixelConverter const& converter)
@@ -188,11 +227,40 @@ static Optional<ClipData> compute_clip_data(PaintableBox const& paintable_box, C
     return {};
 }
 
+static Optional<ClipData> compute_css_clip_data(PaintableBox const& paintable_box, DevicePixelConverter const& converter)
+{
+    if (auto css_clip = paintable_box.get_clip_rect(); css_clip.has_value()) {
+        auto effective_rect = effective_css_clip_rect(*css_clip);
+        return ClipData { converter.rounded_device_rect(effective_rect), {} };
+    }
+    return {};
+}
+
+static Optional<ClipPathData> compute_basic_shape_clip_path_data(PaintableBox const& paintable_box, CSS::ComputedValues const& computed_values, DevicePixelConverter const& converter, float scale)
+{
+    // FIXME: Support other geometry boxes. See: https://drafts.fxtf.org/css-masking/#typedef-geometry-box
+    auto const& clip_path = computed_values.clip_path();
+    if (!clip_path.has_value() || !clip_path->is_basic_shape())
+        return {};
+
+    auto masking_area = paintable_box.absolute_border_box_rect();
+    auto reference_box = CSSPixelRect { {}, masking_area.size() };
+    auto const& basic_shape = clip_path->basic_shape();
+    auto path = basic_shape.to_path(reference_box, paintable_box.layout_node());
+    path.offset(masking_area.top_left().template to_type<float>());
+    auto fill_rule = basic_shape.basic_shape().visit(
+        [](CSS::Polygon const& polygon) { return polygon.fill_rule; },
+        [](CSS::Path const& path) { return path.fill_rule; },
+        [](auto const&) { return Gfx::WindingRule::Nonzero; });
+    auto device_path = path.copy_transformed(Gfx::AffineTransform {}.set_scale(scale, scale));
+    auto device_bounding_rect = converter.rounded_device_rect(masking_area);
+    return ClipPathData { move(device_path), device_bounding_rect, fill_rule };
+}
+
 AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaintable& viewport_paintable)
 {
-    auto visual_context_tree = AccumulatedVisualContextTree::create();
-
     auto& document = viewport_paintable.document();
+    auto visual_context_tree = AccumulatedVisualContextTree::create(visual_viewport_transform_data(document));
     auto pixel_ratio = document.page().client().device_pixels_per_css_pixel();
     DevicePixelConverter converter { pixel_ratio };
     auto scale = static_cast<float>(pixel_ratio);
@@ -214,26 +282,21 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         return effects;
     };
 
-    // Create visual viewport transform as root (if not identity)
-    VisualContextIndex visual_viewport_context_index {};
-    auto transform = document.visual_viewport()->transform();
-    if (!transform.is_identity()) {
-        auto matrix = scale_matrix_for_device_pixels(transform.to_matrix(), scale);
-        visual_viewport_context_index = append_node({}, TransformData { matrix, { 0.f, 0.f } });
-    }
+    auto visual_viewport_context_index = VISUAL_VIEWPORT_NODE_INDEX;
 
     VisualContextIndex viewport_state_for_descendants = visual_viewport_context_index;
     if (viewport_paintable.own_scroll_frame_index().value())
         viewport_state_for_descendants = append_node(visual_viewport_context_index, ScrollData { viewport_paintable.own_scroll_frame_index(), false });
-    viewport_paintable.set_accumulated_visual_context({});
+    viewport_paintable.set_accumulated_visual_context(VISUAL_VIEWPORT_NODE_INDEX);
     viewport_paintable.set_accumulated_visual_context_for_descendants(viewport_state_for_descendants);
 
-    viewport_paintable.for_each_in_subtree_of_type<PaintableBox>([&](auto& paintable_box) {
-        auto visual_parent_paintable = paintable_box.parent();
-        auto* visual_parent = as_if<PaintableBox>(visual_parent_paintable.ptr());
-        if (!visual_parent)
-            return TraversalDecision::Continue;
+    struct DescendantVisualContexts {
+        VisualContextIndex normal;
+        VisualContextIndex absolute_position;
+        VisualContextIndex fixed_position;
+    };
 
+    auto build_paintable_box = [&](auto& self, PaintableBox& paintable_box, DescendantVisualContexts inherited_contexts) -> void {
         // Resolve filters before make_effects_data reads them.
         auto const& paintable_box_computed_values = paintable_box.computed_values();
         if (paintable_box_computed_values.filter().has_filters())
@@ -244,38 +307,28 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         VisualContextIndex inherited_state;
 
         if (paintable_box.is_fixed_position()) {
-            inherited_state = visual_viewport_context_index;
+            inherited_state = inherited_contexts.fixed_position;
         } else if (paintable_box.is_absolutely_positioned()) {
-            // For position: absolute, use containing block's state to correctly escape scroll containers.
-            auto containing = paintable_box.containing_block();
-            inherited_state = containing->accumulated_visual_context_for_descendants_index();
-
-            // Abspos elements escape scroll containers and overflow clips of non-positioned
-            // ancestors, but cannot escape stacking contexts created by intermediate effects
-            // (opacity, mix-blend-mode, isolation). Walk from visual parent to containing
-            // block and collect these intermediate effects.
-            // NOTE: transforms/perspectives/filters establish containing blocks for abspos,
-            //       so they cannot appear as intermediates.
-            Vector<VisualContextData, 4> intermediate_effects;
-            RefPtr<Paintable> containing_paintable = containing;
-            for (RefPtr<Paintable> paintable = visual_parent; paintable && paintable != containing_paintable; paintable = paintable->parent()) {
-                auto* ancestor_box = as_if<PaintableBox>(paintable.ptr());
-                if (!ancestor_box)
-                    continue;
-                if (auto effects = make_effects_data(*ancestor_box); effects.has_value())
-                    intermediate_effects.append(effects.release_value());
-            }
-            for (auto& effects : intermediate_effects.in_reverse())
-                inherited_state = append_node(inherited_state, move(effects));
+            inherited_state = inherited_contexts.absolute_position;
         } else {
-            // For position: relative/static, use visual parent's state directly.
-            // This avoids duplicate transform/perspective allocations that would occur with
-            // the containing block + intermediate walk approach.
-            inherited_state = visual_parent->accumulated_visual_context_for_descendants_index();
+            // In-flow and relatively positioned boxes inherit the normal descendant context from their visual parent.
+            inherited_state = inherited_contexts.normal;
         }
 
         // Build this element's own state from inherited state.
         VisualContextIndex own_state = inherited_state;
+
+        // Out-of-flow descendants can skip overflow and scroll clips from intermediate ancestors. Keep their visual
+        // contexts separate as we descend, and replace them with the normal descendant context only when this box
+        // establishes the relevant containing block.
+        VisualContextIndex state_for_absolute_position_descendants = inherited_contexts.absolute_position;
+        VisualContextIndex state_for_fixed_position_descendants = inherited_contexts.fixed_position;
+
+        auto append_to_own_and_positioned_descendant_contexts = [&](auto const& data) {
+            own_state = append_node(own_state, data);
+            state_for_absolute_position_descendants = append_node(state_for_absolute_position_descendants, data);
+            state_for_fixed_position_descendants = append_node(state_for_fixed_position_descendants, data);
+        };
 
         if (paintable_box.is_sticky_position()) {
             // For sticky elements, use enclosing_scroll_frame which holds the sticky frame.
@@ -287,7 +340,7 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         auto const& computed_values = paintable_box.computed_values();
 
         if (auto effects = make_effects_data(paintable_box); effects.has_value())
-            own_state = append_node(own_state, effects.release_value());
+            append_to_own_and_positioned_descendant_contexts(effects.value());
 
         if (auto transform_data = compute_transform(paintable_box, computed_values, pixel_ratio); transform_data.has_value()) {
             paintable_box.set_has_non_invertible_css_transform(!transform_data->matrix.is_invertible());
@@ -296,26 +349,11 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
             paintable_box.set_has_non_invertible_css_transform(false);
         }
 
-        if (auto css_clip = paintable_box.get_clip_rect(); css_clip.has_value()) {
-            auto effective_rect = effective_css_clip_rect(*css_clip);
-            own_state = append_node(own_state, ClipData { converter.rounded_device_rect(effective_rect), {} });
-        }
+        if (auto css_clip = compute_css_clip_data(paintable_box, converter); css_clip.has_value())
+            append_to_own_and_positioned_descendant_contexts(css_clip.value());
 
-        // FIXME: Support other geometry boxes. See: https://drafts.fxtf.org/css-masking/#typedef-geometry-box
-        if (auto const& clip_path = computed_values.clip_path(); clip_path.has_value() && clip_path->is_basic_shape()) {
-            auto masking_area = paintable_box.absolute_border_box_rect();
-            auto reference_box = CSSPixelRect { {}, masking_area.size() };
-            auto const& basic_shape = clip_path->basic_shape();
-            auto path = basic_shape.to_path(reference_box, paintable_box.layout_node());
-            path.offset(masking_area.top_left().template to_type<float>());
-            auto fill_rule = basic_shape.basic_shape().visit(
-                [](CSS::Polygon const& polygon) { return polygon.fill_rule; },
-                [](CSS::Path const& path) { return path.fill_rule; },
-                [](auto const&) { return Gfx::WindingRule::Nonzero; });
-            auto device_path = path.copy_transformed(Gfx::AffineTransform {}.set_scale(scale, scale));
-            auto device_bounding_rect = converter.rounded_device_rect(masking_area);
-            own_state = append_node(own_state, ClipPathData { move(device_path), device_bounding_rect, fill_rule });
-        }
+        if (auto clip_path_data = compute_basic_shape_clip_path_data(paintable_box, computed_values, converter, scale); clip_path_data.has_value())
+            append_to_own_and_positioned_descendant_contexts(clip_path_data.value());
 
         paintable_box.set_accumulated_visual_context(own_state);
 
@@ -384,19 +422,47 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         }
 
         paintable_box.set_accumulated_visual_context_for_descendants(state_for_descendants);
+        if (paintable_box.layout_node().establishes_an_absolute_positioning_containing_block())
+            state_for_absolute_position_descendants = state_for_descendants;
+        if (paintable_box.layout_node().establishes_a_fixed_positioning_containing_block())
+            state_for_fixed_position_descendants = state_for_descendants;
 
-        return TraversalDecision::Continue;
+        DescendantVisualContexts child_contexts {
+            state_for_descendants,
+            state_for_absolute_position_descendants,
+            state_for_fixed_position_descendants,
+        };
+        paintable_box.for_each_child_of_type<PaintableBox>([&](PaintableBox& child) {
+            self(self, child, child_contexts);
+            return IterationDecision::Continue;
+        });
+    };
+
+    DescendantVisualContexts viewport_contexts {
+        viewport_state_for_descendants,
+        viewport_state_for_descendants,
+        visual_viewport_context_index,
+    };
+    viewport_paintable.for_each_child_of_type<PaintableBox>([&](PaintableBox& child) {
+        build_paintable_box(build_paintable_box, child, viewport_contexts);
+        return IterationDecision::Continue;
     });
 
     return visual_context_tree;
 }
 
+void update_visual_viewport_accumulated_visual_context(ViewportPaintable& viewport_paintable)
+{
+    viewport_paintable.visual_context_tree().set_visual_viewport_transform(visual_viewport_transform_data(viewport_paintable.document()));
+}
+
 VisualContextIndex AccumulatedVisualContextTree::append(VisualContextData data, VisualContextIndex parent_index)
 {
-    size_t depth = parent_index.value() ? m_nodes[parent_index.value()].depth + 1 : 1;
+    VERIFY(parent_index.value() < m_nodes.size());
+    size_t depth = m_nodes[parent_index.value()].depth + 1;
 
     bool empty_clip = false;
-    if (parent_index.value() && m_nodes[parent_index.value()].has_empty_effective_clip) {
+    if (m_nodes[parent_index.value()].has_empty_effective_clip) {
         empty_clip = true;
     } else if (data.has<ClipData>()) {
         empty_clip = data.get<ClipData>().rect.is_empty();
@@ -409,10 +475,45 @@ VisualContextIndex AccumulatedVisualContextTree::append(VisualContextData data, 
     return index;
 }
 
+void AccumulatedVisualContextTree::set_visual_viewport_transform(TransformData transform)
+{
+    VERIFY(!m_nodes.is_empty());
+    VERIFY(m_nodes[VISUAL_VIEWPORT_NODE_INDEX.value()].data.has<TransformData>());
+    m_nodes[VISUAL_VIEWPORT_NODE_INDEX.value()].data = move(transform);
+}
+
+bool AccumulatedVisualContextTree::is_compatible_with(AccumulatedVisualContextTree const& other) const
+{
+    if (m_nodes.size() != other.m_nodes.size())
+        return false;
+
+    for (size_t i = 0; i < m_nodes.size(); ++i) {
+        auto const& node = m_nodes[i];
+        auto const& other_node = other.m_nodes[i];
+        if (node.parent_index != other_node.parent_index)
+            return false;
+        if (node.has_empty_effective_clip != other_node.has_empty_effective_clip)
+            return false;
+        if (!node.data.visit([&](auto const& data) {
+                using DataType = RemoveCVReference<decltype(data)>;
+                return other_node.data.has<DataType>();
+            }))
+            return false;
+    }
+
+    return true;
+}
+
+void AccumulatedVisualContextTree::reuse_version_from(AccumulatedVisualContextTree const& other)
+{
+    VERIFY(is_compatible_with(other));
+    m_version = other.m_version;
+}
+
 VisualContextIndex AccumulatedVisualContextTree::find_common_ancestor(VisualContextIndex a, VisualContextIndex b) const
 {
-    if (!a.value() || !b.value())
-        return {};
+    VERIFY(a.value() < m_nodes.size());
+    VERIFY(b.value() < m_nodes.size());
     size_t a_index = a.value();
     size_t b_index = b.value();
     while (m_nodes[a_index].depth > m_nodes[b_index].depth)
@@ -428,19 +529,20 @@ VisualContextIndex AccumulatedVisualContextTree::find_common_ancestor(VisualCont
 
 Vector<size_t, 8> AccumulatedVisualContextTree::build_ancestor_chain(VisualContextIndex index) const
 {
+    VERIFY(index.value() < m_nodes.size());
     auto const& node = m_nodes[index.value()];
     Vector<size_t, 8> chain;
-    chain.ensure_capacity(node.depth);
-    for (size_t i = index.value(); i; i = m_nodes[i].parent_index.value())
+    chain.ensure_capacity(node.depth + 1);
+    for (size_t i = index.value();; i = m_nodes[i].parent_index.value()) {
         chain.append(i);
+        if (i == VISUAL_VIEWPORT_NODE_INDEX.value())
+            break;
+    }
     return chain;
 }
 
 Optional<Gfx::FloatPoint> AccumulatedVisualContextTree::transform_point_for_hit_test(VisualContextIndex index, Gfx::FloatPoint screen_point, ScrollStateSnapshot const& scroll_state) const
 {
-    if (!index.value())
-        return screen_point;
-
     auto chain = build_ancestor_chain(index);
 
     auto point = screen_point;
@@ -505,9 +607,6 @@ Optional<Gfx::FloatPoint> AccumulatedVisualContextTree::transform_point_for_hit_
 
 Gfx::FloatPoint AccumulatedVisualContextTree::inverse_transform_point(VisualContextIndex index, Gfx::FloatPoint screen_point) const
 {
-    if (!index.value())
-        return screen_point;
-
     auto chain = build_ancestor_chain(index);
 
     auto point = screen_point;
@@ -536,35 +635,36 @@ Gfx::FloatPoint AccumulatedVisualContextTree::inverse_transform_point(VisualCont
     return point;
 }
 
-Gfx::FloatRect AccumulatedVisualContextTree::transform_rect_to_viewport(VisualContextIndex index, Gfx::FloatRect const& source_rect, ScrollStateSnapshot const& scroll_state) const
+Gfx::FloatRect AccumulatedVisualContextTree::transform_rect_to_viewport(VisualContextIndex index, Gfx::FloatRect const& source_rect, ScrollStateSnapshot const& scroll_state, IncludeVisualViewportTransform include_visual_viewport_transform) const
 {
-    if (!index.value())
-        return source_rect;
-
     auto rect = source_rect;
-    for (size_t i = index.value(); i; i = m_nodes[i].parent_index.value()) {
+    for (size_t i = index.value();; i = m_nodes[i].parent_index.value()) {
         auto const& node = m_nodes[i];
-        node.data.visit(
-            [&](TransformData const& transform) {
-                auto affine = Gfx::extract_2d_affine_transform(transform.matrix);
-                rect.translate_by(-transform.origin);
-                rect = affine.map(rect);
-                rect.translate_by(transform.origin);
-            },
-            [&](PerspectiveData const& perspective) {
-                auto affine = Gfx::extract_2d_affine_transform(perspective.matrix);
-                rect = affine.map(rect);
-            },
-            [&](ScrollData const& scroll) {
-                rect.translate_by(scroll_state.device_offset_for_index(scroll.scroll_frame_index));
-            },
-            [&](ScrollCompensation const& compensation) {
-                auto offset = scroll_state.device_offset_for_index(compensation.scroll_frame_index);
-                rect.translate_by(-offset);
-            },
-            [&](ClipData const&) { /* clips don't affect rect coordinates */ },
-            [&](ClipPathData const&) { /* clip paths don't affect rect coordinates */ },
-            [&](EffectsData const&) { /* effects don't affect rect coordinates */ });
+        if (i != VISUAL_VIEWPORT_NODE_INDEX.value() || include_visual_viewport_transform == IncludeVisualViewportTransform::Yes) {
+            node.data.visit(
+                [&](TransformData const& transform) {
+                    auto affine = Gfx::extract_2d_affine_transform(transform.matrix);
+                    rect.translate_by(-transform.origin);
+                    rect = affine.map(rect);
+                    rect.translate_by(transform.origin);
+                },
+                [&](PerspectiveData const& perspective) {
+                    auto affine = Gfx::extract_2d_affine_transform(perspective.matrix);
+                    rect = affine.map(rect);
+                },
+                [&](ScrollData const& scroll) {
+                    rect.translate_by(scroll_state.device_offset_for_index(scroll.scroll_frame_index));
+                },
+                [&](ScrollCompensation const& compensation) {
+                    auto offset = scroll_state.device_offset_for_index(compensation.scroll_frame_index);
+                    rect.translate_by(-offset);
+                },
+                [&](ClipData const&) { /* clips don't affect rect coordinates */ },
+                [&](ClipPathData const&) { /* clip paths don't affect rect coordinates */ },
+                [&](EffectsData const&) { /* effects don't affect rect coordinates */ });
+        }
+        if (i == VISUAL_VIEWPORT_NODE_INDEX.value())
+            break;
     }
 
     return rect;
@@ -572,9 +672,6 @@ Gfx::FloatRect AccumulatedVisualContextTree::transform_rect_to_viewport(VisualCo
 
 void AccumulatedVisualContextTree::dump(VisualContextIndex index, StringBuilder& builder) const
 {
-    if (!index.value())
-        return;
-
     auto const& node = m_nodes[index.value()];
     node.data.visit(
         [&](PerspectiveData const&) {
@@ -787,7 +884,9 @@ ErrorOr<Web::Painting::AccumulatedVisualContextTree> decode(Decoder& decoder)
     auto version = TRY(decoder.decode<u64>());
     auto nodes = TRY(decoder.decode<Vector<Web::Painting::AccumulatedVisualContextNode>>());
     if (nodes.is_empty())
-        return Error::from_string_literal("IPC decode: AccumulatedVisualContextTree missing sentinel node");
+        return Error::from_string_literal("IPC decode: AccumulatedVisualContextTree missing visual viewport node");
+    if (!nodes[Web::Painting::VISUAL_VIEWPORT_NODE_INDEX.value()].data.has<Web::Painting::TransformData>())
+        return Error::from_string_literal("IPC decode: AccumulatedVisualContextTree visual viewport node is not a transform");
     return Web::Painting::AccumulatedVisualContextTree { version, move(nodes) };
 }
 

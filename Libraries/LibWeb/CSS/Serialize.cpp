@@ -149,6 +149,24 @@ void serialize_a_number(StringBuilder& builder, double value)
     builder.appendff("{:.6}", value);
 }
 
+void serialize_a_number(Utf16StringBuilder& builder, double value)
+{
+    // -> <number>
+    //    A base-ten number using digits 0-9 (U+0030 to U+0039) in the shortest form possible, using "." to separate
+    //    decimals (if any), rounding the value if necessary to not produce more than 6 decimals, preceded by "-"
+    //    (U+002D) if it is negative.
+    // NOTE: scientific notation is not used.
+
+    // AD-HOC: If the number is small enough that it would not print any digits when rounded, serialize it as 0.
+    if (AK::abs(value) < 0.0000005) {
+        builder.append_ascii('0');
+        return;
+    }
+
+    // FIXME: Prevent scientific notation for large values.
+    builder.appendff("{:.6}", value);
+}
+
 String serialize_an_identifier(StringView ident)
 {
     StringBuilder builder;
@@ -310,6 +328,36 @@ String serialize_a_series_of_component_values(ReadonlySpan<Parser::ComponentValu
         auto const& current_token = tokens.consume_a_token();
         auto const& next_token = tokens.next_token();
         builder.append(current_token.to_string());
+        if (needs_comment_between(current_token, next_token))
+            builder.append("/**/"sv);
+    }
+
+    return builder.to_string_without_validation();
+}
+
+static bool should_preserve_original_source_text_for_custom_property(Parser::ComponentValue const& component_value)
+{
+    return component_value.is(Parser::Token::Type::Number)
+        || component_value.is(Parser::Token::Type::Percentage)
+        || component_value.is(Parser::Token::Type::Dimension);
+}
+
+String serialize_a_series_of_component_values_preserving_original_source_text(ReadonlySpan<Parser::ComponentValue> component_values)
+{
+    Parser::TokenStream tokens { component_values };
+    StringBuilder builder;
+
+    while (tokens.has_next_token()) {
+        auto const& current_token = tokens.consume_a_token();
+        auto const& next_token = tokens.next_token();
+        if (should_preserve_original_source_text_for_custom_property(current_token)) {
+            auto original_source_text = current_token.original_source_text();
+            if (original_source_text.is_empty())
+                return serialize_a_series_of_component_values(component_values);
+            builder.append(original_source_text);
+        } else {
+            builder.append(current_token.to_string());
+        }
         if (needs_comment_between(current_token, next_token))
             builder.append("/**/"sv);
     }

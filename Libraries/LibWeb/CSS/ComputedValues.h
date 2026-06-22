@@ -182,6 +182,7 @@ public:
     static CursorData cursor() { return { CursorPredefined::Auto }; }
     static WhiteSpaceCollapse white_space_collapse() { return WhiteSpaceCollapse::Collapse; }
     static WordBreak word_break() { return WordBreak::Normal; }
+    static FontVariantEmoji font_variant_emoji() { return FontVariantEmoji::Normal; }
     static CSSPixels word_spacing() { return 0; }
     static CSSPixels letter_spacing() { return 0; }
     static Variant<Length, double> tab_size() { return 8; }
@@ -487,15 +488,6 @@ struct ContentData {
     Vector<Variant<String, NonnullRefPtr<ImageStyleValue>>> data;
     Vector<ValueComparingRefPtr<CounterStyle const>> counter_style_dependencies;
     Optional<String> alt_text {};
-
-    void visit_edges(GC::Cell::Visitor& visitor) const
-    {
-        for (auto const& item : data) {
-            if (auto* ptr = item.get_pointer<NonnullRefPtr<ImageStyleValue>>()) {
-                (*ptr)->visit_edges(visitor);
-            }
-        }
-    }
 };
 
 struct CounterData {
@@ -546,11 +538,6 @@ public:
     ComputedValues() = default;
     ~ComputedValues() = default;
 
-    void visit_edges(GC::Cell::Visitor& visitor)
-    {
-        m_noninherited.visit_edges(visitor);
-    }
-
     AspectRatio aspect_ratio() const { return m_noninherited.aspect_ratio; }
     Float float_() const { return m_noninherited.float_; }
     Length border_spacing_horizontal() const { return m_inherited.border_spacing_horizontal; }
@@ -588,6 +575,7 @@ public:
     WhiteSpaceCollapse white_space_collapse() const { return m_inherited.white_space_collapse; }
     WhiteSpaceTrimData white_space_trim() const { return m_noninherited.white_space_trim; }
     WordBreak word_break() const { return m_inherited.word_break; }
+    FontVariantEmoji font_variant_emoji() const { return m_inherited.font_variant_emoji; }
     CSSPixels const& word_spacing() const { return m_inherited.word_spacing; }
     CSSPixels letter_spacing() const { return m_inherited.letter_spacing; }
     FlexDirection flex_direction() const { return m_noninherited.flex_direction; }
@@ -704,6 +692,7 @@ public:
     Color background_color() const { return m_noninherited.background_color; }
     BackgroundBox background_color_clip() const { return m_noninherited.background_color_clip; }
     Vector<BackgroundLayerData> const& background_layers() const { return m_noninherited.background_layers; }
+    Vector<BackgroundLayerData> const& mask_layers() const { return m_noninherited.mask_layers; }
 
     Color webkit_text_fill_color() const { return m_inherited.webkit_text_fill_color; }
 
@@ -818,6 +807,7 @@ protected:
         CSSPixels text_underline_offset { InitialValues::text_underline_offset() };
         WhiteSpaceCollapse white_space_collapse { InitialValues::white_space_collapse() };
         WordBreak word_break { InitialValues::word_break() };
+        FontVariantEmoji font_variant_emoji { InitialValues::font_variant_emoji() };
         ListStylePosition list_style_position { InitialValues::list_style_position() };
         Visibility visibility { InitialValues::visibility() };
         CSSPixels word_spacing { InitialValues::word_spacing() };
@@ -893,6 +883,7 @@ protected:
         Color background_color { InitialValues::background_color() };
         int order { InitialValues::order() };
         Vector<BackgroundLayerData> background_layers;
+        Vector<BackgroundLayerData> mask_layers;
         FlexDirection flex_direction { InitialValues::flex_direction() };
         ColumnSpan column_span { InitialValues::column_span() };
         BackgroundBox background_color_clip { InitialValues::background_color_clip() };
@@ -975,24 +966,6 @@ protected:
         Vector<CounterData, 0> counter_set;
         WillChange will_change { InitialValues::will_change() };
         Resize resize { InitialValues::resize() };
-
-        void visit_edges(GC::Cell::Visitor& visitor)
-        {
-            for (auto& layer : background_layers)
-                layer.background_image->visit_edges(visitor);
-            if (mask_image)
-                mask_image->visit_edges(visitor);
-            for (auto const& transform : transformations)
-                transform->visit_edges(visitor);
-            if (rotate)
-                rotate->visit_edges(visitor);
-            if (translate)
-                translate->visit_edges(visitor);
-            if (scale)
-                scale->visit_edges(visitor);
-            if (content.has_value())
-                content->visit_edges(visitor);
-        }
     };
 
     NonInheritedValues m_noninherited;
@@ -1031,6 +1004,7 @@ public:
     void set_background_color(Color color) { m_noninherited.background_color = color; }
     void set_background_color_clip(BackgroundBox box) { m_noninherited.background_color_clip = box; }
     void set_background_layers(Vector<BackgroundLayerData>&& layers) { m_noninherited.background_layers = move(layers); }
+    void set_mask_layers(Vector<BackgroundLayerData>&& layers) { m_noninherited.mask_layers = move(layers); }
     void set_float(Float value) { m_noninherited.float_ = value; }
     void set_clear(Clear value) { m_noninherited.clear = value; }
     void set_z_index(Optional<int> value) { m_noninherited.z_index = move(value); }
@@ -1056,6 +1030,7 @@ public:
     void set_white_space_trim(WhiteSpaceTrimData value) { m_noninherited.white_space_trim = value; }
     void set_word_spacing(CSSPixels value) { m_inherited.word_spacing = value; }
     void set_word_break(WordBreak value) { m_inherited.word_break = value; }
+    void set_font_variant_emoji(FontVariantEmoji value) { m_inherited.font_variant_emoji = value; }
     void set_letter_spacing(CSSPixels value) { m_inherited.letter_spacing = value; }
     void set_width(Size const& width) { m_noninherited.width = width; }
     void set_min_width(Size const& width) { m_noninherited.min_width = width; }

@@ -9,8 +9,9 @@
 
 #include <AK/Function.h>
 #include <AK/HashTable.h>
+#include <AK/NeverDestroyed.h>
 #include <AK/ScopeGuard.h>
-#include <AK/StringBuilder.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/ArrayConstructor.h>
@@ -29,7 +30,11 @@ namespace JS {
 
 GC_DEFINE_ALLOCATOR(ArrayPrototype);
 
-static HashTable<GC::Ref<Object>> s_array_join_seen_objects;
+static auto& array_join_seen_objects()
+{
+    static NeverDestroyed<HashTable<GC::Ref<Object>>> seen_objects;
+    return *seen_objects;
+}
 
 ArrayPrototype::ArrayPrototype(Realm& realm)
     : Array(realm, realm.intrinsics().object_prototype())
@@ -119,7 +124,7 @@ static ThrowCompletionOr<Object*> array_species_create(VM& vm, Object& original_
     if (!is_array)
         return TRY(Array::create(realm, length)).ptr();
 
-    static Bytecode::StaticPropertyLookupCache cache;
+    static auto& cache = *new Bytecode::StaticPropertyLookupCache;
     auto constructor = TRY(original_array.get(vm.names.constructor, cache));
     if (constructor.is_constructor()) {
         auto& constructor_function = constructor.as_function();
@@ -132,7 +137,7 @@ static ThrowCompletionOr<Object*> array_species_create(VM& vm, Object& original_
     }
 
     if (constructor.is_object()) {
-        static Bytecode::StaticPropertyLookupCache cache2;
+        static auto& cache2 = *new Bytecode::StaticPropertyLookupCache;
         constructor = TRY(constructor.as_object().get(vm.well_known_symbol_species(), cache2));
         if (constructor.is_null())
             constructor = js_undefined();
@@ -918,29 +923,29 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::join)
     // This is not part of the spec, but all major engines do some kind of circular reference checks.
     // FWIW: engine262, a "100% spec compliant" ECMA-262 impl, aborts with "too much recursion".
     // Same applies to Array.prototype.toLocaleString().
-    if (s_array_join_seen_objects.contains(this_object))
-        return PrimitiveString::create(vm, String {});
-    s_array_join_seen_objects.set(this_object);
+    if (array_join_seen_objects().contains(this_object))
+        return PrimitiveString::create(vm, Utf16String {});
+    array_join_seen_objects().set(this_object);
     ArmedScopeGuard unsee_object_guard = [&] {
-        s_array_join_seen_objects.remove(this_object);
+        array_join_seen_objects().remove(this_object);
     };
 
     auto length = TRY(length_of_array_like(vm, this_object));
-    String separator = ","_string;
+    Utf16String separator = ","_utf16;
     if (!vm.argument(0).is_undefined())
-        separator = TRY(vm.argument(0).to_string(vm));
-    StringBuilder builder;
+        separator = TRY(vm.argument(0).to_utf16_string(vm));
+    Utf16StringBuilder builder;
     for (size_t i = 0; i < length; ++i) {
         if (i > 0)
-            builder.append(separator);
+            builder.append(separator.utf16_view());
         auto value = TRY(this_object->get(i));
         if (value.is_nullish())
             continue;
-        auto string = TRY(value.to_string(vm));
-        builder.append(string);
+        auto string = TRY(value.to_utf16_string(vm));
+        builder.append(string.utf16_view());
     }
 
-    return PrimitiveString::create(vm, builder.to_string_without_validation());
+    return PrimitiveString::create(vm, builder.to_string());
 }
 
 // 23.1.3.19 Array.prototype.keys ( ), https://tc39.es/ecma262/#sec-array.prototype.keys
@@ -1803,11 +1808,11 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::to_locale_string)
     // 1. Let array be ? ToObject(this value).
     auto this_object = TRY(vm.this_value().to_object(vm));
 
-    if (s_array_join_seen_objects.contains(this_object))
-        return PrimitiveString::create(vm, String {});
-    s_array_join_seen_objects.set(this_object);
+    if (array_join_seen_objects().contains(this_object))
+        return PrimitiveString::create(vm, Utf16String {});
+    array_join_seen_objects().set(this_object);
     ArmedScopeGuard unsee_object_guard = [&] {
-        s_array_join_seen_objects.remove(this_object);
+        array_join_seen_objects().remove(this_object);
     };
 
     // 2. Let len be ? ToLength(? Get(array, "length")).
@@ -1817,7 +1822,7 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::to_locale_string)
     constexpr auto separator = ","sv;
 
     // 4. Let R be the empty String.
-    StringBuilder builder;
+    Utf16StringBuilder builder;
 
     // 5. Let k be 0.
     // 6. Repeat, while k < len,
@@ -1825,7 +1830,7 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::to_locale_string)
         // a. If k > 0, then
         if (i > 0) {
             // i. Set R to the string-concatenation of R and separator.
-            builder.append(separator);
+            builder.append_ascii(separator);
         }
 
         // b. Let nextElement be ? Get(array, ! ToString(k)).
@@ -1837,15 +1842,15 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::to_locale_string)
             auto locale_string_result = TRY(value.invoke(vm, vm.names.toLocaleString, locales, options));
 
             // ii. Set R to the string-concatenation of R and S.
-            auto string = TRY(locale_string_result.to_string(vm));
-            builder.append(string);
+            auto string = TRY(locale_string_result.to_utf16_string(vm));
+            builder.append(string.utf16_view());
         }
 
         // d. Increase k by 1.
     }
 
     // 7. Return R.
-    return PrimitiveString::create(vm, builder.to_string_without_validation());
+    return PrimitiveString::create(vm, builder.to_string());
 }
 
 // 23.1.3.33 Array.prototype.toReversed ( ), https://tc39.es/ecma262/#sec-array.prototype.toreversed

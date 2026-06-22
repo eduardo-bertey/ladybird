@@ -13,11 +13,10 @@ namespace Web::Layout {
 
 // https://www.w3.org/TR/css-display/#block-container
 class BlockContainer : public Box {
-    GC_CELL(BlockContainer, Box);
-    GC_DECLARE_ALLOCATOR(BlockContainer);
+    LAYOUT_NODE(BlockContainer, Box);
 
 public:
-    BlockContainer(DOM::Document&, DOM::Node*, GC::Ref<CSS::ComputedProperties>);
+    BlockContainer(DOM::Document&, DOM::Node*, CSS::ComputedProperties const&);
     BlockContainer(DOM::Document&, DOM::Node*, NonnullOwnPtr<CSS::ComputedValues>);
     virtual ~BlockContainer() override;
 

@@ -10,6 +10,8 @@
 #include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
 #include <AK/Vector.h>
+#include <LibGfx/Path.h>
+#include <LibGfx/WindingRule.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/BorderRadiiData.h>
 #include <LibWeb/Painting/Paintable.h>
@@ -23,18 +25,26 @@ namespace Painting {
 class PaintableFragment;
 class ViewportPaintable;
 
+enum class CaretPositionMode : u8 {
+    Normal,
+    // Starting or extending selection should feel more eager than the public caret-position API in inter-line gaps.
+    SelectionStart,
+    Selection,
+};
+
 class WEB_API HitTestDisplayList : public RefCounted<HitTestDisplayList> {
 public:
     static NonnullRefPtr<HitTestDisplayList> create(u64 visual_context_tree_version);
 
     void append_box(PaintableBox const&, Paintable& target, CSSPixelRect, VisualContextIndex, BorderRadiiData);
+    void append_svg_path(Paintable& target, Gfx::Path, Gfx::WindingRule, CSSPixelRect bounding_box, VisualContextIndex);
     void append_text_fragment(PaintableFragment const&, VisualContextIndex);
     void append_empty_editable(PaintableWithLines const&, CSSPixelRect, VisualContextIndex);
     void append_chrome_widget(PaintableBox const&, ChromeWidget&, VisualContextIndex);
 
     u64 visual_context_tree_version() const { return m_visual_context_tree_version; }
     [[nodiscard]] Optional<HitTestResult> hit_test(CSSPixelPoint, HitTestType, ViewportPaintable const&, double device_pixels_per_css_pixel, ChromeMetrics const&) const;
-    [[nodiscard]] Optional<CaretPosition> caret_position_from_point(CSSPixelPoint, ViewportPaintable const&, double device_pixels_per_css_pixel, ChromeMetrics const&) const;
+    [[nodiscard]] Optional<CaretPosition> caret_position_from_point(CSSPixelPoint, ViewportPaintable const&, double device_pixels_per_css_pixel, ChromeMetrics const&, CaretPositionMode = CaretPositionMode::Normal) const;
     TraversalDecision hit_test_all(CSSPixelPoint, ViewportPaintable const&, double device_pixels_per_css_pixel, ChromeMetrics const&, Function<TraversalDecision(HitTestResult)> const&) const;
 
 private:
@@ -42,6 +52,7 @@ private:
 
     enum class ItemKind : u8 {
         Box,
+        SvgPath,
         TextFragment,
         EmptyEditable,
         ChromeWidget,
@@ -59,6 +70,8 @@ private:
         Optional<CSSPixelRect> block_container_margin_rect;
         VisualContextIndex visual_context_index;
         BorderRadiiData border_radii;
+        Optional<Gfx::Path> path {};
+        Gfx::WindingRule winding_rule { Gfx::WindingRule::Nonzero };
     };
 
     struct SpatialIndex {
@@ -95,8 +108,9 @@ private:
     [[nodiscard]] HitTestResult hit_test_result_for_item(Item const&, CSSPixelPoint local_point) const;
     [[nodiscard]] Optional<CaretPosition> caret_position_for_item(Item const&, CSSPixelPoint local_point, CaretPositionType = CaretPositionType::Closest) const;
     [[nodiscard]] Optional<CaretPosition> caret_position_for_hit_container(Item const&) const;
-    [[nodiscard]] Optional<CaretPosition> caret_position_for_line(CaretLine const&, CSSPixelPoint local_point) const;
+    [[nodiscard]] Optional<CaretPosition> caret_position_for_line(CaretLine const&, CSSPixelPoint local_point, CaretPositionMode) const;
     [[nodiscard]] bool line_contains_descendant_of(CaretLine const&, DOM::Node const&) const;
+    [[nodiscard]] bool item_is_inline_adjacent_to_line(Item const&, CaretLine const&) const;
     void find_topmost_item_in_list(Vector<size_t> const&, CSSPixelPoint local_point, ChromeMetrics const&, Optional<size_t>& topmost_item_index) const;
     void find_topmost_caret_item_in_list(Vector<size_t> const&, CSSPixelPoint local_point, ChromeMetrics const&, Optional<size_t>& topmost_item_index) const;
     void find_items_in_list(Vector<size_t> const&, CSSPixelPoint local_point, ChromeMetrics const&, Vector<size_t>& hit_item_indices) const;

@@ -13,6 +13,8 @@
 
 #include <QApplication>
 
+class QMenu;
+
 namespace Ladybird {
 
 struct WindowConfiguration {
@@ -23,7 +25,7 @@ struct WindowConfiguration {
     Optional<bool> maximized {};
 };
 
-class Application : public WebView::Application {
+class Application final : public WebView::Application {
     WEB_VIEW_APPLICATION(Application)
 
 public:
@@ -31,9 +33,18 @@ public:
 
     Function<void(URL::URL)> on_open_file;
     BrowserWindow& new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& = {}, BrowserWindow::IsPopupWindow is_popup_window = BrowserWindow::IsPopupWindow::No, Tab* parent_tab = nullptr, Optional<u64> page_index = {});
+    void open_new_tab();
+    void open_new_window();
+    void focus_location_editor();
+    void reopen_recently_closed_tab();
+    void open_file();
+    void quit();
+    void initialize_macos_application_menu();
+    QMenu* qt_bookmarks_menu() const;
 
     BrowserWindow& active_window() const { return *m_active_window; }
     void set_active_window(BrowserWindow& w) { m_active_window = &w; }
+    BrowserWindow* active_window_if_any() const { return m_active_window; }
 
     Tab* active_tab() const { return m_active_window ? m_active_window->current_tab() : nullptr; }
     void update_reopen_recently_closed_actions() const;
@@ -42,10 +53,12 @@ private:
     explicit Application();
 
     virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions&) override;
-    virtual NonnullOwnPtr<Core::EventLoop> create_platform_event_loop() override;
+    virtual Core::EventLoop& create_platform_event_loop() override;
 
     virtual Optional<WebView::ViewImplementation&> active_web_view() const override;
     virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const override;
+    virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const override;
+    virtual bool activate_tab_with_url(URL::URL const&) const override;
     virtual void open_url_in_new_window(URL::URL const& url) override;
 
     virtual Optional<ByteString> ask_user_for_download_path(StringView file) const override;
@@ -59,8 +72,11 @@ private:
     virtual Vector<Web::Clipboard::SystemClipboardRepresentation> clipboard_entries() const override;
     virtual void insert_clipboard_entry(Web::Clipboard::SystemClipboardRepresentation) override;
 
+    virtual bool supports_vertical_tabs() const override { return true; }
+    virtual bool supports_server_side_window_decorations() const override { return true; }
+    virtual void update_tabs_display() const override;
+
     virtual void rebuild_bookmarks_menu() const override;
-    virtual void update_bookmarks_bar_display(bool) const override;
     virtual void show_bookmark_context_menu(Gfx::IntPoint, Optional<WebView::BookmarkItem const&>, Optional<String const&> target_folder_id) override;
     virtual Optional<BookmarkID> bookmark_item_id_for_context_menu() const override;
     virtual NonnullRefPtr<BookmarkPromise> display_add_bookmark_dialog() const override;

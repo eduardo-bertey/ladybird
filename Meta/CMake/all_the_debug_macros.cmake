@@ -30,8 +30,8 @@ set(IDB_DEBUG ON)
 set(IDL_DEBUG ON)
 set(IMAGE_DECODER_DEBUG ON)
 set(IMAGE_LOADER_DEBUG ON)
-set(JS_BYTECODE_DEBUG ON)
 set(JS_MODULE_DEBUG ON)
+set(LADYBIRD_SESSION_HISTORY_DEBUG ON)
 set(LEXER_DEBUG ON)
 set(WEBVIEW_HISTORY_DEBUG ON)
 set(LIBWEB_CSS_ANIMATION_DEBUG ON)
@@ -80,8 +80,6 @@ set(XML_PARSER_DEBUG ON)
 
 # False positive: ANDROID_LOG_DEBUG is a log level, not a debug flag
 # set(ANDROID_LOG_DEBUG ON)
-# Clogs up build: The BindingsGenerator stuff is run at compile time.
-# set(BINDINGS_GENERATOR_DEBUG ON)
 # Third-party: skia vcpkg port overlay
 # set(gn_defines_DEBUG ON)
 # set(gn_include_dirs_DEBUG ON)

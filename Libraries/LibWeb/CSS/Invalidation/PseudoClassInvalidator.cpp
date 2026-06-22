@@ -71,7 +71,8 @@ static bool element_may_match_rule_containing_pseudo_class_in_style_scope(DOM::E
 {
     bool may_match = false;
     auto abstract_element = DOM::AbstractElement { element };
-    style_scope.get_pseudo_class_rule_cache(pseudo_class).for_each_matching_rules(abstract_element, [&](auto const& matching_rules) {
+    Function<bool(u32)> const may_contain_ancestor_hash = [](u32) { return true; };
+    style_scope.get_pseudo_class_rule_cache(pseudo_class).for_each_matching_rules(abstract_element, may_contain_ancestor_hash, [&](auto const& matching_rules) {
         for (auto const& matching_rule : matching_rules) {
             if (pseudo_class_subject_may_match_element(element, matching_rule.selector, pseudo_class)) {
                 may_match = true;
@@ -110,17 +111,6 @@ void invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass pseudo_cl
         };
         options.invalidate_self_from_property_plan = options.invalidate_self;
         element.invalidate_style(reason, properties, options);
-
-        // The interaction-state pseudo classes (Hover/Focus/etc.) aren't tracked in
-        // pseudo_classes_used_in_has_selectors, so invalidate_node_style_for_properties
-        // doesn't schedule :has() ancestor invalidation for them. Schedule it directly so
-        // rules like .a:has(:focus) ... re-evaluate when the state flips.
-        element.for_each_style_scope_which_may_observe_the_node([&](CSS::StyleScope& scope) {
-            if (!scope.may_have_has_selectors())
-                return;
-            scope.record_pending_has_invalidation_mutation_features(element, properties);
-            scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(element);
-        });
     };
 
     auto build_chain = [&](GC::Ptr<DOM::Node> start) {

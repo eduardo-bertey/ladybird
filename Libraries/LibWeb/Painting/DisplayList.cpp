@@ -29,8 +29,6 @@ static void set_command_sequence_visual_context(Bytes command_bytes, VisualConte
     }
 }
 
-DisplayListCommandSequence::DisplayListCommandSequence() = default;
-
 DisplayList::DisplayList(u64 compatible_visual_context_tree_version)
     : m_compatible_visual_context_tree_version(compatible_visual_context_tree_version)
     , m_id(s_next_id.fetch_add(1, AK::MemoryOrder::memory_order_relaxed))
@@ -55,14 +53,14 @@ bool DisplayList::append_bytes(
     bool is_clip)
 {
     VERIFY(visual_context_tree.version() == m_compatible_visual_context_tree_version);
-    if (context_index.value() && visual_context_tree.has_empty_effective_clip(context_index))
+    if (visual_context_tree.has_empty_effective_clip(context_index))
         return false;
-    VERIFY(m_command_bytes.size() % DisplayListCommandSequence::command_alignment == 0);
+    VERIFY(m_command_bytes.size() % DisplayList::command_alignment == 0);
     VERIFY(payload.size() <= NumericLimits<u32>::max());
     VERIFY(inline_data.size() <= NumericLimits<u32>::max() - payload.size());
     auto payload_size = payload.size() + inline_data.size();
     auto record_size = sizeof(DisplayListCommandHeader) + payload_size;
-    constexpr auto command_alignment = DisplayListCommandSequence::command_alignment;
+    constexpr auto command_alignment = DisplayList::command_alignment;
     auto trailing_padding = align_up_to(record_size, command_alignment) - record_size;
     VERIFY(trailing_padding <= NumericLimits<u32>::max() - payload_size);
     DisplayListCommandHeader header {
@@ -83,33 +81,28 @@ bool DisplayList::append_bytes(
 }
 
 void DisplayList::append_command_sequence(
-    DisplayListCommandSequence const& sequence,
+    ReadonlyBytes command_sequence,
     AccumulatedVisualContextTree const& visual_context_tree,
-    VisualContextIndex context_index,
-    DisplayListResourceStorage& resource_storage)
+    VisualContextIndex context_index)
 {
     VERIFY(visual_context_tree.version() == m_compatible_visual_context_tree_version);
 
-    auto command_bytes = MUST(ByteBuffer::copy(sequence.m_command_bytes.span()));
+    auto command_bytes = MUST(ByteBuffer::copy(command_sequence));
 
     set_command_sequence_visual_context(command_bytes.span(), context_index);
-    resource_storage.append_referenced_resources_from(sequence.m_resource_storage, command_bytes.span());
-    VERIFY(m_command_bytes.size() % DisplayListCommandSequence::command_alignment == 0);
-    VERIFY(command_bytes.size() % DisplayListCommandSequence::command_alignment == 0);
+    VERIFY(m_command_bytes.size() % DisplayList::command_alignment == 0);
+    VERIFY(command_bytes.size() % DisplayList::command_alignment == 0);
 
     if (!command_bytes.is_empty())
         m_command_bytes.append(command_bytes.data(), command_bytes.size());
 }
 
-DisplayListCommandSequence DisplayList::copy_command_sequence_from(
-    size_t command_start_offset,
-    DisplayListResourceStorage const& resource_storage) const
+ByteBuffer DisplayList::copy_command_bytes_from(size_t command_start_offset) const
 {
     VERIFY(command_start_offset <= m_command_bytes.size());
-    DisplayListCommandSequence sequence;
-    sequence.m_command_bytes = MUST(m_command_bytes.slice(command_start_offset, m_command_bytes.size() - command_start_offset));
-    sequence.m_resource_storage.append_referenced_resources_from(resource_storage, sequence.m_command_bytes.span());
-    return sequence;
+    return MUST(m_command_bytes.slice(
+        command_start_offset,
+        m_command_bytes.size() - command_start_offset));
 }
 
 void DisplayListPlayer::execute(
@@ -117,14 +110,17 @@ void DisplayListPlayer::execute(
     AccumulatedVisualContextTree const& visual_context_tree,
     DisplayListResourceStorage const& resource_storage,
     ScrollStateSnapshot const& scroll_state_snapshot,
-    RefPtr<Gfx::PaintingSurface> surface)
+    RefPtr<Gfx::PaintingSurface> surface,
+    CanvasSurfaceRegistry const* canvas_surface_registry)
 {
     VERIFY(display_list.compatible_visual_context_tree_version() == visual_context_tree.version());
     m_surface = surface;
     m_active_display_list = &display_list;
     m_active_visual_context_tree = &visual_context_tree;
     m_resource_storage = &resource_storage;
+    m_canvas_surface_registry = canvas_surface_registry;
     execute_impl(display_list, scroll_state_snapshot);
+    m_canvas_surface_registry = nullptr;
     m_resource_storage = nullptr;
     m_active_visual_context_tree = nullptr;
     m_active_display_list = nullptr;
@@ -172,13 +168,14 @@ void DisplayListPlayer::execute_impl(
 
     auto for_each_node_from_common_ancestor_to_target =
         [&](this auto const& self,
-            VisualContextIndex common_ancestor_index,
+            Optional<VisualContextIndex> common_ancestor_index,
             VisualContextIndex target_index,
             auto&& callback) -> IterationDecision {
-        if (!target_index.value() || target_index == common_ancestor_index)
+        if (common_ancestor_index.has_value() && target_index == common_ancestor_index.value())
             return IterationDecision::Continue;
-        if (self(common_ancestor_index, visual_context_tree.node_at(target_index).parent_index, callback)
-            == IterationDecision::Break) {
+        if (target_index != VISUAL_VIEWPORT_NODE_INDEX
+            && self(common_ancestor_index, visual_context_tree.node_at(target_index).parent_index, callback)
+                == IterationDecision::Break) {
             return IterationDecision::Break;
         }
         return callback(target_index, visual_context_tree.node_at(target_index));
@@ -188,53 +185,54 @@ void DisplayListPlayer::execute_impl(
         [&](VisualContextIndex, AccumulatedVisualContextNode const& node) {
             node.data.visit(
                 [&](EffectsData const& effects) {
-                    apply_effects({
-                                      .opacity = effects.opacity,
-                                      .compositing_and_blending_operator = effects.blend_mode,
-                                      .has_filter = effects.gfx_filter.has_value(),
-                                      .filter_data = {},
-                                  },
+                    play_command(ApplyEffects {
+                                     .opacity = effects.opacity,
+                                     .compositing_and_blending_operator = effects.blend_mode,
+                                     .has_filter = effects.gfx_filter.has_value(),
+                                     .filter_data = {},
+                                 },
                         effects.gfx_filter.has_value() ? &effects.gfx_filter.value() : nullptr);
                 },
                 [&](PerspectiveData const& perspective) {
-                    save({});
+                    play_command(Save {});
                     apply_transform({ 0, 0 }, perspective.matrix);
                 },
                 [&](ScrollData const& scroll) {
-                    save({});
+                    play_command(Save {});
                     auto offset = scroll_state.device_offset_for_index(scroll.scroll_frame_index);
                     if (!offset.is_zero())
-                        translate({ .delta = offset.to_type<int>() });
+                        play_command(Translate { .delta = offset.to_type<int>() });
                 },
                 [&](ScrollCompensation const& compensation) {
-                    save({});
+                    play_command(Save {});
                     auto offset = scroll_state.device_offset_for_index(compensation.scroll_frame_index);
                     if (!offset.is_zero())
-                        translate({ .delta = (-offset).to_type<int>() });
+                        play_command(Translate { .delta = (-offset).to_type<int>() });
                 },
                 [&](TransformData const& transform) {
-                    save({});
+                    play_command(Save {});
                     apply_transform(transform.origin, transform.matrix);
                 },
                 [&](ClipData const& clip) {
-                    save({});
+                    play_command(Save {});
                     if (clip.corner_radii.has_any_radius()) {
-                        add_rounded_rect_clip({
+                        play_command(AddRoundedRectClip {
                             .corner_radii = clip.corner_radii,
                             .border_rect = clip.rect.to_type<int>(),
                             .corner_clip = Gfx::CornerClip::Outside,
                         });
                     } else {
-                        add_clip_rect({ .rect = clip.rect.to_type<int>() });
+                        play_command(AddClipRect { .rect = clip.rect.to_type<int>() });
                     }
                 },
                 [&](ClipPathData const& clip_path) {
-                    save({});
+                    play_command(Save {});
                     add_clip_path(clip_path.path);
                 });
         };
 
     VisualContextIndex applied_context_index;
+    bool has_applied_context { false };
     size_t applied_depth = 0;
 
     // OPTIMIZATION: When walking down to apply effects (opacity, filters, blend modes), check culling before applying
@@ -245,28 +243,37 @@ void DisplayListPlayer::execute_impl(
         CulledByEffect,
     };
     auto switch_to_context = [&](VisualContextIndex target_index, Optional<Gfx::IntRect> bounding_rect = {}) -> SwitchResult {
-        if (applied_context_index == target_index)
+        if (has_applied_context && applied_context_index == target_index)
             return SwitchResult::Switched;
 
-        auto common_ancestor_index = visual_context_tree.find_common_ancestor(applied_context_index, target_index);
-        size_t const common_ancestor_depth = common_ancestor_index.value() ? visual_context_tree.node_at(common_ancestor_index).depth : 0;
+        Optional<VisualContextIndex> common_ancestor_index;
+        if (has_applied_context)
+            common_ancestor_index = visual_context_tree.find_common_ancestor(applied_context_index, target_index);
+        size_t const common_ancestor_depth = common_ancestor_index.has_value() ? visual_context_tree.node_at(common_ancestor_index.value()).depth + 1 : 0;
 
-        auto has_coordinate_changing_descendant = [&](VisualContextIndex ancestor_index) {
-            for (auto index = target_index; index != ancestor_index; index = visual_context_tree.node_at(index).parent_index) {
+        auto has_coordinate_changing_descendant = [&](Optional<VisualContextIndex> ancestor_index) {
+            for (auto index = target_index;; index = visual_context_tree.node_at(index).parent_index) {
+                if (ancestor_index.has_value() && index == ancestor_index.value())
+                    break;
                 auto const& node = visual_context_tree.node_at(index);
                 if (node.data.has<TransformData>()
                     || node.data.has<PerspectiveData>()
                     || node.data.has<ScrollData>()
                     || node.data.has<ScrollCompensation>())
                     return true;
+                if (index == VISUAL_VIEWPORT_NODE_INDEX)
+                    break;
             }
             return false;
         };
 
-        while (applied_depth > common_ancestor_depth) {
-            restore({});
-            applied_depth--;
-        }
+        auto restore_to_depth = [&](size_t target_depth) {
+            while (applied_depth > target_depth) {
+                play_command(Restore {});
+                --applied_depth;
+            }
+        };
+        restore_to_depth(common_ancestor_depth);
 
         auto result = SwitchResult::Switched;
         for_each_node_from_common_ancestor_to_target(
@@ -274,7 +281,7 @@ void DisplayListPlayer::execute_impl(
             target_index,
             [&](VisualContextIndex node_index, AccumulatedVisualContextNode const& node) {
                 if (bounding_rect.has_value() && node.data.has<EffectsData>()) {
-                    auto can_cull_before_effect = !has_coordinate_changing_descendant(node_index);
+                    auto can_cull_before_effect = !has_coordinate_changing_descendant(Optional<VisualContextIndex> { node_index });
                     if (bounding_rect->is_empty() || (can_cull_before_effect && would_be_fully_clipped_by_painter(*bounding_rect))) {
                         result = SwitchResult::CulledByEffect;
                         return IterationDecision::Break;
@@ -285,12 +292,19 @@ void DisplayListPlayer::execute_impl(
                 return IterationDecision::Continue;
             });
 
-        if (result == SwitchResult::Switched)
+        if (result == SwitchResult::Switched) {
             applied_context_index = target_index;
+            has_applied_context = true;
+        } else {
+            restore_to_depth(common_ancestor_depth);
+        }
         return result;
     };
 
     DisplayList::for_each_command_header(commands, [&](DisplayListCommandHeader const& header, ReadonlyBytes payload) {
+        if (display_list_command_is_compositor_metadata(header.type))
+            return;
+
         auto bounding_rect = header.has_bounding_rect
             ? Optional<Gfx::IntRect>(header.bounding_rect)
             : Optional<Gfx::IntRect> {};
@@ -303,9 +317,9 @@ void DisplayListPlayer::execute_impl(
             // so replace it with one to avoid doing unnecessary work.
             if (header.is_clip) {
                 if (header.type == DisplayListCommandType::AddClipRect)
-                    add_clip_rect(read_display_list_command_payload<AddClipRect>(payload));
+                    play_command(read_display_list_command_payload<AddClipRect>(payload));
                 else
-                    add_clip_rect({ bounding_rect.release_value() });
+                    play_command(AddClipRect { bounding_rect.release_value() });
             }
             return;
         }
@@ -327,7 +341,7 @@ void DisplayListPlayer::execute_impl(
 #define DISPATCH_DISPLAY_LIST_COMMAND(command_type, player_method)                    \
     case DisplayListCommandType::command_type:                                        \
         dispatch_command.template operator()<command_type>([&](auto const& command) { \
-            player_method(command);                                                   \
+            play_command(command);                                                    \
         });                                                                           \
         break;
             ENUMERATE_DISPLAY_LIST_COMMANDS(DISPATCH_DISPLAY_LIST_COMMAND)
@@ -336,7 +350,7 @@ void DisplayListPlayer::execute_impl(
     });
 
     while (applied_depth > 0) {
-        restore({});
+        play_command(Restore {});
         applied_depth--;
     }
 }

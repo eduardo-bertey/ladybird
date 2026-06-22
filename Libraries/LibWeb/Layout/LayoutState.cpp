@@ -16,7 +16,10 @@
 #include <LibWeb/Layout/LayoutState.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
+#include <LibWeb/Painting/SVGForeignObjectPaintable.h>
+#include <LibWeb/Painting/SVGGraphicsPaintable.h>
 #include <LibWeb/Painting/SVGPathPaintable.h>
+#include <LibWeb/Painting/SVGSVGPaintable.h>
 #include <LibWeb/Painting/TextPaintable.h>
 
 namespace Web::Layout {
@@ -425,7 +428,7 @@ static void build_paint_tree(Node& node, RefPtr<Painting::Paintable> parent_pain
         if (node.dom_node())
             node.dom_node()->set_paintable(paintable);
     }
-    for (auto* child = node.first_child(); child; child = child->next_sibling()) {
+    for (auto child = node.first_child(); child; child = child->next_sibling()) {
         build_paint_tree(*child, node.first_paintable());
     }
 }
@@ -584,6 +587,14 @@ void LayoutState::commit(Box& root)
                 svg_graphics_paintable && used_values.computed_svg_transforms().has_value()) {
                 svg_graphics_paintable->set_computed_transforms(*used_values.computed_svg_transforms());
             }
+            if (auto* svg_foreign_object_paintable = as_if<Painting::SVGForeignObjectPaintable>(paintable.ptr());
+                svg_foreign_object_paintable && used_values.computed_svg_transforms().has_value()) {
+                svg_foreign_object_paintable->set_computed_transforms(*used_values.computed_svg_transforms());
+            }
+            if (auto* svg_svg_paintable = as_if<Painting::SVGSVGPaintable>(paintable.ptr());
+                svg_svg_paintable && used_values.computed_svg_transforms().has_value()) {
+                svg_svg_paintable->set_computed_transforms(*used_values.computed_svg_transforms());
+            }
 
             if (auto* svg_path_paintable = as_if<Painting::SVGPathPaintable>(paintable.ptr())) {
                 if (auto* path = used_values.computed_svg_path())
@@ -591,6 +602,8 @@ void LayoutState::commit(Box& root)
             }
 
             if (node.display().is_grid_inside()) {
+                paintable_box->set_used_values_for_grid_template_columns(used_values.grid_template_columns());
+                paintable_box->set_used_values_for_grid_template_rows(used_values.grid_template_rows());
                 paintable_box->set_grid_layout_data(used_values.take_grid_layout_data());
             }
 
@@ -742,8 +755,8 @@ void LayoutState::commit(Box& root)
         auto const* box = as_if<Box>(used_values.node());
         if (!box || !box->paintable_box())
             return;
-        if (auto containing_block = box->containing_block())
-            contained_boxes_map.ensure(containing_block.ptr()).append(box);
+        if (auto const* containing_block = box->containing_block())
+            contained_boxes_map.ensure(containing_block).append(box);
     });
 
     // Measure overflow in scroll containers.

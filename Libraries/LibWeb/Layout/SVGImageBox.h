@@ -13,11 +13,10 @@
 namespace Web::Layout {
 
 class SVGImageBox : public SVGGraphicsBox {
-    GC_CELL(SVGImageBox, SVGGraphicsBox);
-    GC_DECLARE_ALLOCATOR(SVGImageBox);
+    LAYOUT_NODE(SVGImageBox, SVGGraphicsBox);
 
 public:
-    SVGImageBox(DOM::Document&, SVG::SVGGraphicsElement&, GC::Ref<CSS::ComputedProperties>);
+    SVGImageBox(DOM::Document&, SVG::SVGGraphicsElement&, CSS::ComputedProperties const&);
     virtual ~SVGImageBox() override = default;
 
     SVG::SVGImageElement& dom_node() { return static_cast<SVG::SVGImageElement&>(SVGGraphicsBox::dom_node()); }

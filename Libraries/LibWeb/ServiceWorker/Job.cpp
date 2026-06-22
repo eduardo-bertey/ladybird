@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NeverDestroyed.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibURL/URL.h>
@@ -72,8 +73,8 @@ void Job::visit_edges(JS::Cell::Visitor& visitor)
 // https://w3c.github.io/ServiceWorker/#dfn-scope-to-job-queue-map
 static HashMap<ByteString, JobQueue>& scope_to_job_queue_map()
 {
-    static HashMap<ByteString, JobQueue> map;
-    return map;
+    static NeverDestroyed<HashMap<ByteString, JobQueue>> map;
+    return *map;
 }
 
 // https://w3c.github.io/ServiceWorker/#register-algorithm
@@ -441,7 +442,7 @@ static void update(JS::VM& vm, GC::Ref<Job> job)
         if (job->client) {
             auto& realm = job->client->realm();
             auto context = HTML::TemporaryExecutionContext(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
-            WebIDL::reject_promise(realm, *job->job_promise, vm.throw_completion<JS::InternalError>(JS::ErrorType::NotImplemented, "Run Service Worker"sv).value());
+            WebIDL::reject_promise(realm, *job->job_promise, vm.throw_completion<JS::InternalError>(JS::ErrorType::NotImplemented, "Run Service Worker"_utf16).value());
             finish_job(vm, job);
         }
     });
@@ -469,7 +470,7 @@ static void unregister(JS::VM& vm, GC::Ref<Job> job)
     if (job->client) {
         auto& realm = job->client->realm();
         auto context = HTML::TemporaryExecutionContext(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
-        WebIDL::reject_promise(realm, *job->job_promise, vm.throw_completion<JS::InternalError>(JS::ErrorType::NotImplemented, "Service Worker unregistration"sv).value());
+        WebIDL::reject_promise(realm, *job->job_promise, vm.throw_completion<JS::InternalError>(JS::ErrorType::NotImplemented, "Service Worker unregistration"_utf16).value());
         finish_job(vm, job);
     }
 }

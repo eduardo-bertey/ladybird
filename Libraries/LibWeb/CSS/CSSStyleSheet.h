@@ -98,7 +98,7 @@ public:
     GC::Ptr<DOM::Document> owning_document() const;
     virtual void set_disabled(bool) override;
     void for_each_owning_style_scope(Function<void(StyleScope&)> const&) const;
-    NonnullRefPtr<StyleCache> shared_single_constructed_sheet_style_cache(StyleScope&);
+    NonnullRefPtr<StyleCache> shared_single_constructed_sheet_style_cache();
     SelectorInsights const& selector_insights() const;
 
     Optional<FlyString> default_namespace() const;
@@ -122,8 +122,8 @@ public:
 
     bool disallow_modification() const { return m_disallow_modification; }
 
-    void set_source_text(String);
-    Optional<String> source_text(Badge<DOM::Document>) const;
+    void set_source_text(String source) { m_source_text = move(source); }
+    Optional<String> source_text() const { return m_source_text; }
 
     void add_critical_subresource(Subresource&);
     void remove_critical_subresource(Subresource&);

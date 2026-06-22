@@ -9,6 +9,7 @@
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
 #include <AK/StringView.h>
+#include <AK/Utf16StringBuilder.h>
 #include <AK/Vector.h>
 #include <LibGfx/Color.h>
 #include <LibGfx/Font/UnicodeRange.h>
@@ -25,6 +26,7 @@ void serialize_a_string(StringBuilder&, StringView string);
 WEB_API void serialize_a_url(StringBuilder&, StringView url);
 void serialize_unicode_ranges(StringBuilder&, Vector<Gfx::UnicodeRange> const& unicode_ranges);
 WEB_API void serialize_a_number(StringBuilder&, double value);
+WEB_API void serialize_a_number(Utf16StringBuilder&, double value);
 
 String serialize_an_identifier(StringView ident);
 String serialize_a_string(StringView string);
@@ -49,6 +51,7 @@ void serialize_a_comma_separated_list(StringBuilder& builder, Vector<T> const& i
 String serialize_a_css_declaration(StringView property, StringView value, Important = Important::No);
 
 String serialize_a_series_of_component_values(ReadonlySpan<Parser::ComponentValue>);
+String serialize_a_series_of_component_values_preserving_original_source_text(ReadonlySpan<Parser::ComponentValue>);
 String serialize_a_positional_value_list(StyleValueVector const& values, SerializationMode mode);
 
 }

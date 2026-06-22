@@ -755,6 +755,7 @@ Variant<Empty, QualifiedRule, Parser::InvalidRuleError> Parser::consume_a_qualif
         .prelude = {},
         .declarations = {},
         .child_rules = {},
+        .source_position = {},
     };
 
     // NOTE: Qualified rules inside @keyframes are a keyframe rule.
@@ -831,7 +832,10 @@ Variant<Empty, QualifiedRule, Parser::InvalidRuleError> Parser::consume_a_qualif
         // anything else
         {
             // Consume a component value from input and append the result to rule’s prelude.
-            rule.prelude.append(consume_a_component_value(input));
+            auto component_value = consume_a_component_value(input);
+            if (!rule.source_position.has_value() && !component_value.is(Token::Type::Whitespace))
+                rule.source_position = component_value.start_position();
+            rule.prelude.append(move(component_value));
         }
     }
 }
@@ -1250,12 +1254,18 @@ Optional<Declaration> Parser::consume_a_declaration(TokenStream<T>& input, Neste
     Declaration declaration {
         .name {},
         .value {},
+        .important = Important::No,
+        .original_value_text = {},
+        .original_full_text = {},
+        .source_position = {},
     };
     auto start_token_index = input.current_index();
 
     // 1. If the next token is an <ident-token>, consume a token from input and set decl’s name to the token’s value.
     if (input.next_token().is(Token::Type::Ident)) {
-        declaration.name = ((Token)input.consume_a_token()).ident();
+        auto token = (Token)input.consume_a_token();
+        declaration.source_position = token.start_position();
+        declaration.name = token.ident();
     }
     //    Otherwise, consume the remnants of a bad declaration from input, with nested, and return nothing.
     else {
@@ -1645,6 +1655,45 @@ Parser::PropertiesAndCustomProperties Parser::parse_as_property_declaration_bloc
     return parsed_declarations;
 }
 
+Vector<DevToolsStyleDeclaration> Parser::parse_as_devtools_property_declaration_block()
+{
+    auto declarations_and_at_rules = parse_a_blocks_contents(m_token_stream);
+
+    Vector<DevToolsStyleDeclaration> parsed_declarations;
+    for (auto const& rule_or_list : declarations_and_at_rules) {
+        if (auto* rule_declarations = rule_or_list.get_pointer<Vector<Declaration>>()) {
+            for (auto const& declaration : *rule_declarations) {
+                auto property = PropertyNameAndID::from_name(Utf16FlyString::from_utf8(declaration.name));
+
+                StringBuilder value_builder;
+                for (auto const& value : declaration.value)
+                    value_builder.append(value.original_source_text());
+
+                parsed_declarations.append(DevToolsStyleDeclaration {
+                    .name = declaration.name,
+                    .value = value_builder.to_string_without_validation(),
+                    .important = declaration.important,
+                    .is_custom_property = property.has_value() && property->is_custom_property(),
+                    .is_name_valid = property.has_value(),
+                    .is_valid = property.has_value() && convert_to_style_property(declaration).has_value(),
+                });
+            }
+        }
+    }
+
+    return parsed_declarations;
+}
+
+Vector<DevToolsStyleDeclaration> parse_css_declaration_block_for_devtools(ParsingParams const& parsing_params, StringView declaration_block)
+{
+    auto devtools_parsing_params = parsing_params;
+    if (devtools_parsing_params.rule_context.is_empty())
+        devtools_parsing_params.rule_context.append(RuleContext::Style);
+
+    auto parser = Parser::create(devtools_parsing_params, declaration_block);
+    return parser.parse_as_devtools_property_declaration_block();
+}
+
 // https://drafts.csswg.org/cssom/#parse-a-css-declaration-block
 Vector<Descriptor> Parser::parse_as_descriptor_declaration_block(AtRuleID at_rule_id)
 {
@@ -1716,7 +1765,7 @@ bool Parser::is_valid_in_the_current_context(Declaration const& declaration) con
         // The <declaration-list> inside of <keyframe-block> accepts any CSS property except those defined in this
         // specification, but does accept the animation-timing-function property and interprets it specially
         // NB: animation-composition is defined in CSS Animations Level 2, so it is not excluded by this rule.
-        auto property = PropertyNameAndID::from_name(declaration.name);
+        auto property = PropertyNameAndID::from_name(Utf16FlyString::from_utf8(declaration.name));
         if (!property.has_value())
             return true;
         switch (property->id()) {
@@ -1908,7 +1957,7 @@ GC::Ref<CSSStyleProperties> Parser::convert_to_style_declaration(Vector<Declarat
 
 Optional<StylePropertyAndName> Parser::convert_to_style_property(Declaration const& declaration)
 {
-    auto property = PropertyNameAndID::from_name(declaration.name);
+    auto property = PropertyNameAndID::from_name(Utf16FlyString::from_utf8(declaration.name));
 
     if (!property.has_value()) {
         if (has_ignored_vendor_prefix(declaration.name)) {
@@ -1922,8 +1971,10 @@ Optional<StylePropertyAndName> Parser::convert_to_style_property(Declaration con
     auto value = parse_css_value(property->id(), value_token_stream, declaration.original_value_text);
     if (value.is_error()) {
         if (value.error() == ParseError::SyntaxError) {
+            auto property_name = property->name().to_utf16_string();
+            auto property_name_utf8 = property_name.to_utf8_but_should_be_ported_to_utf16();
             ErrorReporter::the().report(InvalidPropertyError {
-                .property_name = property->name(),
+                .property_name = MUST(FlyString::from_utf8(property_name_utf8.bytes_as_string_view())),
                 .value_string = value_token_stream.dump_string(),
                 .description = "Failed to parse."_string,
             });

@@ -5,7 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/StringBuilder.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibWeb/ARIA/Roles.h>
 #include <LibWeb/Bindings/ExceptionOrUtils.h>
@@ -224,7 +224,7 @@ WebIDL::ExceptionOr<void> HTMLElement::set_outer_text(Utf16View const& value)
         MUST(fragment->append_child(document().create_text_node({})));
 
     // 6. Replace this with fragment within this's parent.
-    MUST(parent()->replace_child(fragment, *this));
+    TRY(parent()->replace_child(fragment, *this));
 
     // 7. If next is non-null and next's previous sibling is a Text node, then merge with the next text node given next's previous sibling.
     if (next && is<DOM::Text>(next->previous_sibling()))
@@ -313,6 +313,8 @@ static Vector<Variant<Utf16String, RequiredLineBreakCount>> rendered_text_collec
     //    FIXME: - option elements have an associated non-replaced block-level CSS box whose child boxes are as normal for non-replaced block-level CSS boxes.
     auto* layout_node = node.layout_node();
     if (!layout_node)
+        return items;
+    if (!layout_node->has_style_or_parent_with_style())
         return items;
 
     auto const& computed_values = layout_node->computed_values();
@@ -416,7 +418,7 @@ Utf16String HTMLElement::get_the_text_steps()
 
     // 6. Replace each remaining run of consecutive required line break count items with a string consisting of as many
     //    U+000A LF code points as the maximum of the values in the required line break count items.
-    StringBuilder builder(StringBuilder::Mode::UTF16);
+    Utf16StringBuilder builder;
     for (size_t i = 0; i < results.size(); ++i) {
         results[i].visit(
             [&](Utf16String const& string) {
@@ -433,12 +435,12 @@ Utf16String HTMLElement::get_the_text_steps()
                 // Skip over the run of required line break counts.
                 i = j - 1;
 
-                builder.append_repeated('\n', max_line_breaks);
+                builder.append_repeated_ascii('\n', max_line_breaks);
             });
     }
 
     // 7. Return the concatenation of the string items in results.
-    return builder.to_utf16_string();
+    return builder.to_string();
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#dom-innertext
@@ -1156,7 +1158,7 @@ void HTMLElement::set_popover(Optional<String> value)
         remove_attribute(HTML::AttributeNames::popover);
 }
 
-void HTMLElement::adjust_computed_style(CSS::ComputedProperties& style)
+void HTMLElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
 {
     // https://drafts.csswg.org/css-display-3/#unbox
     if (local_name() == HTML::TagNames::wbr) {

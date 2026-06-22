@@ -7,6 +7,7 @@
 
 #include <AK/ByteString.h>
 #include <AK/LsanSuppressions.h>
+#include <AK/NeverDestroyed.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/Font/TypefaceSkia.h>
 #include <LibIPC/Encoder.h>
@@ -35,7 +36,11 @@
 
 namespace Gfx {
 
-static sk_sp<SkFontMgr> s_font_manager;
+static auto& skia_font_manager()
+{
+    static NeverDestroyed<sk_sp<SkFontMgr>> font_manager;
+    return *font_manager;
+}
 
 struct TypefaceSkia::Impl {
     Impl(sk_sp<SkTypeface> skia_typeface, std::unique_ptr<SkStreamAsset> stream = {}, Optional<SystemUIFontKind> system_ui_font_kind = {}
@@ -74,24 +79,25 @@ struct TypefaceSkia::Impl {
 
 static SkFontMgr& font_manager()
 {
-    if (!s_font_manager) {
+    auto& font_manager = skia_font_manager();
+    if (!font_manager) {
 #ifdef AK_OS_MACOS
         if (Gfx::FontDatabase::the().system_font_provider_name() != "FontConfig"sv) {
-            s_font_manager = SkFontMgr_New_CoreText(nullptr);
+            font_manager = SkFontMgr_New_CoreText(nullptr);
         }
 #endif
 #if defined(AK_OS_ANDROID)
-        s_font_manager = SkFontMgr_New_Android(nullptr);
+        font_manager = SkFontMgr_New_Android(nullptr);
 #elif defined(AK_OS_WINDOWS)
-        s_font_manager = SkFontMgr_New_DirectWrite();
+        font_manager = SkFontMgr_New_DirectWrite();
 #else
-        if (!s_font_manager) {
-            s_font_manager = SkFontMgr_New_FontConfig(nullptr, SkFontScanner_Make_FreeType());
+        if (!font_manager) {
+            font_manager = SkFontMgr_New_FontConfig(nullptr, SkFontScanner_Make_FreeType());
         }
 #endif
     }
-    VERIFY(s_font_manager);
-    return *s_font_manager;
+    VERIFY(font_manager);
+    return *font_manager;
 }
 
 static std::unique_ptr<SkMemoryStream> copy_stream_to_memory_stream(SkStreamAsset& stream)
@@ -299,12 +305,15 @@ ErrorOr<RefPtr<TypefaceSkia>> TypefaceSkia::match_family_style(StringView family
     return typeface_from_skia_typeface(move(skia_typeface));
 }
 
-ErrorOr<RefPtr<TypefaceSkia>> TypefaceSkia::find_typeface_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope)
+ErrorOr<RefPtr<TypefaceSkia>> TypefaceSkia::find_typeface_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
 {
     SkFontStyle style(weight, width, slope_to_skia_slant(slope));
 
+    // The "und-Zsye" language tag steers the font matcher towards a color emoji font. Without it, a text-presentation
+    // font is preferred for emoji-capable code points.
+    char const* emoji_locale[] = { "und-Zsye" };
     auto skia_typeface = font_manager().matchFamilyStyleCharacter(
-        nullptr, style, nullptr, 0, code_point);
+        nullptr, style, prefer_color_emoji ? emoji_locale : nullptr, prefer_color_emoji ? 1 : 0, code_point);
 
     if (!skia_typeface)
         return RefPtr<TypefaceSkia> {};

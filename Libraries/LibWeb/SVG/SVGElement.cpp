@@ -16,6 +16,7 @@
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/SVG/SVGDescElement.h>
 #include <LibWeb/SVG/SVGElement.h>
+#include <LibWeb/SVG/SVGForeignObjectElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGSymbolElement.h>
 #include <LibWeb/SVG/SVGTitleElement.h>
@@ -57,7 +58,7 @@ struct NamedPropertyID {
 static ReadonlySpan<NamedPropertyID> attribute_style_properties()
 {
     // https://svgwg.org/svg2-draft/styling.html#PresentationAttributes
-    static Array const properties = {
+    static auto const& properties = *new Array {
         // FIXME: The `fill` attribute and CSS `fill` property are not the same! But our support is limited enough that they are equivalent for now.
         NamedPropertyID(CSS::PropertyID::Fill),
         // FIXME: The `stroke` attribute and CSS `stroke` property are not the same! But our support is limited enough that they are equivalent for now.
@@ -234,22 +235,21 @@ void SVGElement::update_use_elements_that_reference_this()
     if (is<SVGUseElement>(this)
         // If this element is in a shadow root, it already represents a clone and is not itself referenced.
         || is<DOM::ShadowRoot>(this->root())
-        // If this does not have an id it cannot be referenced, no point in searching the entire DOM tree.
+        // If this does not have an id it cannot be referenced, no point in notifying use elements.
         || !id().has_value()
         // An unconnected node cannot have valid references.
         // This also prevents searches for elements that are in the process of being constructed - as clones.
-        || !this->is_connected()
-        // Each use element already listens for the completely_loaded event and then clones its reference,
-        // we do not have to also clone it in the process of initial DOM building.
-        || !document().is_completely_loaded()) {
+        || !this->is_connected()) {
 
         return;
     }
 
-    document().for_each_in_subtree_of_type<SVGUseElement>([this](SVGUseElement& use_element) {
-        use_element.svg_element_changed(*this);
-        return TraversalDecision::Continue;
-    });
+    for (auto& use_element : document().svg_use_elements()) {
+        if (document().is_completely_loaded())
+            use_element.svg_element_changed(*this);
+        else
+            use_element.svg_element_changed_before_document_complete(*this);
+    }
 }
 
 void SVGElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, Node& old_root)
@@ -269,6 +269,12 @@ void SVGElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor,
         return;
 
     remove_from_use_element_that_reference_this();
+
+    // A <mask>, <clipPath>, or <pattern> referenced via url(#id) is laid out as a resource box attached to the
+    // referencing element's layout subtree. So it outlives this element's own DOM node. Rebuild the layout tree
+    // while this element is still alive — so those stale resource boxes are dropped before this node is collected.
+    if (id().has_value())
+        document().set_needs_full_layout_tree_update(true);
 }
 
 void SVGElement::remove_from_use_element_that_reference_this()
@@ -277,22 +283,37 @@ void SVGElement::remove_from_use_element_that_reference_this()
         return;
     }
 
-    document().for_each_in_subtree_of_type<SVGUseElement>([this](SVGUseElement& use_element) {
+    for (auto& use_element : document().svg_use_elements()) {
+        // Use elements that are part of the same subtree removal may still be registered, since removal hooks run
+        // after the subtree has been detached. They are no longer reachable from the document and should not be
+        // notified. NB: This must check the tree structure, not Node::is_connected(), because the connected flag of
+        // nodes later in tree order has not been updated yet when we get here.
+        if (!use_element.root().is_document())
+            continue;
         use_element.svg_element_removed(*this);
-        return TraversalDecision::Continue;
-    });
+    }
 }
 
-void SVGElement::adjust_computed_style(CSS::ComputedProperties& computed_properties)
+void SVGElement::adjust_computed_style(CSS::ComputedProperties::Builder& computed_properties)
 {
     Base::adjust_computed_style(computed_properties);
 
-    // The outermost <svg> element (no ancestor <svg>) participates in CSS box layout
-    // and may be positioned. All other SVG elements, including nested <svg> elements,
-    // use SVG's coordinate system and must be forced to position:static.
-    if (is<SVGSVGElement>(*this) && !owner_svg_element())
-        return;
+    // An <svg> element that is not in SVG layout participates in CSS box layout
+    // and may be positioned. That includes the outermost <svg>, and <svg>
+    // elements in HTML content inside <foreignObject>.
+    if (is<SVGSVGElement>(*this)) {
+        for (auto ancestor = parent_element(); ancestor; ancestor = ancestor->parent_element()) {
+            if (is<SVGForeignObjectElement>(*ancestor))
+                return;
+            if (is<SVGSVGElement>(*ancestor))
+                break;
+        }
+        if (!owner_svg_element())
+            return;
+    }
 
+    // SVG elements in SVG layout use SVG's coordinate system and must be forced
+    // to position: static.
     computed_properties.set_property(CSS::PropertyID::Position, CSS::KeywordStyleValue::create(CSS::Keyword::Static));
 }
 
@@ -345,7 +366,7 @@ GC::Ref<SVGAnimatedLength> SVGElement::svg_animated_length_for_property(CSS::Pro
         if (auto const computed_properties = this->computed_properties()) {
             auto const& style_value = computed_properties->property(property);
 
-            if (!style_value.has_auto())
+            if (!style_value.has_auto() && (style_value.is_length() || style_value.is_percentage() || style_value.is_calculated()))
                 return SVGLength::from_length_percentage(realm(), CSS::LengthPercentage::from_style_value(style_value), read_only);
         }
         return SVGLength::create(realm(), 0, 0, read_only);

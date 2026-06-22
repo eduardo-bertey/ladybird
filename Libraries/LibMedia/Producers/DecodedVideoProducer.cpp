@@ -18,7 +18,7 @@ namespace Media {
 
 static constexpr int AUTO_SUSPEND_IDLE_TIMEOUT_MS = 10000;
 
-DecoderErrorOr<NonnullRefPtr<DecodedVideoProducer>> DecodedVideoProducer::try_create(NonnullRefPtr<Core::WeakEventLoopReference> const& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track)
+DecoderErrorOr<NonnullRefPtr<DecodedVideoProducer>> DecodedVideoProducer::try_create(Core::EventLoop& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track)
 {
     TRY(demuxer->create_context_for_track(track));
     auto duration = TRY(demuxer->duration_of_track(track));
@@ -169,7 +169,7 @@ void DecodedVideoProducer::seek(AK::Duration timestamp)
     m_thread_data->seek(timestamp);
 }
 
-DecodedVideoProducer::ThreadData::ThreadData(NonnullRefPtr<Core::WeakEventLoopReference> const& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track, AK::Duration duration)
+DecodedVideoProducer::ThreadData::ThreadData(Core::EventLoop& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track, AK::Duration duration)
     : m_main_thread_event_loop(main_thread_event_loop)
     , m_demuxer(demuxer)
     , m_track(track)
@@ -258,7 +258,6 @@ void DecodedVideoProducer::ThreadData::seek(AK::Duration timestamp)
 {
     auto locker = take_lock();
     note_consumer_activity_while_locked();
-    m_current_halting_status = PipelineStatus::Pending;
     m_downstream_needs_wake = true;
 
     if (timestamp >= m_earliest_available_timestamp && timestamp < m_latest_available_timestamp) {
@@ -302,10 +301,7 @@ void DecodedVideoProducer::ThreadData::invoke_on_main_thread_while_locked(Invoke
 {
     if (m_requested_state == RequestedState::Exit)
         return;
-    auto event_loop = m_main_thread_event_loop->take();
-    if (!event_loop.is_alive())
-        return;
-    event_loop->deferred_invoke([self = NonnullRefPtr(*this), invokee = move(invokee)] mutable {
+    m_main_thread_event_loop.deferred_invoke([self = NonnullRefPtr(*this), invokee = move(invokee)] mutable {
         invokee(self);
     });
 }
@@ -394,8 +390,8 @@ void DecodedVideoProducer::ThreadData::dispatch_error(DecoderError&& error)
 void DecodedVideoProducer::ThreadData::resolve_seek(u32 seek_id, bool moved_position)
 {
     m_last_processed_seek_id = seek_id;
-    VERIFY(m_current_halting_status != PipelineStatus::HaveData);
     if (moved_position) {
+        m_current_halting_status = PipelineStatus::Pending;
         m_moved_position_pending = true;
         m_queue.clear();
     }
@@ -409,15 +405,19 @@ bool DecodedVideoProducer::ThreadData::handle_seek()
     if (m_last_processed_seek_id == seek_id)
         return false;
 
+    AK::Duration timestamp;
+    bool moved_position = false;
+
     auto handle_error = [&](DecoderError&& error) {
         auto locker = take_lock();
         m_queue.clear();
+        if (moved_position) {
+            m_current_halting_status = PipelineStatus::Pending;
+            m_moved_position_pending = true;
+        }
         enter_halting_state(PipelineStatus::Error, move(error));
         m_last_processed_seek_id = seek_id;
     };
-
-    AK::Duration timestamp;
-    bool moved_position = false;
 
     while (true) {
         {
@@ -514,28 +514,24 @@ void DecodedVideoProducer::ThreadData::push_data_and_decode_some_frames()
     //        before this functionality can exist.
 
     auto set_halting_status_and_wait_for_seek = [this](PipelineStatus status, Optional<DecoderError> error) {
-        {
-            auto locker = take_lock();
-            enter_halting_state(status, move(error));
-        }
+        auto locker = take_lock();
+        enter_halting_state(status, move(error));
 
         dbgln_if(PLAYBACK_MANAGER_DEBUG, "Decoded Video Producer: Reached a halting pull status, waiting for a seek to start decoding again...");
         while (true) {
-            {
-                auto locker = take_lock();
-                if (m_current_halting_status == PipelineStatus::Pending)
-                    return;
-            }
-            if (handle_seek())
-                break;
-            {
-                auto locker = take_lock();
-                m_wait_condition.wait();
-                if (should_thread_exit_while_locked())
-                    return;
-            }
+            if (m_seek_id != m_last_processed_seek_id)
+                return;
+            m_wait_condition.wait();
+            if (should_thread_exit_while_locked())
+                return;
         }
     };
+
+    // If a prior seek encountered a decoding error, stop here to ensure that the pipeline state stays Error.
+    if (m_current_halting_status != PipelineStatus::Pending) {
+        set_halting_status_and_wait_for_seek(m_current_halting_status, {});
+        return;
+    }
 
     auto sample_result = m_demuxer->get_next_sample_for_track(m_track);
     if (sample_result.is_error()) {

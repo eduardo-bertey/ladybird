@@ -10,7 +10,9 @@
 #include <AK/JsonObjectSerializer.h>
 #include <AK/JsonValue.h>
 #include <AK/Math.h>
+#include <LibCore/Process.h>
 #include <LibCore/Timer.h>
+#include <LibDevTools/IndexedDBSerialization.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ShareableBitmap.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
@@ -19,6 +21,8 @@
 #include <LibJS/Runtime/ConsoleObject.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/CSS/CSSImportRule.h>
+#include <LibWeb/CSS/StyleScope.h>
+#include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/CSS/StyleSheetList.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Document.h>
@@ -27,13 +31,16 @@
 #include <LibWeb/DOM/NodeList.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
-#include <LibWeb/HTML/HTMLLinkElement.h>
+#include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
+#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/TraversableNavigable.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/WebIDL/Promise.h>
 #include <LibWebView/SiteIsolation.h>
 #include <LibWebView/ViewImplementation.h>
 #include <WebContent/ConnectionFromClient.h>
@@ -46,9 +53,9 @@
 
 namespace WebContent {
 
-static PageClient::UseSkiaPainter s_use_skia_painter = PageClient::UseSkiaPainter::GPUBackendIfAvailable;
 static bool s_is_headless { false };
 static bool s_async_scrolling_enabled { false };
+static bool s_should_report_session_history_updates_in_test_mode { false };
 
 GC_DEFINE_ALLOCATOR(PageClient);
 
@@ -59,11 +66,6 @@ static String serialize_dom_mutation_target(Web::DOM::Node const& target)
     target.serialize_tree_as_json(serializer);
     MUST(serializer.finish());
     return MUST(builder.to_string());
-}
-
-void PageClient::set_use_skia_painter(UseSkiaPainter use_skia_painter)
-{
-    s_use_skia_painter = use_skia_painter;
 }
 
 bool PageClient::is_headless() const
@@ -79,6 +81,11 @@ void PageClient::set_is_headless(bool is_headless)
 void PageClient::set_async_scrolling_enabled(bool enabled)
 {
     s_async_scrolling_enabled = enabled;
+}
+
+void PageClient::set_should_report_session_history_updates_in_test_mode(bool should_report)
+{
+    s_should_report_session_history_updates_in_test_mode = should_report;
 }
 
 GC::Ref<PageClient> PageClient::create(JS::VM& vm, PageHost& page_host, u64 id)
@@ -107,6 +114,8 @@ void PageClient::visit_edges(JS::Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     visitor.visit(m_page);
     visitor.visit(m_top_level_document_console_client);
+    for (auto& promise : m_pending_delete_all_cookies_promises)
+        visitor.visit(promise.value);
     m_pending_dom_mutations.for_each([&](auto& pending_mutation) {
         visitor.visit(pending_mutation.target);
     });
@@ -124,7 +133,29 @@ ConnectionFromClient& PageClient::client() const
 
 void PageClient::set_has_focus(bool has_focus)
 {
+    if (m_has_focus == has_focus)
+        return;
+
     m_has_focus = has_focus;
+
+    if (auto document = page().top_level_traversable()->active_document()) {
+        if (has_focus)
+            document->reset_cursor_blink_cycle();
+        document->set_cursor_position_needs_repaint();
+    }
+}
+
+void PageClient::set_window_handle(String window_handle)
+{
+    page().top_level_traversable()->set_window_handle(move(window_handle));
+
+    if (m_webdriver)
+        m_webdriver->page_did_set_window_handle({}, page().top_level_traversable()->window_handle());
+}
+
+void PageClient::did_start_webdriver_navigation(URL::URL const& url)
+{
+    client().async_did_start_webdriver_navigation(m_id, url);
 }
 
 void PageClient::setup_palette()
@@ -149,9 +180,12 @@ bool PageClient::is_url_suitable_for_same_process_navigation(URL::URL const& cur
     return WebView::is_url_suitable_for_same_process_navigation(current_url, target_url);
 }
 
-void PageClient::request_new_process_for_navigation(URL::URL const& url)
+void PageClient::request_new_process_for_navigation(URL::URL const& url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
 {
-    client().async_did_request_new_process_for_navigation(m_id, url);
+    if (m_webdriver)
+        m_webdriver->page_did_start_window_replacement({}, page().top_level_traversable()->window_handle());
+
+    client().async_did_request_new_process_for_navigation(m_id, url, move(document_resource), history_handling);
 }
 
 Gfx::Palette PageClient::palette() const
@@ -211,10 +245,16 @@ void PageClient::set_window_size(Web::DevicePixelSize size)
     page().set_window_size(size);
 }
 
+void PageClient::compositor_process_lost()
+{
+    page().notify_all_webgl_contexts_lost();
+}
+
 void PageClient::compositor_process_reconnected()
 {
     page().top_level_traversable()->repaint_after_compositor_process_reconnect();
-    page().republish_all_canvas_element_surfaces();
+    page().notify_all_canvas_elements_of_lost_backing_storage();
+    page().prepare_canvas_contexts_for_compositing();
     page().update_all_media_element_video_sinks();
     Web::HTML::main_thread_event_loop().queue_task_to_update_the_rendering();
 }
@@ -368,9 +408,20 @@ void PageClient::page_did_middle_click_link(URL::URL const& url, ByteString cons
     client().async_did_middle_click_link(m_id, url, target, modifiers);
 }
 
-void PageClient::page_did_start_loading(URL::URL const& url, bool is_redirect)
+void PageClient::page_did_start_loading(URL::URL const& url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, bool is_redirect, Web::Bindings::NavigationHistoryBehavior history_handling)
 {
-    client().async_did_start_loading(m_id, url, is_redirect);
+    if (m_webdriver)
+        m_webdriver->page_did_start_loading({}, url);
+
+    client().async_did_start_loading(m_id, url, move(document_resource), is_redirect, history_handling);
+}
+
+void PageClient::page_did_cancel_loading(URL::URL const& url)
+{
+    if (m_webdriver)
+        m_webdriver->page_did_cancel_loading({}, url);
+
+    client().async_did_cancel_loading(m_id, url);
 }
 
 void PageClient::page_did_create_new_document(Web::DOM::Document& document)
@@ -399,6 +450,22 @@ void PageClient::page_did_finish_loading(URL::URL const& url)
     client().async_did_finish_loading(m_id, url);
 }
 
+void PageClient::wait_for_webdriver_navigation_completion(Optional<u64> page_load_timeout, Function<void(Web::WebDriver::Response)> on_complete)
+{
+    auto request_id = m_next_webdriver_navigation_completion_request_id++;
+    m_pending_webdriver_navigation_completion_requests.set(request_id, move(on_complete));
+    client().async_did_request_webdriver_navigation_completion(m_id, request_id, page_load_timeout);
+}
+
+void PageClient::did_complete_webdriver_navigation_completion(u64 request_id, Web::WebDriver::Response response)
+{
+    auto maybe_callback = m_pending_webdriver_navigation_completion_requests.take(request_id);
+    if (!maybe_callback.has_value())
+        return;
+
+    maybe_callback.value()(move(response));
+}
+
 void PageClient::page_did_finish_test(String const& text)
 {
     client().async_did_finish_test(m_id, text);
@@ -412,11 +479,6 @@ void PageClient::page_did_set_test_timeout(double milliseconds)
 void PageClient::page_did_receive_reference_test_metadata(JsonValue metadata)
 {
     client().async_did_receive_reference_test_metadata(m_id, metadata);
-}
-
-void PageClient::page_did_receive_test_variant_metadata(JsonValue metadata)
-{
-    client().async_did_receive_test_variant_metadata(m_id, metadata);
 }
 
 void PageClient::page_did_set_browser_zoom(double factor)
@@ -595,7 +657,7 @@ HTTP::Cookie::VersionedCookie PageClient::page_did_request_cookie(URL::URL const
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestCookie>(m_id, url, source);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestCookie. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
     return response->take_cookie();
 }
@@ -605,7 +667,7 @@ void PageClient::page_did_set_cookie(URL::URL const& url, HTTP::Cookie::ParsedCo
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidSetCookie>(url, cookie, source);
     if (!response) {
         dbgln("WebContent client disconnected during DidSetCookie. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
 }
 
@@ -627,6 +689,28 @@ void PageClient::page_did_expire_cookies_with_time_offset(AK::Duration offset)
         document->reset_cookie_version();
 }
 
+void PageClient::page_did_delete_all_cookies(URL::URL const& url, GC::Ref<Web::WebIDL::Promise> promise)
+{
+    auto request_id = m_next_delete_all_cookies_request_id++;
+    m_pending_delete_all_cookies_promises.set(request_id, promise);
+    client().async_did_request_delete_all_cookies(m_id, request_id, url);
+
+    if (auto* document = page().top_level_browsing_context().active_document())
+        document->reset_cookie_version();
+}
+
+void PageClient::did_delete_all_cookies(u64 request_id)
+{
+    auto maybe_promise = m_pending_delete_all_cookies_promises.take(request_id);
+    if (!maybe_promise.has_value())
+        return;
+
+    auto promise = maybe_promise.release_value();
+    auto& realm = promise->promise()->shape().realm();
+    Web::HTML::TemporaryExecutionContext execution_context { realm, Web::HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+    Web::WebIDL::resolve_promise(realm, promise);
+}
+
 void PageClient::page_did_store_hsts_policy(String const& domain, HTTP::HSTS::ParsedHSTSPolicy const& policy)
 {
     client().async_did_store_hsts_policy(domain, policy);
@@ -637,7 +721,7 @@ bool PageClient::page_did_is_known_hsts_host(String const& domain)
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidIsKnownHstsHost>(domain);
     if (!response) {
         dbgln("WebContent client disconnected during DidIsKnownHstsHost. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
     return response->result();
 }
@@ -647,7 +731,7 @@ Optional<String> PageClient::page_did_request_storage_item(Web::StorageAPI::Stor
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageItem>(storage_endpoint, storage_key, bottle_key);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestStorageItem. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
     return response->take_value();
 }
@@ -657,7 +741,7 @@ WebView::StorageSetResult PageClient::page_did_set_storage_item(Web::StorageAPI:
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidSetStorageItem>(storage_endpoint, storage_key, bottle_key, value);
     if (!response) {
         dbgln("WebContent client disconnected during DidSetStorageItem. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
     return response->result();
 }
@@ -667,7 +751,7 @@ void PageClient::page_did_remove_storage_item(Web::StorageAPI::StorageEndpointTy
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRemoveStorageItem>(storage_endpoint, storage_key, bottle_key);
     if (!response) {
         dbgln("WebContent client disconnected during DidRemoveStorageItem. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
 }
 
@@ -676,7 +760,7 @@ Vector<String> PageClient::page_did_request_storage_keys(Web::StorageAPI::Storag
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageKeys>(storage_endpoint, storage_key);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestStorageKeys. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
     return response->take_keys();
 }
@@ -686,8 +770,25 @@ void PageClient::page_did_clear_storage(Web::StorageAPI::StorageEndpointType sto
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidClearStorage>(storage_endpoint, storage_key);
     if (!response) {
         dbgln("WebContent client disconnected during DidClearStorage. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
+}
+
+void PageClient::page_did_broadcast_storage_change(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& url, Optional<String> const& key, Optional<String> const& old_value, Optional<String> const& new_value)
+{
+    client().async_did_change_storage_item(m_id, storage_endpoint, url, key, old_value, new_value);
+}
+
+void PageClient::page_did_update_indexed_database(String const& url, Web::IndexedDB::TransactionChanges const& changes)
+{
+    if (!has_devtools_client())
+        return;
+
+    auto update = DevTools::IndexedDB::serialize_update(url, changes);
+    if (update.is_empty())
+        return;
+
+    client().async_did_update_indexed_database(m_id, update.serialized());
 }
 
 void PageClient::page_did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage const& message)
@@ -710,7 +811,7 @@ PageClient::NewWebViewResult PageClient::page_did_request_new_web_view(Web::HTML
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestNewWebView>(m_id, activate_tab, hints);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestNewWebView. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
 
     auto& new_client = m_owner.create_page(response->new_page_id());
@@ -724,7 +825,10 @@ void PageClient::page_did_request_activate_tab()
 
 void PageClient::page_did_close_top_level_traversable()
 {
-    page().top_level_traversable()->compositor_context().set_presentation_mode(Empty {});
+    page().top_level_traversable()->compositor_context().stop_presenting_to_client();
+
+    if (m_webdriver)
+        m_webdriver->page_did_close_window({}, page().top_level_traversable()->window_handle());
 
     // FIXME: Rename this IPC call
     client().async_did_close_browsing_context(m_id);
@@ -747,6 +851,71 @@ void PageClient::send_current_needs_beforeunload_check()
 void PageClient::page_did_update_navigation_buttons_state(bool back_enabled, bool forward_enabled)
 {
     client().async_did_update_navigation_buttons_state(m_id, back_enabled, forward_enabled);
+}
+
+bool PageClient::should_report_session_history_updates() const
+{
+    return !Web::HTML::Window::in_test_mode() || s_should_report_session_history_updates_in_test_mode;
+}
+
+void PageClient::page_did_update_session_history(Vector<Web::HTML::SessionHistoryEntryDescriptor> const& entries, Vector<i32> const& used_steps, size_t current_used_step_index)
+{
+    client().async_did_update_session_history(m_id, entries, used_steps, current_used_step_index);
+}
+
+String PageClient::page_did_request_ui_process_session_history_for_testing()
+{
+    return client().did_request_ui_process_session_history_for_testing(m_id);
+}
+
+String PageClient::page_did_update_session_history_and_request_ui_process_session_history_for_testing(Vector<Web::HTML::SessionHistoryEntryDescriptor> const& entries, Vector<i32> const& used_steps, size_t current_used_step_index)
+{
+    return client().did_update_session_history_and_request_ui_process_session_history_for_testing(m_id, entries, used_steps, current_used_step_index);
+}
+
+bool PageClient::page_did_request_traverse_the_history_by_delta(int delta, Web::HistoryTraversalPrecheck history_traversal_precheck)
+{
+    return client().did_request_traverse_the_history_by_delta(m_id, delta, history_traversal_precheck);
+}
+
+void PageClient::request_webdriver_history_traversal(int delta, Function<void(WebDriverHistoryTraversalResult)> on_complete)
+{
+    auto request_id = m_next_webdriver_history_traversal_request_id++;
+    m_pending_webdriver_history_traversal_requests.set(request_id, move(on_complete));
+    client().async_did_request_webdriver_history_traversal(m_id, request_id, delta);
+}
+
+void PageClient::did_complete_webdriver_history_traversal(u64 request_id, bool accepted, bool will_replace_web_content_process, bool will_change_top_level_entry)
+{
+    auto maybe_callback = m_pending_webdriver_history_traversal_requests.take(request_id);
+    if (!maybe_callback.has_value())
+        return;
+
+    maybe_callback.value()(WebDriverHistoryTraversalResult {
+        .accepted = accepted,
+        .will_replace_web_content_process = will_replace_web_content_process,
+        .will_change_top_level_entry = will_change_top_level_entry,
+    });
+}
+
+Web::WebDriver::Response PageClient::request_webdriver_load_url_from_ui(URL::URL const& url)
+{
+    return client().did_request_webdriver_load_url_from_ui(m_id, url);
+}
+
+Web::WebDriver::Response PageClient::request_webdriver_traverse_history_from_ui(int delta)
+{
+    return client().did_request_webdriver_traverse_history_from_ui(m_id, delta);
+}
+
+Web::WebDriver::Response PageClient::request_webdriver_mark_web_content_session_history_stale()
+{
+    return client().did_request_webdriver_mark_web_content_session_history_stale(m_id);
+}
+
+Web::WebDriver::Response PageClient::request_webdriver_session_history()
+{
+    return client().did_request_webdriver_session_history(m_id);
 }
 
 void PageClient::request_file(Web::FileRequest file_request)
@@ -809,7 +978,7 @@ Web::HTML::WorkerAgentId PageClient::start_worker_agent(Web::HTML::WorkerAgentSt
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::StartWorkerAgent>(m_id, move(request));
     if (!response) {
         dbgln("WebContent client disconnected during StartWorkerAgent. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
 
     return response->agent_id();
@@ -935,13 +1104,34 @@ void PageClient::page_did_receive_network_response_body(u64 request_id, Readonly
 
 void PageClient::did_connect_devtools_client()
 {
+    auto was_first_devtools_client = !has_devtools_client();
     ++m_devtools_client_count;
+
+    if (!was_first_devtools_client)
+        return;
+
+    for (auto& navigable : Web::HTML::all_navigables()) {
+        if (&navigable->page() != &page())
+            continue;
+        if (auto active_document = navigable->active_document())
+            active_document->update_layout(Web::DOM::UpdateLayoutReason::InspectDevToolsLayoutData);
+    }
 }
 
 void PageClient::did_disconnect_devtools_client()
 {
     VERIFY(m_devtools_client_count > 0);
     --m_devtools_client_count;
+
+    if (has_devtools_client())
+        return;
+
+    for (auto& navigable : Web::HTML::all_navigables()) {
+        if (&navigable->page() != &page())
+            continue;
+        if (auto active_document = navigable->active_document())
+            active_document->clear_devtools_layout_inspection_data();
+    }
 }
 
 void PageClient::page_did_finish_network_request(u64 request_id, u64 body_size, Requests::RequestTimingInfo const& timing_info, Optional<Requests::NetworkError> const& network_error)
@@ -1011,34 +1201,8 @@ void PageClient::console_peer_did_misbehave(char const* reason)
 
 static void gather_style_sheets(Vector<Web::CSS::StyleSheetIdentifier>& results, Web::CSS::CSSStyleSheet& sheet)
 {
-    Web::CSS::StyleSheetIdentifier identifier {};
-
-    bool valid = true;
-
-    if (sheet.owner_rule()) {
-        identifier.type = Web::CSS::StyleSheetIdentifier::Type::ImportRule;
-    } else if (auto* node = sheet.owner_node()) {
-        if (node->is_html_style_element() || node->is_svg_style_element()) {
-            identifier.type = Web::CSS::StyleSheetIdentifier::Type::StyleElement;
-        } else if (is<Web::HTML::HTMLLinkElement>(node)) {
-            identifier.type = Web::CSS::StyleSheetIdentifier::Type::LinkElement;
-        } else {
-            dbgln("Can't identify where style sheet came from; owner node is {}", node->debug_description());
-            identifier.type = Web::CSS::StyleSheetIdentifier::Type::StyleElement;
-        }
-        identifier.dom_element_unique_id = node->unique_id();
-    } else {
-        dbgln("Style sheet has no owner rule or owner node; skipping");
-        valid = false;
-    }
-
-    if (valid) {
-        if (auto sheet_url = sheet.href(); sheet_url.has_value())
-            identifier.url = sheet_url.release_value();
-
-        identifier.rule_count = sheet.rules().length();
-        results.append(move(identifier));
-    }
+    if (auto identifier = Web::CSS::style_sheet_identifier_for(sheet); identifier.has_value())
+        results.append(identifier.release_value());
 
     for (auto& import_rule : sheet.import_rules()) {
         if (import_rule->loaded_style_sheet()) {
@@ -1071,39 +1235,11 @@ Vector<Web::CSS::StyleSheetIdentifier> PageClient::list_style_sheets() const
         });
     }
 
-    // User-agent
-    results.append({
-        .type = Web::CSS::StyleSheetIdentifier::Type::UserAgent,
-        .url = "CSS/Default.css"_string,
-    });
-    if (document && document->in_quirks_mode()) {
-        results.append({
-            .type = Web::CSS::StyleSheetIdentifier::Type::UserAgent,
-            .url = "CSS/QuirksMode.css"_string,
-        });
-    }
-    results.append({
-        .type = Web::CSS::StyleSheetIdentifier::Type::UserAgent,
-        .url = "MathML/Default.css"_string,
-    });
-    results.append({
-        .type = Web::CSS::StyleSheetIdentifier::Type::UserAgent,
-        .url = "SVG/Default.css"_string,
+    Web::CSS::StyleScope::for_each_user_agent_stylesheet(document && document->in_quirks_mode(), [&](auto&, auto const& identifier) {
+        results.append(identifier);
     });
 
     return results;
-}
-
-Web::DisplayListPlayerType PageClient::display_list_player_type() const
-{
-    switch (s_use_skia_painter) {
-    case UseSkiaPainter::GPUBackendIfAvailable:
-        return Web::DisplayListPlayerType::SkiaGPUIfAvailable;
-    case UseSkiaPainter::CPUBackend:
-        return Web::DisplayListPlayerType::SkiaCPU;
-    default:
-        VERIFY_NOT_REACHED();
-    }
 }
 
 void PageClient::ensure_compositor_host()

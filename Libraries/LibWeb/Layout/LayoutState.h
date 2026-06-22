@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <AK/BumpAllocator.h>
 #include <AK/HashTable.h>
 #include <AK/OwnPtr.h>
+#include <AK/kmalloc.h>
 #include <LibGfx/Path.h>
 #include <LibGfx/Point.h>
 #include <LibWeb/Layout/Box.h>
@@ -67,10 +69,19 @@ class PagedStore {
     static constexpr u32 PageMask = PageSize - 1;
 
     struct Page {
-        Optional<T> entries[PageSize] {};
+        AK_ALLOC_WITH_KMALLOC_PARTITION(HeapPartition::Layout);
+
+        T* entries[PageSize] {};
     };
 
 public:
+    PagedStore() = default;
+
+    PagedStore(PagedStore const&) = delete;
+    PagedStore& operator=(PagedStore const&) = delete;
+    PagedStore(PagedStore&&) = delete;
+    PagedStore& operator=(PagedStore&&) = delete;
+
     void ensure_capacity(u32 count)
     {
         m_pages.resize((count + PageSize - 1) >> PageBits);
@@ -84,10 +95,7 @@ public:
         auto const& page = m_pages[page_index];
         if (!page)
             return nullptr;
-        auto& entry = page->entries[index & PageMask];
-        if (!entry.has_value())
-            return nullptr;
-        return &entry.value();
+        return page->entries[index & PageMask];
     }
 
     T& allocate(u32 index)
@@ -99,8 +107,13 @@ public:
         if (!page)
             page = make<Page>();
         auto& entry = page->entries[index & PageMask];
-        entry = T {};
-        return entry.value();
+        if (entry) {
+            *entry = T {};
+            return *entry;
+        }
+        entry = m_allocator.allocate();
+        VERIFY(entry);
+        return *entry;
     }
 
     template<typename Callback>
@@ -110,17 +123,22 @@ public:
             if (!page)
                 continue;
             for (auto& entry : page->entries) {
-                if (entry.has_value())
-                    callback(entry.value());
+                if (entry)
+                    callback(*entry);
             }
         }
     }
 
 private:
+    static constexpr size_t BumpAllocatorChunkSize = 4 * KiB;
+
     Vector<OwnPtr<Page>> m_pages;
+    UniformBumpAllocator<T, false, BumpAllocatorChunkSize> m_allocator;
 };
 
 struct LayoutState {
+    AK_ALLOC_WITH_KMALLOC_PARTITION(HeapPartition::Layout);
+
     struct UsedValues {
         UsedValues() = default;
         UsedValues(UsedValues&&) = default;
@@ -229,9 +247,9 @@ struct LayoutState {
         }
 
         void add_floating_descendant(Box const& box) { ensure_rare_data().floating_descendants.set(&box); }
-        HashTable<GC::Ptr<Box const>> const& floating_descendants() const
+        HashTable<Box const*> const& floating_descendants() const
         {
-            static HashTable<GC::Ptr<Box const>> const empty;
+            static auto const& empty = *new HashTable<Box const*>;
             return m_rare ? m_rare->floating_descendants : empty;
         }
 
@@ -276,6 +294,20 @@ struct LayoutState {
             return move(m_rare->grid_layout_data);
         }
 
+        void set_grid_template_columns(RefPtr<CSS::GridTrackSizeListStyleValue const> used_values_for_grid_template_columns) { ensure_rare_data().grid_template_columns = move(used_values_for_grid_template_columns); }
+        RefPtr<CSS::GridTrackSizeListStyleValue const> const& grid_template_columns() const
+        {
+            static auto const& empty = *new RefPtr<CSS::GridTrackSizeListStyleValue const>;
+            return m_rare ? m_rare->grid_template_columns : empty;
+        }
+
+        void set_grid_template_rows(RefPtr<CSS::GridTrackSizeListStyleValue const> used_values_for_grid_template_rows) { ensure_rare_data().grid_template_rows = move(used_values_for_grid_template_rows); }
+        RefPtr<CSS::GridTrackSizeListStyleValue const> const& grid_template_rows() const
+        {
+            static auto const& empty = *new RefPtr<CSS::GridTrackSizeListStyleValue const>;
+            return m_rare ? m_rare->grid_template_rows : empty;
+        }
+
         void set_flex_layout_data(OwnPtr<FlexLayoutData> flex_layout_data) { ensure_rare_data().flex_layout_data = move(flex_layout_data); }
         FlexLayoutData const* flex_layout_data() const
         {
@@ -317,11 +349,15 @@ struct LayoutState {
         CSSPixels border_bottom_collapsed() const { return use_collapsing_borders_model() ? round(border_bottom / 2) : border_bottom; }
 
         struct RareData {
+            AK_ALLOC_WITH_KMALLOC_PARTITION(HeapPartition::Layout);
+
             RareData() = default;
             RareData(RareData const& other)
                 : floating_descendants(other.floating_descendants)
                 , table_cell_coordinates(other.table_cell_coordinates)
                 , computed_svg_path(other.computed_svg_path)
+                , grid_template_columns(other.grid_template_columns)
+                , grid_template_rows(other.grid_template_rows)
                 , grid_area_size(other.grid_area_size)
                 , override_borders_data(other.override_borders_data)
                 , computed_svg_transforms(other.computed_svg_transforms)
@@ -333,11 +369,13 @@ struct LayoutState {
                     flex_layout_data = make<FlexLayoutData>(*other.flex_layout_data);
             }
 
-            HashTable<GC::Ptr<Box const>> floating_descendants;
+            HashTable<Box const*> floating_descendants;
             Optional<Painting::PaintableBox::TableCellCoordinates> table_cell_coordinates;
             Optional<Gfx::Path> computed_svg_path;
             OwnPtr<GridLayoutData> grid_layout_data;
             OwnPtr<FlexLayoutData> flex_layout_data;
+            RefPtr<CSS::GridTrackSizeListStyleValue const> grid_template_columns;
+            RefPtr<CSS::GridTrackSizeListStyleValue const> grid_template_rows;
             Optional<CSSPixelSize> grid_area_size;
             Optional<Painting::PaintableBox::BordersDataWithElementKind> override_borders_data;
             Optional<Painting::SVGGraphicsPaintable::ComputedTransforms> computed_svg_transforms;
@@ -352,7 +390,7 @@ struct LayoutState {
             return *m_rare;
         }
 
-        GC::Ptr<Layout::NodeWithStyle const> m_node { nullptr };
+        Layout::NodeWithStyle const* m_node { nullptr };
         UsedValues const* m_containing_block_used_values { nullptr };
         Optional<CSSPixelPoint> m_cumulative_offset;
 
@@ -374,6 +412,9 @@ struct LayoutState {
 
     void ensure_capacity(u32 node_count);
 
+    void set_should_collect_devtools_layout_data(bool should_collect) { m_should_collect_devtools_layout_data = should_collect; }
+    bool should_collect_devtools_layout_data() const { return m_should_collect_devtools_layout_data; }
+
     UsedValues& get_mutable(NodeWithStyle const&);
     UsedValues const& get(NodeWithStyle const&) const;
 
@@ -389,7 +430,8 @@ private:
     void resolve_relative_positions();
 
     PagedStore<UsedValues> m_used_values_store;
-    GC::Ptr<Layout::NodeWithStyle const> m_subtree_root;
+    Layout::NodeWithStyle const* m_subtree_root { nullptr };
+    bool m_should_collect_devtools_layout_data { false };
 };
 
 inline CSSPixels clamp_to_max_dimension_value(CSSPixels value)

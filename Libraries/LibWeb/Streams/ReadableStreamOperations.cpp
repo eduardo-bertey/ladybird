@@ -1086,7 +1086,7 @@ void readable_stream_reader_generic_release(ReadableStreamGenericReaderMixin& re
     VERIFY(stream->reader()->visit([](auto& reader) -> ReadableStreamGenericReaderMixin* { return reader.ptr(); }) == &reader);
 
     auto& realm = stream->realm();
-    auto exception = JS::TypeError::create(realm, "Reader has been released"sv);
+    auto exception = JS::TypeError::create(realm, "Reader has been released"_utf16);
 
     // 4. If stream.[[state]] is "readable", reject reader.[[closedPromise]] with a TypeError exception.
     if (stream->state() == ReadableStream::State::Readable) {
@@ -1155,7 +1155,7 @@ void readable_stream_byob_reader_release(ReadableStreamBYOBReader& reader)
     readable_stream_reader_generic_release(reader);
 
     // 2. Let e be a new TypeError exception.
-    auto exception = JS::TypeError::create(realm, "Reader has been released"sv);
+    auto exception = JS::TypeError::create(realm, "Reader has been released"_utf16);
 
     // 3. Perform ! ReadableStreamBYOBReaderErrorReadIntoRequests(reader, e).
     readable_stream_byob_reader_error_read_into_requests(reader, exception);
@@ -1216,7 +1216,7 @@ void readable_stream_default_reader_release(ReadableStreamDefaultReader& reader)
     readable_stream_reader_generic_release(reader);
 
     // 2. Let e be a new TypeError exception.
-    auto exception = JS::TypeError::create(realm, "Reader has been released"sv);
+    auto exception = JS::TypeError::create(realm, "Reader has been released"_utf16);
 
     // 3. Perform ! ReadableStreamDefaultReaderErrorReadRequests(reader, e).
     readable_stream_default_reader_error_read_requests(reader, exception);
@@ -1722,7 +1722,7 @@ WebIDL::ExceptionOr<void> readable_byte_stream_controller_close(ReadableByteStre
         // 2. If the remainder after dividing firstPendingPullInto’s bytes filled by firstPendingPullInto’s element size is not 0,
         if (first_pending_pull_into->bytes_filled % first_pending_pull_into->element_size != 0) {
             // 1. Let e be a new TypeError exception.
-            auto error = JS::TypeError::create(realm, "Cannot close controller in the middle of processing a write request"sv);
+            auto error = JS::TypeError::create(realm, "Cannot close controller in the middle of processing a write request"_utf16);
 
             // 2. Perform ! ReadableByteStreamControllerError(controller, e).
             readable_byte_stream_controller_error(controller, error);
@@ -1817,7 +1817,7 @@ static WebIDL::ExceptionOr<void> readable_byte_stream_controller_enqueue_transfe
 
         // 2. If ! IsDetachedBuffer(firstPendingPullInto’s buffer) is true, throw a TypeError exception.
         if (first_pending_pull_into->buffer->is_detached())
-            return vm.throw_completion<JS::TypeError>("Buffer is detached"sv);
+            return vm.throw_completion<JS::TypeError>("Buffer is detached"_utf16);
 
         // 3. Perform ! ReadableByteStreamControllerInvalidateBYOBRequest(controller).
         readable_byte_stream_controller_invalidate_byob_request(controller);
@@ -1920,7 +1920,7 @@ WebIDL::ExceptionOr<void> readable_byte_stream_controller_enqueue(ReadableByteSt
     auto typed_array_record = JS::make_typed_array_with_buffer_witness_record(*typed_array, JS::ArrayBuffer::Order::SeqCst);
 
     if (JS::is_typed_array_out_of_bounds(typed_array_record))
-        return vm.throw_completion<JS::TypeError>(JS::ErrorType::BufferOutOfBounds, "TypedArray"sv);
+        return vm.throw_completion<JS::TypeError>(JS::ErrorType::BufferOutOfBounds, "TypedArray"_utf16);
 
     // 5. Let byteLength be chunk.[[ByteLength]].
     auto byte_length = JS::typed_array_byte_length(typed_array_record);
@@ -2106,10 +2106,9 @@ bool readable_byte_stream_controller_fill_pull_into_descriptor_from_queue(Readab
 
         // 8. Perform ! CopyDataBlockBytes(pullIntoDescriptor’s buffer.[[ArrayBufferData]], destStart, headOfQueue’s buffer.[[ArrayBufferData]], headOfQueue’s byte offset, bytesToCopy).
         // NOTE: Stream buffers are never externally backed, so copy_data_block_bytes is safe here.
-        if (pull_into_descriptor.buffer->is_external() || head_of_queue.buffer->is_external())
-            pull_into_descriptor.buffer->overwrite(dest_start, head_of_queue.buffer->data() + head_of_queue.byte_offset, bytes_to_copy);
-        else
-            JS::copy_data_block_bytes(pull_into_descriptor.buffer->buffer(), dest_start, head_of_queue.buffer->buffer(), head_of_queue.byte_offset, bytes_to_copy);
+        auto descriptor_buffer_bytes = pull_into_descriptor.buffer->bytes();
+        auto queue_buffer_bytes = head_of_queue.buffer->bytes();
+        JS::copy_data_block_bytes(descriptor_buffer_bytes, dest_start, queue_buffer_bytes, head_of_queue.byte_offset, bytes_to_copy);
 
         // 9. If headOfQueue’s byte length is bytesToCopy,
         if (head_of_queue.byte_length == bytes_to_copy) {
@@ -2448,7 +2447,7 @@ void readable_byte_stream_controller_pull_into(ReadableByteStreamController& con
         // 2. If controller.[[closeRequested]] is true,
         if (controller.close_requested()) {
             // 1. Let e be a TypeError exception.
-            auto error = JS::TypeError::create(realm, "Reader has been released"sv);
+            auto error = JS::TypeError::create(realm, "Reader has been released"_utf16);
 
             // 2. Perform ! ReadableByteStreamControllerError(controller, e).
             readable_byte_stream_controller_error(controller, error);

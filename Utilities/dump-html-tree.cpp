@@ -66,7 +66,6 @@ public:
     virtual void report_finished_handling_input_event([[maybe_unused]] u64 page_id, [[maybe_unused]] Web::EventResult event_was_handled) override { }
     virtual void request_frame() override { }
     virtual void request_file(Web::FileRequest) override { }
-    virtual Web::DisplayListPlayerType display_list_player_type() const override { return Web::DisplayListPlayerType::SkiaCPU; }
     virtual bool is_headless() const override { return true; }
 
 private:
@@ -329,7 +328,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     StringView input { input_data };
 
-    [[maybe_unused]] Core::EventLoop event_loop;
+    [[maybe_unused]] auto& event_loop = Core::EventLoop::initialize_for_current_thread();
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
     Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(false));
     Web::Bindings::initialize_main_thread_vm(Web::Bindings::AgentType::SimilarOriginWindow);

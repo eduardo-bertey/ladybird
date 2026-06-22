@@ -7,8 +7,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/GenericShorthands.h>
 #include <AK/StdLibExtras.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibGfx/Font/Font.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/ComputedValues.h>
@@ -50,6 +52,76 @@ namespace Web::Painting {
 
 static bool g_paint_viewport_scrollbars = true;
 
+struct PaintableBox::CachedPaintData {
+    bool has(PaintPhase phase) const
+    {
+        return m_present_phases[to_underlying(phase)];
+    }
+
+    ReadonlyBytes bytes_for(PaintPhase phase) const
+    {
+        auto const& span = m_phase_spans[to_underlying(phase)];
+        return m_command_bytes.span().slice(span.offset, span.size);
+    }
+
+    void set(PaintPhase phase, ReadonlyBytes command_bytes)
+    {
+        auto const phase_index = to_underlying(phase);
+        if (m_present_phases[phase_index]) {
+            replace(phase, command_bytes);
+            return;
+        }
+
+        m_phase_spans[phase_index] = append_to(m_command_bytes, command_bytes);
+        m_present_phases[phase_index] = true;
+    }
+
+    template<typename Callback>
+    void for_each_present_phase(Callback callback) const
+    {
+        for (size_t phase_index = 0; phase_index < paint_phase_count; ++phase_index) {
+            if (!m_present_phases[phase_index])
+                continue;
+            auto phase = static_cast<PaintPhase>(phase_index);
+            callback(phase, bytes_for(phase));
+        }
+    }
+
+private:
+    struct Span {
+        u32 offset { 0 };
+        u32 size { 0 };
+    };
+
+    static Span append_to(ByteBuffer& command_buffer, ReadonlyBytes command_bytes)
+    {
+        auto const offset = command_buffer.size();
+        command_buffer.append(command_bytes);
+        return { static_cast<u32>(offset), static_cast<u32>(command_bytes.size()) };
+    }
+
+    void replace(PaintPhase phase, ReadonlyBytes replacement_bytes)
+    {
+        ByteBuffer command_buffer;
+        Array<Span, paint_phase_count> phase_spans {};
+
+        for (size_t phase_index = 0; phase_index < paint_phase_count; ++phase_index) {
+            if (!m_present_phases[phase_index])
+                continue;
+            auto present_phase = static_cast<PaintPhase>(phase_index);
+            auto command_bytes = present_phase == phase ? replacement_bytes : bytes_for(present_phase);
+            phase_spans[phase_index] = append_to(command_buffer, command_bytes);
+        }
+
+        m_command_bytes = move(command_buffer);
+        m_phase_spans = phase_spans;
+    }
+
+    ByteBuffer m_command_bytes;
+    Array<bool, paint_phase_count> m_present_phases {};
+    Array<Span, paint_phase_count> m_phase_spans {};
+};
+
 static bool content_size_change_affects_container_queries(PaintableBox const& paintable_box, CSSPixelSize old_size, CSSPixelSize new_size)
 {
     auto const& container_type = paintable_box.computed_values().container_type();
@@ -70,9 +142,7 @@ static void invalidate_descendant_styles_for_container_query_size_change(Paintab
     if (!content_size_change_affects_container_queries(paintable_box, old_size, new_size))
         return;
 
-    if (auto* element = as_if<DOM::Element>(paintable_box.dom_node().ptr());
-        element && element->style_scope().have_size_container_queries()) {
-
+    if (auto* element = as_if<DOM::Element>(paintable_box.dom_node().ptr())) {
         element->for_each_shadow_including_descendant([](DOM::Node& node) {
             if (auto* descendant_element = as_if<DOM::Element>(node); descendant_element && descendant_element->style_depends_on_size_container_query())
                 descendant_element->set_needs_style_update(true);
@@ -224,11 +294,22 @@ static void record_wheel_hit_test_target(PaintableBox const& paintable_box, Disp
     if (rect.is_empty())
         return;
 
+    auto target_scroll_frame_index = wheel_hit_test_target_scroll_frame_index_for(paintable_box).value_or({});
+    auto corner_radii = paintable_box.border_radii_data().as_corners(context.device_pixel_converter());
+    if (corner_radii.has_any_radius()) {
+        context.display_list_recorder().compositor_wheel_hit_test_target_with_corner_radii({
+            .document_id = paintable_box.document().unique_id(),
+            .target_scroll_frame_index = target_scroll_frame_index,
+            .rect = rect,
+            .corner_radii = corner_radii,
+        });
+        return;
+    }
+
     context.display_list_recorder().compositor_wheel_hit_test_target({
         .document_id = paintable_box.document().unique_id(),
-        .target_scroll_frame_index = wheel_hit_test_target_scroll_frame_index_for(paintable_box).value_or({}),
+        .target_scroll_frame_index = target_scroll_frame_index,
         .rect = rect,
-        .corner_radii = paintable_box.border_radii_data().as_corners(context.device_pixel_converter()),
     });
 }
 
@@ -385,6 +466,60 @@ PaintableBox::PaintableBox(Layout::InlineNode const& layout_box)
 
 PaintableBox::~PaintableBox()
 {
+    if (has_layout_node())
+        invalidate_paint_cache();
+}
+
+void PaintableBox::acquire_cache_references_for_cached_commands(ReadonlyBytes command_bytes) const
+{
+    auto& resource_storage = navigable()->display_list_resource_storage();
+    auto referenced_resources = resource_storage.collect_referenced_resources(command_bytes);
+    if (referenced_resources.is_empty())
+        return;
+    resource_storage.acquire_cache_references(referenced_resources);
+}
+
+void PaintableBox::release_cache_references_for_cached_commands(ReadonlyBytes command_bytes) const
+{
+    auto& resource_storage = navigable()->display_list_resource_storage();
+    auto referenced_resources = resource_storage.collect_referenced_resources(command_bytes);
+    if (referenced_resources.is_empty())
+        return;
+    resource_storage.release_cache_references(referenced_resources);
+}
+
+bool PaintableBox::has_cached_commands(PaintPhase phase) const
+{
+    return m_cached_paint_data && m_cached_paint_data->has(phase);
+}
+
+ReadonlyBytes PaintableBox::cached_commands(PaintPhase phase) const
+{
+    return m_cached_paint_data->bytes_for(phase);
+}
+
+void PaintableBox::invalidate_paint_cache() const
+{
+    if (!m_cached_paint_data)
+        return;
+
+    m_cached_paint_data->for_each_present_phase([&](PaintPhase, ReadonlyBytes command_bytes) {
+        release_cache_references_for_cached_commands(command_bytes);
+    });
+    m_cached_paint_data = nullptr;
+}
+
+void PaintableBox::set_cached_commands(PaintPhase phase, ByteBuffer const& commands) const
+{
+    if (!m_cached_paint_data)
+        m_cached_paint_data = make<CachedPaintData>();
+
+    if (m_cached_paint_data->has(phase))
+        release_cache_references_for_cached_commands(m_cached_paint_data->bytes_for(phase));
+
+    auto command_bytes = commands.span();
+    acquire_cache_references_for_cached_commands(command_bytes);
+    m_cached_paint_data->set(phase, command_bytes);
 }
 
 void PaintableBox::reset_for_relayout()
@@ -413,14 +548,16 @@ void PaintableBox::reset_for_relayout()
 
     m_enclosing_scroll_frame_index = {};
     m_own_scroll_frame_index = {};
-    m_accumulated_visual_context_index = {};
-    m_accumulated_visual_context_for_descendants_index = {};
+    m_accumulated_visual_context_index = VISUAL_VIEWPORT_NODE_INDEX;
+    m_accumulated_visual_context_for_descendants_index = VISUAL_VIEWPORT_NODE_INDEX;
     m_fixed_background_visual_context = {};
 
+    m_used_values_for_grid_template_columns = nullptr;
+    m_used_values_for_grid_template_rows = nullptr;
     m_grid_layout_data = nullptr;
     m_flex_layout_data = nullptr;
 
-    m_cached_phase_commands = {};
+    invalidate_paint_cache();
 
     invalidate_stacking_context();
 }
@@ -908,8 +1045,11 @@ Optional<PaintableBox::ScrollbarData> PaintableBox::compute_scrollbar_data(Scrol
     if (!m_own_scroll_frame_index.value())
         return {};
 
-    CSSPixelRect scrollable_overflow_rect = this->scrollable_overflow_rect().value();
-    CSSPixels scrollable_overflow_length = scrollable_overflow_rect.primary_size_for_orientation(orientation);
+    auto scrollable_overflow_rect = this->scrollable_overflow_rect();
+    if (!scrollable_overflow_rect.has_value())
+        return {};
+
+    CSSPixels scrollable_overflow_length = scrollable_overflow_rect->primary_size_for_orientation(orientation);
     if (scrollable_overflow_length == 0)
         return {};
 
@@ -1011,6 +1151,9 @@ void PaintableBox::record_async_scrolling_metadata(DisplayListRecordingContext& 
 
 void PaintableBox::record_hit_test_items(DisplayListRecordingContext& context, PaintPhase phase) const
 {
+    if (phase != PaintPhase::Background && phase != PaintPhase::Overlay)
+        return;
+
     auto* hit_test_display_list = context.hit_test_display_list();
     if (!hit_test_display_list)
         return;
@@ -1229,10 +1372,10 @@ void PaintableBox::paint_inspector_overlay_internal(DisplayListRecordingContext&
 
     auto font = Platform::FontPlugin::the().default_font(12);
 
-    StringBuilder builder(StringBuilder::Mode::UTF16);
-    builder.append(debug_description());
+    Utf16StringBuilder builder;
+    builder.appendff("{}", debug_description());
     builder.appendff(" {}x{} @ {},{}", border_rect.width(), border_rect.height(), border_rect.x(), border_rect.y());
-    auto size_text = builder.to_utf16_string();
+    auto size_text = builder.to_string();
     auto size_text_rect = border_rect;
     size_text_rect.set_y(border_rect.y() + border_rect.height());
     size_text_rect.set_top(size_text_rect.top());
@@ -1600,11 +1743,12 @@ BorderRadiiData PaintableBox::normalized_border_radii_data(ShrinkRadiiForBorders
 
 Optional<CSSPixelPoint> PaintableBox::transform_point_to_local(CSSPixelPoint screen_position) const
 {
-    if (!m_accumulated_visual_context_index.value())
+    auto viewport_paintable = document().paintable();
+    if (!viewport_paintable || !viewport_paintable->has_visual_context_tree())
         return screen_position;
     auto pixel_ratio = static_cast<float>(document().page().client().device_pixels_per_css_pixel());
-    auto const& scroll_state = document().paintable()->scroll_state_snapshot();
-    auto const& visual_context_tree = document().paintable()->visual_context_tree();
+    auto const& scroll_state = viewport_paintable->scroll_state_snapshot();
+    auto const& visual_context_tree = viewport_paintable->visual_context_tree();
     auto result = visual_context_tree.transform_point_for_hit_test(m_accumulated_visual_context_index, screen_position.to_type<float>() * pixel_ratio, scroll_state);
     if (!result.has_value())
         return {};
@@ -1613,34 +1757,37 @@ Optional<CSSPixelPoint> PaintableBox::transform_point_to_local(CSSPixelPoint scr
 
 Optional<CSSPixelPoint> PaintableBox::transform_point_to_local_for_descendants(CSSPixelPoint screen_position) const
 {
-    if (!m_accumulated_visual_context_for_descendants_index.value())
+    auto viewport_paintable = document().paintable();
+    if (!viewport_paintable || !viewport_paintable->has_visual_context_tree())
         return screen_position;
     auto pixel_ratio = static_cast<float>(document().page().client().device_pixels_per_css_pixel());
-    auto const& scroll_state = document().paintable()->scroll_state_snapshot();
-    auto const& visual_context_tree = document().paintable()->visual_context_tree();
+    auto const& scroll_state = viewport_paintable->scroll_state_snapshot();
+    auto const& visual_context_tree = viewport_paintable->visual_context_tree();
     auto result = visual_context_tree.transform_point_for_hit_test(m_accumulated_visual_context_for_descendants_index, screen_position.to_type<float>() * pixel_ratio, scroll_state);
     if (!result.has_value())
         return {};
     return (*result / pixel_ratio).to_type<CSSPixels>();
 }
 
-CSSPixelRect PaintableBox::transform_rect_to_viewport(CSSPixelRect const& rect) const
+CSSPixelRect PaintableBox::transform_rect_to_viewport(CSSPixelRect const& rect, AccumulatedVisualContextTree::IncludeVisualViewportTransform include_visual_viewport_transform) const
 {
-    if (!m_accumulated_visual_context_index.value())
+    auto viewport_paintable = document().paintable();
+    if (!viewport_paintable || !viewport_paintable->has_visual_context_tree())
         return rect;
     auto pixel_ratio = static_cast<float>(document().page().client().device_pixels_per_css_pixel());
-    auto const& scroll_state = document().paintable()->scroll_state_snapshot();
-    auto const& visual_context_tree = document().paintable()->visual_context_tree();
-    auto result = visual_context_tree.transform_rect_to_viewport(m_accumulated_visual_context_index, rect.to_type<float>() * pixel_ratio, scroll_state);
+    auto const& scroll_state = viewport_paintable->scroll_state_snapshot();
+    auto const& visual_context_tree = viewport_paintable->visual_context_tree();
+    auto result = visual_context_tree.transform_rect_to_viewport(m_accumulated_visual_context_index, rect.to_type<float>() * pixel_ratio, scroll_state, include_visual_viewport_transform);
     return (result * (1.f / pixel_ratio)).to_type<CSSPixels>();
 }
 
 CSSPixelPoint PaintableBox::inverse_transform_point(CSSPixelPoint screen_position) const
 {
-    if (!m_accumulated_visual_context_index.value())
+    auto viewport_paintable = document().paintable();
+    if (!viewport_paintable || !viewport_paintable->has_visual_context_tree())
         return screen_position;
     auto pixel_ratio = static_cast<float>(document().page().client().device_pixels_per_css_pixel());
-    auto const& visual_context_tree = document().paintable()->visual_context_tree();
+    auto const& visual_context_tree = viewport_paintable->visual_context_tree();
     auto result = visual_context_tree.inverse_transform_point(m_accumulated_visual_context_index, screen_position.to_type<float>() * pixel_ratio);
     return (result / pixel_ratio).to_type<CSSPixels>();
 }

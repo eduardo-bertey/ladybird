@@ -49,10 +49,10 @@ jobs:
       # Pull requests can trail behind `master` and can cause breakage if merging before running the CI checks on an updated branch.
       # Luckily, GitHub creates and maintains a merge branch that is updated whenever the target or source branch is modified. By
       # checking this branch out, we gain a stabler `master` at the cost of reproducibility.
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.0
         if: ${{ github.event_name != 'pull_request' }}
 
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.0
         if: ${{ github.event_name == 'pull_request' }}
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
@@ -117,6 +117,13 @@ jobs:
           ccache_path: ${{ steps.setup.outputs.ccache_path }}
           vcpkg_cache_path: ${{ steps.setup.outputs.vcpkg_cache_path }}
 
+      - name: Cache the WebAssembly spec test suite
+        if: ${{ inputs.os_name != 'Windows' }}
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/caches/WasmSpecTests
+          key: wasm-spec-test-suite | ${{ hashFiles('Meta/CMake/wasm_spec_tests.cmake') }}
+
       - name: Set dynamic environment variables
         if: ${{ inputs.os_name != 'Windows' }}
         run: |
@@ -154,18 +161,11 @@ jobs:
           VCPKG_CACHE_SAS: ${{ github.ref == 'refs/heads/master' && secrets.VCPKG_CACHE_SAS || '' }}
           VCPKG_CACHE_MODE: ${{ github.ref == 'refs/heads/master' && 'write' || '' }}
         run: |
-          cmake --preset=Host_Tools -B "${GITHUB_WORKSPACE}/Build/host-tools-build" \
-            ${{ steps.build-parameters.outputs.cmake_options }} \
-            -DPython3_EXECUTABLE=${{ env.pythonLocation }}/bin/python
-
-          ninja -C "${GITHUB_WORKSPACE}/Build/host-tools-build" install
-
           cmake --preset ${{ inputs.build_preset }} -B Build \
             ${{ steps.build-parameters.outputs.cmake_options }} \
             -DPython3_EXECUTABLE=${{ env.pythonLocation }}/bin/python \
             -DCMAKE_C_COMPILER=${{ steps.build-parameters.outputs.host_cc }} \
-            -DCMAKE_CXX_COMPILER=${{ steps.build-parameters.outputs.host_cxx }} \
-            -DLagomTools_DIR=${GITHUB_WORKSPACE}/Build/host-tools/share/LagomTools
+            -DCMAKE_CXX_COMPILER=${{ steps.build-parameters.outputs.host_cxx }}
 
       # === BUILD ===
 
@@ -200,6 +200,20 @@ jobs:
           pulseaudio --system -D --exit-idle-time=1800 \
             --load="module-native-protocol-unix auth-anonymous=1 socket=/tmp/pulse-native" \
             --load="module-null-sink sink_name=virtual_sink"
+
+      - name: Check new tests for flakiness
+        if: ${{ github.event_name == 'pull_request' && inputs.build_preset == 'Sanitizer' && (inputs.os_name == 'Linux' || inputs.os_name == 'macOS') }}
+        timeout-minutes: 30
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
+          "${{ env.pythonLocation }}/bin/python" Meta/check-test-flakiness.py \
+            --test-web-binary Build/bin/test-web \
+            --base-ref ${{ github.event.pull_request.base.sha }} \
+            --deadline-seconds 1200 \
+            --python-executable "${{ env.pythonLocation }}/bin/python" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Test
         if: ${{ inputs.build_preset == 'Sanitizer' }}

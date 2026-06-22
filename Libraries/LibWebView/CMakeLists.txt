@@ -9,6 +9,7 @@ set(SOURCES
     DOMNodeProperties.cpp
     FileDownloader.cpp
     HeadlessWebView.cpp
+    HistoryDebug.cpp
     HistoryStore.cpp
     HelperProcess.cpp
     HSTSStore.cpp
@@ -20,6 +21,7 @@ set(SOURCES
     ProcessManager.cpp
     ProcessMonitor.cpp
     SearchEngine.cpp
+    SessionHistory.cpp
     Settings.cpp
     SiteIsolation.cpp
     SourceHighlighter.cpp
@@ -33,21 +35,20 @@ set(SOURCES
     WorkerProcessManager.cpp
     WebUI.cpp
     WebUI/BookmarksUI.cpp
+    WebUI/HistoryUI.cpp
     WebUI/ProcessesUI.cpp
     WebUI/SettingsUI.cpp
     WebUI/VersionUI.cpp
     CompositorClient.cpp
 )
 
-set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
+if (APPLE)
+    list(APPEND SOURCES
+        PlatformColorsMacOS.cpp
+    )
+endif()
 
-embed_as_string(
-    "NativeStyleSheetSource.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Native.css"
-    "NativeStyleSheetSource.cpp"
-    "native_stylesheet_source"
-    NAMESPACE "WebView"
-)
+set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
 
 compile_ipc(UIProcessServer.ipc UIProcessServerEndpoint.h)
 compile_ipc(UIProcessClient.ipc UIProcessClientEndpoint.h)
@@ -72,7 +73,6 @@ set(GENERATED_SOURCES
     ../../Services/WebContent/WebDriverServerEndpoint.h
     ../../Services/WebContent/WebUIClientEndpoint.h
     ../../Services/WebContent/WebUIServerEndpoint.h
-    NativeStyleSheetSource.cpp
     UIProcessClientEndpoint.h
     UIProcessServerEndpoint.h
 )

@@ -13,6 +13,7 @@
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/DOM/Document.h>
@@ -39,7 +40,7 @@ HTMLTextAreaElement::HTMLTextAreaElement(DOM::Document& document, DOM::Qualified
 
 HTMLTextAreaElement::~HTMLTextAreaElement() = default;
 
-void HTMLTextAreaElement::adjust_computed_style(CSS::ComputedProperties& style)
+void HTMLTextAreaElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
 {
     // https://drafts.csswg.org/css-display-3/#unbox
     if (style.display().is_contents())
@@ -110,6 +111,9 @@ void HTMLTextAreaElement::reset_algorithm()
     m_dirty_value = false;
     // and the raw value to its child text content.
     set_raw_value(child_text_content());
+
+    // AD-HOC: Resetting may change the value and the user validity, affecting which validity pseudo-classes match.
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
     if (m_text_node) {
         MUST(m_text_node->replace_data(0, m_text_node->length_in_utf16_code_units(), m_raw_value));
@@ -191,6 +195,9 @@ void HTMLTextAreaElement::set_value(Utf16String const& value)
     // 4. If the new API value is different from oldAPIValue, then move the text entry cursor position to the end of
     //    the text control, unselecting any selected text and resetting the selection direction to "none".
     if (api_value() != old_api_value) {
+        // AD-HOC: Changing the value may change which validity pseudo-classes match.
+        CSS::Invalidation::invalidate_style_after_validity_change(*this);
+
         if (m_text_node) {
             MUST(m_text_node->replace_data(0, m_text_node->length_in_utf16_code_units(), m_raw_value));
             update_placeholder_visibility();
@@ -420,12 +427,20 @@ void HTMLTextAreaElement::form_associated_element_attribute_changed(FlyString co
     } else if (name == HTML::AttributeNames::maxlength) {
         handle_maxlength_attribute();
     }
+
+    // AD-HOC: A change to any of these attributes can change whether the element satisfies its constraints, and
+    //         therefore which validity pseudo-classes match.
+    if (first_is_one_of(name, HTML::AttributeNames::required, HTML::AttributeNames::maxlength, HTML::AttributeNames::minlength))
+        CSS::Invalidation::invalidate_style_after_validity_change(*this);
 }
 
 void HTMLTextAreaElement::did_edit_text_node(FlyString const& input_type, Optional<Utf16String> const& data)
 {
     VERIFY(m_text_node);
     set_raw_value(m_text_node->data());
+
+    // AD-HOC: Editing the value may change which validity pseudo-classes match.
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
     // Any time the user causes the element's raw value to change, the user agent must queue an element task on the user
     // interaction task source given the textarea element to fire an event named input at the textarea element, with the
@@ -482,9 +497,9 @@ Optional<String> HTMLTextAreaElement::placeholder_value() const
     return get_attribute_value(HTML::AttributeNames::placeholder);
 }
 
-GC::Ptr<Layout::Node> HTMLTextAreaElement::create_layout_node(GC::Ref<CSS::ComputedProperties> style)
+RefPtr<Layout::Node> HTMLTextAreaElement::create_layout_node(CSS::ComputedProperties const& style)
 {
-    return heap().allocate<Layout::TextAreaBox>(document(), *this, style);
+    return make_ref_counted<Layout::TextAreaBox>(document(), *this, style);
 }
 
 }

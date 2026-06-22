@@ -8,6 +8,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NeverDestroyed.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/Range.h>
 #include <LibWeb/DOM/Comment.h>
@@ -41,8 +43,8 @@ GC_DEFINE_ALLOCATOR(Range);
 
 HashTable<Range*>& Range::live_ranges()
 {
-    static HashTable<Range*> ranges;
-    return ranges;
+    static NeverDestroyed<HashTable<Range*>> ranges;
+    return *ranges;
 }
 
 GC::Ref<Range> Range::create(HTML::Window& window)
@@ -568,7 +570,7 @@ WebIDL::ExceptionOr<WebIDL::Short> Range::compare_point(GC::Ref<Node> node, WebI
 Utf16String Range::to_string() const
 {
     // 1. Let s be the empty string.
-    StringBuilder builder(StringBuilder::Mode::UTF16);
+    Utf16StringBuilder builder;
 
     // 2. If this’s start node is this’s end node and it is a Text node,
     //    then return the substring of that Text node’s data beginning at this’s start offset and ending at this’s end offset.
@@ -592,7 +594,7 @@ Utf16String Range::to_string() const
         builder.append(MUST(end_text->substring_data(0, end_offset())));
 
     // 6. Return s.
-    return builder.to_utf16_string();
+    return builder.to_string();
 }
 
 // https://dom.spec.whatwg.org/#dom-range-extractcontents
@@ -1179,16 +1181,34 @@ GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
     Vector<GC::Root<Geometry::DOMRect>> rects;
     // FIXME: take Range collapsed into consideration
     // 2. Iterate the node included in Range
-    auto start_node = start_container();
-    if (!is<DOM::Text>(*start_node))
-        start_node = *start_node->child_at_index(m_start_offset);
+    GC::Ptr<Node> start_node = start_container();
+    if (!is<DOM::Text>(*start_node)) {
+        auto next_after_subtree = [](Node& node) -> GC::Ptr<Node> {
+            for (auto* current = &node; current; current = current->parent_node()) {
+                if (auto* next = current->next_sibling())
+                    return next;
+            }
+            return nullptr;
+        };
 
-    auto end_node = end_container();
+        auto* start_child = start_node->child_at_index(m_start_offset);
+        if (start_child) {
+            start_node = *start_child;
+        } else if (start_node->last_child()) {
+            start_node = next_after_subtree(*start_node);
+        } else {
+            start_node = start_node->next_in_pre_order();
+        }
+    }
+
+    GC::Ptr<Node> end_node = end_container();
     if (!is<DOM::Text>(*end_node)) {
         // end offset shouldn't be 0
         if (m_end_offset == 0)
             return Geometry::DOMRectList::create(realm(), {});
-        end_node = *end_node->child_at_index(m_end_offset - 1);
+        end_node = end_node->child_at_index(m_end_offset - 1);
+        if (!end_node)
+            return Geometry::DOMRectList::create(realm(), {});
     }
     for (GC::Ptr<Node> node = start_node; node && node != end_node->next_in_pre_order(); node = node->next_in_pre_order()) {
         auto selection_state = Painting::Paintable::SelectionState::Full;
@@ -1207,7 +1227,7 @@ GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
         if (node_type == NodeType::ELEMENT_NODE) {
             // 1. For each element selected by the range, whose parent is not selected by the range, include the border
             // areas returned by invoking getClientRects() on the element.
-            if (contains_node(*node) && !contains_node(*node->parent())) {
+            if (contains_node(*node) && (!node->parent() || !contains_node(*node->parent()))) {
                 auto const& element = static_cast<DOM::Element const&>(*node);
                 auto const element_rects = element.get_client_rects();
                 for (auto& rect : element_rects) {

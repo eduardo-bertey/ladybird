@@ -83,7 +83,7 @@ static inline void decode_audio(StringView path, u32 sample_rate, u8 channel_cou
     }());
     auto tracks = TRY_OR_FAIL(demuxer->get_tracks_for_type(Media::TrackType::Audio));
     VERIFY(!tracks.is_empty());
-    auto producer = TRY_OR_FAIL(Media::DecodedAudioProducer::try_create(Core::EventLoop::current_weak(), demuxer, tracks[0]));
+    auto producer = TRY_OR_FAIL(Media::DecodedAudioProducer::try_create(loop, demuxer, tracks[0]));
 
     producer->set_error_handler([&](Media::DecoderError&&) {
         FAIL("An error occurred while decoding.");
@@ -109,8 +109,8 @@ static inline void decode_audio(StringView path, u32 sample_rate, u8 channel_cou
             if (expected_channel_map.has_value())
                 EXPECT_EQ(block.sample_specification().channel_map(), expected_channel_map.value());
 
-            VERIFY(frame_count == 0 || last_frame <= block.timestamp_in_frames());
-            last_frame = block.timestamp_in_frames() + static_cast<i64>(block.frame_count());
+            VERIFY(frame_count == 0 || last_frame <= block.first_frame_index());
+            last_frame = block.first_frame_index() + static_cast<i64>(block.frame_count());
 
             frame_count += block.frame_count();
         } else if (status == Media::PipelineStatus::EndOfStream) {

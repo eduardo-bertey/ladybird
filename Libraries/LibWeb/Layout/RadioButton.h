@@ -12,11 +12,10 @@
 namespace Web::Layout {
 
 class RadioButton final : public ReplacedBox {
-    GC_CELL(RadioButton, ReplacedBox);
-    GC_DECLARE_ALLOCATOR(RadioButton);
+    LAYOUT_NODE(RadioButton, ReplacedBox);
 
 public:
-    RadioButton(DOM::Document&, HTML::HTMLInputElement&, GC::Ref<CSS::ComputedProperties>);
+    RadioButton(DOM::Document&, HTML::HTMLInputElement&, CSS::ComputedProperties const&);
     virtual ~RadioButton() override;
 
 private:

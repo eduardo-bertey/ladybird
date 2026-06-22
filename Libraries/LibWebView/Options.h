@@ -74,10 +74,16 @@ enum class EnableContentBlocker {
     Yes,
 };
 
+enum class DisableSandbox {
+    No,
+    Yes,
+};
+
 struct BrowserOptions {
     Vector<URL::URL> urls;
     Vector<ByteString> raw_urls;
     Optional<HeadlessMode> headless_mode;
+    Optional<ByteString> screenshot_path {};
     u32 screenshot_delay { 1 };
     int window_width { 800 };
     int window_height { 600 };
@@ -92,6 +98,7 @@ struct BrowserOptions {
     Optional<DNSSettings> dns_settings {};
     Optional<u16> devtools_port;
     EnableContentBlocker enable_content_blocker { EnableContentBlocker::Yes };
+    DisableSandbox disable_sandbox { DisableSandbox::No };
     Vector<ByteString> content_blocker_list_paths {};
 };
 
@@ -173,6 +180,11 @@ enum class FileSchemeUrlsHaveTupleOrigins {
     Yes,
 };
 
+enum class ReportSessionHistoryUpdatesInTestMode {
+    No,
+    Yes,
+};
+
 struct WebContentOptions {
     Optional<ByteString> config_path {};
     Optional<StringView> user_agent_preset {};
@@ -191,6 +203,7 @@ struct WebContentOptions {
     PaintViewportScrollbars paint_viewport_scrollbars { PaintViewportScrollbars::Yes };
     EnableAsyncScrolling enable_async_scrolling { EnableAsyncScrolling::Yes };
     FileSchemeUrlsHaveTupleOrigins file_scheme_urls_have_tuple_origins { FileSchemeUrlsHaveTupleOrigins::No };
+    ReportSessionHistoryUpdatesInTestMode report_session_history_updates_in_test_mode { ReportSessionHistoryUpdatesInTestMode::No };
     Optional<StringView> default_time_zone {};
     Optional<u64> style_invalidation_counter_dump_interval {};
 };

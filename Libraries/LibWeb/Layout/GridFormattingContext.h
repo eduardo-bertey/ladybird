@@ -26,7 +26,7 @@ struct GridPosition {
 };
 
 struct GridItem {
-    GC::Ref<Box const> box;
+    Box const& box;
     LayoutState::UsedValues& used_values;
 
     // Position and span are empty if the item is auto-placed which could only be the case for abspos items
@@ -62,7 +62,7 @@ struct GridItem {
 
     CSS::ComputedValues const& computed_values() const
     {
-        return box->computed_values();
+        return box.computed_values();
     }
 
     CSS::Size const& minimum_size(GridDimension dimension) const
@@ -322,7 +322,7 @@ private:
     void resolve_grid_item_sizes(GridDimension dimension);
 
     void resolve_track_spacing(GridDimension dimension);
-    void save_grid_layout_data(CSS::GridTrackSizeList&& columns, CSS::GridTrackSizeList&& rows);
+    void save_grid_layout_data();
     CSSPixels grid_container_size_for_track_alignment(GridDimension dimension) const;
 
     AvailableSize get_free_space(AvailableSpace const&, GridDimension) const;

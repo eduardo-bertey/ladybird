@@ -12,6 +12,7 @@
 #include <LibCore/StandardPaths.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
+#include <LibURL/InternalURLs.h>
 #include <LibURL/Parser.h>
 #include <LibUnicode/Locale.h>
 #include <LibWebView/Application.h>
@@ -21,6 +22,15 @@
 namespace WebView {
 
 static constexpr auto NEW_TAB_PAGE_URL_KEY = "newTabPageURL"sv;
+
+static constexpr auto TAB_SETTINGS_KEY = "tabs"sv;
+static constexpr auto VERTICAL_TABS_ENABLED_KEY = "verticalTabsEnabled"sv;
+static constexpr auto VERTICAL_TABS_EXPANDED_KEY = "verticalTabsExpanded"sv;
+static constexpr auto VERTICAL_TABS_EXPAND_ON_HOVER_KEY = "verticalTabsExpandOnHover"sv;
+static constexpr auto VERTICAL_TABS_EXPANDED_WIDTH_KEY = "verticalTabsExpandedWidth"sv;
+
+static constexpr auto SHOW_MENU_BAR_KEY = "showMenuBar"sv;
+static constexpr auto DEFAULT_SHOW_MENU_BAR = false;
 
 static constexpr auto SHOW_BOOKMARKS_BAR_KEY = "showBookmarksBar"sv;
 static constexpr auto DEFAULT_SHOW_BOOKMARKS_BAR = true;
@@ -45,7 +55,7 @@ static constexpr auto SEARCH_ENGINE_URL_KEY = "url"sv;
 static constexpr auto AUTOCOMPLETE_ENGINE_KEY = "autocompleteEngine"sv;
 static constexpr auto AUTOCOMPLETE_ENGINE_NAME_KEY = "name"sv;
 
-static constexpr auto SITE_SETTING_ENABLED_GLOBALLY_KEY = "enabledGlobally"sv;
+static constexpr auto SITE_SETTING_POLICY_KEY = "policy"sv;
 static constexpr auto SITE_SETTING_SITE_FILTERS_KEY = "siteFilters"sv;
 
 static constexpr auto AUTOPLAY_KEY = "autoplay"sv;
@@ -60,7 +70,7 @@ static constexpr auto DNS_SETTINGS_KEY = "dnsSettings"sv;
 
 static constexpr auto CONFIG_VARIABLES_KEY = "configVariables"sv;
 
-static Array<ConfigVariableDefinition, static_cast<size_t>(ConfigVariableID::Count)> const CONFIG_VARIABLE_DEFINITIONS { {
+static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefinition, static_cast<size_t>(ConfigVariableID::Count)> { {
     {
         .id = ConfigVariableID::ShowWebContentProcessIDInTabTitle,
         .name = "debug.process.show_web_content_process_id"sv,
@@ -84,6 +94,22 @@ static Array<ConfigVariableDefinition, static_cast<size_t>(ConfigVariableID::Cou
         .description = "Load content blocker lists from these filesystem paths on startup, in order."sv,
         .default_value = JsonArray {},
         .array_element_type = JsonValue::Type::String,
+    },
+    {
+        .id = ConfigVariableID::UseRoundedWindowCorners,
+        .name = "ui.window.use_rounded_corners"sv,
+        .title = "Use rounded window corners"sv,
+        .description = "Clip browser windows to rounded corners."sv,
+        .default_value = true,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::UseServerSideWindowDecorations,
+        .name = "ui.window.use_server_side_decorations"sv,
+        .title = "Use server-side window decorations"sv,
+        .description = "Use the system window frame instead of the custom title bar and window controls."sv,
+        .default_value = false,
+        .array_element_type = {},
     },
 } };
 
@@ -169,6 +195,12 @@ Settings Settings::create(Badge<Application>)
             settings.m_new_tab_page_url = parsed_new_tab_page_url.release_value();
     }
 
+    if (auto tab_settings = settings_json.value().get(TAB_SETTINGS_KEY); tab_settings.has_value())
+        settings.m_tab_settings = parse_tab_settings(*tab_settings);
+
+    if (auto show_menu_bar = settings_json.value().get_bool(SHOW_MENU_BAR_KEY); show_menu_bar.has_value())
+        settings.m_show_menu_bar = *show_menu_bar;
+
     if (auto show_bookmarks_bar = settings_json.value().get_bool(SHOW_BOOKMARKS_BAR_KEY); show_bookmarks_bar.has_value())
         settings.m_show_bookmarks_bar = *show_bookmarks_bar;
 
@@ -210,13 +242,15 @@ Settings Settings::create(Badge<Application>)
         }
     }
 
-    auto load_site_setting = [&](SiteSetting& site_setting, StringView key) {
+    auto load_site_setting = [&](AutoplaySiteSetting& site_setting, StringView key) {
         auto saved_settings = settings_json.value().get_object(key);
         if (!saved_settings.has_value())
             return;
 
-        if (auto enabled_globally = saved_settings->get_bool(SITE_SETTING_ENABLED_GLOBALLY_KEY); enabled_globally.has_value())
-            site_setting.enabled_globally = *enabled_globally;
+        if (auto policy = saved_settings->get_string(SITE_SETTING_POLICY_KEY); policy.has_value()) {
+            if (auto parsed = Web::HTML::autoplay_policy_from_string(*policy); parsed.has_value())
+                site_setting.policy = *parsed;
+        }
 
         if (auto site_filters = saved_settings->get_array(SITE_SETTING_SITE_FILTERS_KEY); site_filters.has_value()) {
             site_setting.site_filters.clear();
@@ -254,6 +288,7 @@ Settings Settings::create(Badge<Application>)
 Settings::Settings(ByteString settings_path)
     : m_settings_path(move(settings_path))
     , m_new_tab_page_url(URL::about_newtab())
+    , m_show_menu_bar(DEFAULT_SHOW_MENU_BAR)
     , m_show_bookmarks_bar(DEFAULT_SHOW_BOOKMARKS_BAR)
     , m_default_zoom_level_factor(INITIAL_ZOOM_LEVEL_FACTOR)
     , m_languages({ DEFAULT_LANGUAGE })
@@ -267,6 +302,16 @@ JsonValue Settings::serialize_json() const
 {
     JsonObject settings;
     settings.set(NEW_TAB_PAGE_URL_KEY, m_new_tab_page_url.serialize());
+
+    JsonObject tab_settings;
+    tab_settings.set(VERTICAL_TABS_ENABLED_KEY, m_tab_settings.vertical_tabs_enabled);
+    tab_settings.set(VERTICAL_TABS_EXPANDED_KEY, m_tab_settings.vertical_tabs_expanded);
+    tab_settings.set(VERTICAL_TABS_EXPAND_ON_HOVER_KEY, m_tab_settings.vertical_tabs_expand_on_hover);
+    if (m_tab_settings.vertical_tabs_expanded_width.has_value())
+        tab_settings.set(VERTICAL_TABS_EXPANDED_WIDTH_KEY, *m_tab_settings.vertical_tabs_expanded_width);
+    settings.set(TAB_SETTINGS_KEY, move(tab_settings));
+
+    settings.set(SHOW_MENU_BAR_KEY, m_show_menu_bar);
     settings.set(SHOW_BOOKMARKS_BAR_KEY, m_show_bookmarks_bar);
     settings.set(DEFAULT_ZOOM_LEVEL_FACTOR_KEY, m_default_zoom_level_factor);
 
@@ -317,7 +362,7 @@ JsonValue Settings::serialize_json() const
         settings.set(AUTOCOMPLETE_ENGINE_KEY, move(autocomplete_engine));
     }
 
-    auto save_site_setting = [&](SiteSetting const& site_setting, StringView key) {
+    auto save_site_setting = [&](AutoplaySiteSetting const& site_setting, StringView key) {
         JsonArray site_filters;
         site_filters.ensure_capacity(site_setting.site_filters.size());
 
@@ -325,8 +370,8 @@ JsonValue Settings::serialize_json() const
             site_filters.must_append(site_filter);
 
         JsonObject setting;
-        setting.set("enabledGlobally"sv, site_setting.enabled_globally);
-        setting.set("siteFilters"sv, move(site_filters));
+        setting.set(SITE_SETTING_POLICY_KEY, Web::HTML::autoplay_policy_to_string(site_setting.policy));
+        setting.set(SITE_SETTING_SITE_FILTERS_KEY, move(site_filters));
 
         settings.set(key, move(setting));
     };
@@ -381,6 +426,43 @@ void Settings::set_new_tab_page_url(URL::URL new_tab_page_url)
 
     for (auto& observer : m_observers)
         observer.new_tab_page_url_changed();
+}
+
+TabSettings Settings::parse_tab_settings(JsonValue const& settings)
+{
+    if (!settings.is_object())
+        return {};
+
+    TabSettings tab_settings;
+
+    if (auto vertical_tabs_enabled = settings.as_object().get_bool(VERTICAL_TABS_ENABLED_KEY); vertical_tabs_enabled.has_value())
+        tab_settings.vertical_tabs_enabled = *vertical_tabs_enabled;
+    if (auto vertical_tabs_expanded = settings.as_object().get_bool(VERTICAL_TABS_EXPANDED_KEY); vertical_tabs_expanded.has_value())
+        tab_settings.vertical_tabs_expanded = *vertical_tabs_expanded;
+    if (auto vertical_tabs_expand_on_hover = settings.as_object().get_bool(VERTICAL_TABS_EXPAND_ON_HOVER_KEY); vertical_tabs_expand_on_hover.has_value())
+        tab_settings.vertical_tabs_expand_on_hover = *vertical_tabs_expand_on_hover;
+    if (auto vertical_tabs_expanded_width = settings.as_object().get_integer<u16>(VERTICAL_TABS_EXPANDED_WIDTH_KEY); vertical_tabs_expanded_width.has_value())
+        tab_settings.vertical_tabs_expanded_width = *vertical_tabs_expanded_width;
+
+    return tab_settings;
+}
+
+void Settings::set_tab_settings(TabSettings tab_settings)
+{
+    m_tab_settings = tab_settings;
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.tab_settings_changed();
+}
+
+void Settings::set_show_menu_bar(bool show_menu_bar)
+{
+    m_show_menu_bar = show_menu_bar;
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.show_menu_bar_changed();
 }
 
 void Settings::set_show_bookmarks_bar(bool show_bookmarks_bar)
@@ -574,9 +656,9 @@ void Settings::set_autocomplete_engine(Optional<StringView> autocomplete_engine_
         observer.autocomplete_engine_changed();
 }
 
-void Settings::set_autoplay_enabled_globally(bool enabled_globally)
+void Settings::set_autoplay_policy(Web::HTML::AutoplayPolicy policy)
 {
-    m_autoplay.enabled_globally = enabled_globally;
+    m_autoplay.policy = policy;
     persist_settings();
 
     for (auto& observer : m_observers)
@@ -777,11 +859,6 @@ SettingsObserver::SettingsObserver()
 SettingsObserver::~SettingsObserver()
 {
     Settings::remove_observer({}, *this);
-}
-
-SiteSetting::SiteSetting()
-{
-    site_filters.set("file://"_string);
 }
 
 }

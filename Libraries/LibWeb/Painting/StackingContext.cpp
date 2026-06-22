@@ -14,6 +14,7 @@
 #include <LibWeb/Layout/ReplacedBox.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Painting/BackgroundPainting.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListRecorder.h>
 #include <LibWeb/Painting/PaintableBox.h>
@@ -40,9 +41,6 @@ static void paint_node(Paintable const& paintable, DisplayListRecordingContext& 
             context.display_list_recorder().set_accumulated_visual_context(paintable_box->accumulated_visual_context_index());
     }
 
-    if (paintable_box && phase == PaintPhase::Background)
-        paintable_box->record_async_scrolling_metadata(context);
-
     if (paintable_box)
         paintable_box->record_hit_test_items(context, phase);
 
@@ -51,13 +49,17 @@ static void paint_node(Paintable const& paintable, DisplayListRecordingContext& 
         context.display_list_recorder().replay_cached_commands(paintable_box->cached_commands(phase));
     } else if (!skip_cache) {
         auto capture = context.display_list_recorder().begin_command_capture();
+        if (phase == PaintPhase::Background)
+            paintable_box->record_async_scrolling_metadata(context);
         paintable.paint(context, phase);
         paintable_box->set_cached_commands(phase, capture.take());
     } else {
+        if (paintable_box && phase == PaintPhase::Background)
+            paintable_box->record_async_scrolling_metadata(context);
         paintable.paint(context, phase);
     }
 
-    context.display_list_recorder().set_accumulated_visual_context({});
+    context.display_list_recorder().set_accumulated_visual_context(VISUAL_VIEWPORT_NODE_INDEX);
 
     VERIFY(context.display_list_recorder().m_save_nesting_level == 0);
 }
@@ -268,7 +270,7 @@ void StackingContext::paint_internal(DisplayListRecordingContext& context) const
         paint_node(svg_svg_paintable, context, PaintPhase::Background);
         paint_node(svg_svg_paintable, context, PaintPhase::Border);
 
-        SVGSVGPaintable::paint_descendants(context, svg_svg_paintable, PaintPhase::Foreground);
+        SVGSVGPaintable::paint_svg_box(context, svg_svg_paintable, PaintPhase::Foreground);
 
         paint_node(svg_svg_paintable, context, PaintPhase::Outline);
         if (context.should_paint_overlay()) {
@@ -295,9 +297,11 @@ void StackingContext::paint_internal(DisplayListRecordingContext& context) const
     // Draw the background and borders for block-level children (step 4)
     paint_descendants(context, paintable_box(), StackingContextPaintPhase::BackgroundAndBorders);
     // Draw the non-positioned floats (step 5)
-    paint_descendants(context, paintable_box(), StackingContextPaintPhase::Floats);
+    if (!m_non_positioned_floating_descendants.is_empty())
+        paint_descendants(context, paintable_box(), StackingContextPaintPhase::Floats);
     // Draw inline content, replaced content, etc. (steps 6, 7)
-    paint_descendants(context, paintable_box(), StackingContextPaintPhase::BackgroundAndBordersForInlineLevelAndReplaced);
+    if (m_contains_inline_or_replaced_descendants)
+        paint_descendants(context, paintable_box(), StackingContextPaintPhase::BackgroundAndBordersForInlineLevelAndReplaced);
     paint_node(paintable_box(), context, PaintPhase::Foreground);
     paint_descendants(context, paintable_box(), StackingContextPaintPhase::Foreground);
 
@@ -349,11 +353,7 @@ void StackingContext::paint(DisplayListRecordingContext& context) const
     });
 
     auto const& computed_values = paintable_box().computed_values();
-    auto mask_image = computed_values.mask_image();
-
-    if (mask_image) {
-        mask_image->resolve_for_size(paintable_box().layout_node_with_style_and_box_metrics(), paintable_box().absolute_padding_box_rect().size());
-    }
+    auto const& mask_layers = computed_values.mask_layers();
 
     auto effective_context_index = paintable_box().accumulated_visual_context_index();
     context.display_list_recorder().set_accumulated_visual_context(effective_context_index);
@@ -368,13 +368,18 @@ void StackingContext::paint(DisplayListRecordingContext& context) const
     // Collect all masks (CSS mask-image, SVG <mask>, SVG <clipPath>).
     Vector<DisplayListRecorder::MaskInfo> masks;
 
-    if (mask_image) {
+    if (!mask_layers.is_empty()) {
         auto visual_context_tree = AccumulatedVisualContextTree::create();
         auto mask_display_list = DisplayList::create(visual_context_tree);
         DisplayListRecorder display_list_recorder(*mask_display_list, visual_context_tree, context.display_list_recorder().resource_storage());
         auto mask_painting_context = context.clone(display_list_recorder);
-        auto mask_rect_in_device_pixels = context.enclosing_device_rect(paintable_box().absolute_padding_box_rect());
-        mask_image->paint(mask_painting_context, { {}, mask_rect_in_device_pixels.size() }, CSS::ImageRendering::Auto);
+        auto absolute_mask_rect = paintable_box().absolute_border_box_rect();
+        auto mask_rect_in_device_pixels = context.enclosing_device_rect(absolute_mask_rect);
+        auto mask_rect = CSSPixelRect { {}, absolute_mask_rect.size() };
+        auto resolved_mask = resolve_background_layers(mask_layers, paintable_box(), Color::Transparent, CSS::BackgroundBox::BorderBox, mask_rect, {});
+
+        // FIXME: Respect `image-rendering` here.
+        paint_background(mask_painting_context, paintable_box(), CSS::ImageRendering::Auto, resolved_mask, {});
         masks.append({ { *mask_display_list, move(visual_context_tree) }, mask_rect_in_device_pixels.to_type<int>(), Gfx::MaskKind::Alpha });
     }
 
@@ -409,7 +414,7 @@ void StackingContext::dump(StringBuilder& builder, int indent) const
     for (int i = 0; i < indent; ++i)
         builder.append(' ');
     CSSPixelRect rect = paintable_box().absolute_rect();
-    builder.appendff("SC for {} {} [children: {}] (z-index: ", paintable_box().layout_node().debug_description(), rect, m_children.size());
+    builder.appendff("SC for {} {} (z-index: ", paintable_box().layout_node().debug_description(), rect);
 
     if (paintable_box().effective_z_index().has_value())
         builder.appendff("{}", paintable_box().effective_z_index().value());
@@ -421,7 +426,7 @@ void StackingContext::dump(StringBuilder& builder, int indent) const
         builder.append(", has_transform"sv);
 
     builder.append('\n');
-    for (auto& child : m_children)
+    for (auto const& child : m_children)
         child->dump(builder, indent + 1);
 }
 

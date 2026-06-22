@@ -9,8 +9,8 @@
 #include <AK/RefCounted.h>
 #include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
+#include <AK/kmalloc.h>
 #include <LibGC/Ptr.h>
-#include <LibGC/Weak.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Display.h>
 #include <LibWeb/Export.h>
@@ -39,11 +39,11 @@ class WEB_API Paintable
     , public RefCountedTreeNode<Paintable> {
 
 public:
+    AK_ALLOC_WITH_KMALLOC_PARTITION(HeapPartition::Painting);
+
     virtual ~Paintable();
 
     virtual StringView class_name() const { return "Paintable"sv; }
-
-    void detach_from_layout_node();
 
     [[nodiscard]] bool is_visible() const
     {
@@ -128,9 +128,9 @@ public:
     };
     struct SelectionStyle {
         Color background_color;
-        Optional<Color> text_color;
-        Optional<Vector<ShadowData>> text_shadow;
-        Optional<TextDecorationStyle> text_decoration;
+        Optional<Color> text_color {};
+        Optional<Vector<ShadowData>> text_shadow {};
+        Optional<TextDecorationStyle> text_decoration {};
 
         bool has_styling() const
         {
@@ -147,13 +147,20 @@ protected:
     explicit Paintable(Layout::Node const&);
 
     void paint_with_inspector_overlay_context(DisplayListRecordingContext&, Function<void()> const&) const;
+    bool has_layout_node() const { return m_layout_node; }
 
     virtual void paint_inspector_overlay_internal(DisplayListRecordingContext&) const { }
     Optional<WeakPtr<PaintableBox>> mutable m_containing_block;
 
 private:
+    void detach_from_layout_node(Badge<Layout::Node>)
+    {
+        m_containing_block.clear();
+        m_layout_node.clear();
+    }
+
     GC::Weak<DOM::Node> m_dom_node;
-    GC::Weak<Layout::Node const> m_layout_node;
+    WeakPtr<Layout::Node const> m_layout_node;
 
     SelectionState m_selection_state { SelectionState::None };
 
