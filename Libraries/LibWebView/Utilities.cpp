@@ -9,6 +9,7 @@
 #include <AK/JsonValue.h>
 #include <AK/LexicalPath.h>
 #include <AK/Platform.h>
+#include <AK/Utf16String.h>
 #include <LibCore/Directory.h>
 #include <LibCore/Environment.h>
 #include <LibCore/File.h>
@@ -98,24 +99,6 @@ void platform_init(Optional<ByteString> ladybird_binary_path)
     Core::ResourceImplementation::install(make<Core::ResourceImplementationFile>(MUST(String::from_byte_string(s_ladybird_resource_root))));
 }
 
-void copy_default_config_files(StringView config_path)
-{
-    MUST(Core::Directory::create(config_path, Core::Directory::CreateDirectories::Yes));
-
-    auto config_resources = MUST(Core::Resource::load_from_uri("resource://ladybird/default-config"sv));
-
-    config_resources->for_each_descendant_file([config_path](Core::Resource const& resource) -> IterationDecision {
-        auto file_path = ByteString::formatted("{}/{}", config_path, resource.filename());
-
-        if (Core::System::stat(file_path).is_error()) {
-            auto file = MUST(Core::File::open(file_path, Core::File::OpenMode::Write));
-            MUST(file->write_until_depleted(resource.data()));
-        }
-
-        return IterationDecision::Continue;
-    });
-}
-
 ErrorOr<Vector<ByteString>> get_paths_for_helper_process(StringView process_name)
 {
     auto application_path = TRY(application_directory());
@@ -156,7 +139,7 @@ ErrorOr<Web::HTML::SelectedFile> create_selected_file(ByteString const& file_pat
     // https://html.spec.whatwg.org/multipage/input.html#file-upload-state-(type=file):concept-input-file-path
     // Filenames must not contain path components, even in the case that a user has selected an entire directory
     // hierarchy or multiple files with the same name from different directories.
-    auto name = LexicalPath::basename(file_path);
+    auto name = Utf16String::from_utf8(LexicalPath::basename(file_path));
 
     auto file = TRY(Core::File::open(file_path, Core::File::OpenMode::Read));
     return Web::HTML::SelectedFile { move(name), IPC::File::adopt_file(move(file)) };

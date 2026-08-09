@@ -23,9 +23,7 @@ class HTMLIFrameElement final
 public:
     virtual ~HTMLIFrameElement() override;
 
-    virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
-
+    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
     // ^EventTarget
     virtual bool is_focusable() const override
     {
@@ -63,9 +61,9 @@ private:
     // ^DOM::Element
     virtual void post_connection() override;
     virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
     virtual i32 default_tab_index_value() const override;
-    virtual bool is_presentational_hint(FlyString const&) const override;
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:dimension-attributes
@@ -92,7 +90,7 @@ private:
     SandboxingFlagSet m_iframe_sandboxing_flag_set {};
 };
 
-void run_iframe_load_event_steps(HTML::HTMLIFrameElement&);
+WEB_API void run_iframe_load_event_steps(HTML::HTMLIFrameElement&);
 
 ReferrerPolicy::ReferrerPolicy determine_iframe_element_referrer_policy(GC::Ptr<DOM::Element> embedder);
 

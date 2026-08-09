@@ -57,7 +57,7 @@ double HTMLMeterElement::value() const
 
 void HTMLMeterElement::set_value(double value)
 {
-    set_attribute_value(HTML::AttributeNames::value, String::number(value));
+    set_attribute_value(HTML::AttributeNames::value, Utf16String::number(value));
     update_meter_value_element();
 }
 
@@ -74,7 +74,7 @@ double HTMLMeterElement::min() const
 
 void HTMLMeterElement::set_min(double value)
 {
-    set_attribute_value(HTML::AttributeNames::min, String::number(value));
+    set_attribute_value(HTML::AttributeNames::min, Utf16String::number(value));
     update_meter_value_element();
 }
 
@@ -94,7 +94,7 @@ double HTMLMeterElement::max() const
 
 void HTMLMeterElement::set_max(double value)
 {
-    set_attribute_value(HTML::AttributeNames::max, String::number(value));
+    set_attribute_value(HTML::AttributeNames::max, Utf16String::number(value));
     update_meter_value_element();
 }
 
@@ -116,7 +116,7 @@ double HTMLMeterElement::low() const
 
 void HTMLMeterElement::set_low(double value)
 {
-    set_attribute_value(HTML::AttributeNames::low, String::number(value));
+    set_attribute_value(HTML::AttributeNames::low, Utf16String::number(value));
     update_meter_value_element();
 }
 
@@ -138,7 +138,7 @@ double HTMLMeterElement::high() const
 
 void HTMLMeterElement::set_high(double value)
 {
-    set_attribute_value(HTML::AttributeNames::high, String::number(value));
+    set_attribute_value(HTML::AttributeNames::high, Utf16String::number(value));
     update_meter_value_element();
 }
 
@@ -160,7 +160,7 @@ double HTMLMeterElement::optimum() const
 
 void HTMLMeterElement::set_optimum(double value)
 {
-    set_attribute_value(HTML::AttributeNames::optimum, String::number(value));
+    set_attribute_value(HTML::AttributeNames::optimum, Utf16String::number(value));
     update_meter_value_element();
 }
 
@@ -168,13 +168,6 @@ void HTMLMeterElement::inserted()
 {
     Base::inserted();
     create_shadow_tree_if_needed();
-}
-
-void HTMLMeterElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
-{
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
 }
 
 void HTMLMeterElement::create_shadow_tree_if_needed()
@@ -234,7 +227,7 @@ void HTMLMeterElement::update_meter_value_element()
         return;
 
     double position = (value - min) / (max - min) * 100;
-    MUST(m_meter_value_element->style_for_bindings()->set_property(CSS::PropertyID::Width, MUST(String::formatted("{}%", position))));
+    MUST(m_meter_value_element->style_for_bindings()->set_property(CSS::PropertyID::Width, Utf16String::formatted("{}%", position)));
 }
 
 }

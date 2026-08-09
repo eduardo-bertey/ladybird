@@ -6,6 +6,7 @@
 
 #include <AK/Debug.h>
 #include <LibCore/ElapsedTimer.h>
+#include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Bindings/ExceptionOrUtils.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
@@ -18,8 +19,18 @@ namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(ClassicScript);
 
+static void register_source(ClassicScript& script, ScriptRegistry::IsInlineSource is_inline_source, size_t source_line_number)
+{
+    auto* script_record = script.script_record();
+    if (!script_record || !script_record->cached_executable())
+        return;
+
+    auto const& source_code = script_record->cached_executable()->source_code;
+    register_javascript_source(script, source_code, is_inline_source, source_line_number);
+}
+
 // https://html.spec.whatwg.org/multipage/webappapis.html#creating-a-classic-script
-GC::Ref<ClassicScript> ClassicScript::create(ByteString filename, StringView source, EnvironmentSettingsObject& settings, URL::URL base_url, size_t source_line_number, MutedErrors muted_errors)
+GC::Ref<ClassicScript> ClassicScript::create(ByteString filename, Utf16View source, EnvironmentSettingsObject& settings, URL::URL base_url, size_t source_line_number, MutedErrors muted_errors, ScriptRegistry::IsInlineSource is_inline_source)
 {
     auto& vm = settings.vm();
 
@@ -29,7 +40,7 @@ GC::Ref<ClassicScript> ClassicScript::create(ByteString filename, StringView sou
 
     // FIXME: 2. If scripting is disabled for settings and bypassDisabledScripting is false, then set source to the empty string.
     if (is_scripting_disabled(settings))
-        source = ""sv;
+        source = {};
 
     // 3. Let script be a new classic script that this algorithm will subsequently initialize.
     // 4. Set script's settings object to settings.
@@ -48,9 +59,8 @@ GC::Ref<ClassicScript> ClassicScript::create(ByteString filename, StringView sou
     // FIXME: 9. Record classic script creation time given script and sourceURLForWindowScripts .
 
     // 10. Let result be ParseScript(source, settings's realm, script).
-    auto source_text = Utf16String::from_utf8(source);
     auto parse_timer = Core::ElapsedTimer::start_new();
-    auto result = JS::Script::parse(source_text.utf16_view(), settings.realm(), script->filename(), script->display_filename(), script, source_line_number);
+    auto result = JS::Script::parse(source, settings.realm(), script->filename(), script->display_filename(), script, source_line_number);
     dbgln_if(HTML_SCRIPT_DEBUG, "ClassicScript: Parsed {} in {}ms", script->filename(), parse_timer.elapsed_milliseconds());
 
     // 11. If result is a list of errors, then:
@@ -68,6 +78,7 @@ GC::Ref<ClassicScript> ClassicScript::create(ByteString filename, StringView sou
 
     // 12. Set script's record to result.
     script->m_script_record = *result.release_value();
+    register_source(*script, is_inline_source, source_line_number);
 
     // 13. Return script.
     return script;
@@ -81,7 +92,8 @@ GC::Ref<ClassicScript> ClassicScript::create_from_pre_parsed(ByteString filename
     if (muted_errors == MutedErrors::Yes)
         base_url = URL::about_blank();
 
-    auto script = vm.heap().allocate<ClassicScript>(move(base_url), move(filename), settings);
+    auto display_filename = source_code->filename();
+    auto script = vm.heap().allocate<ClassicScript>(move(base_url), move(filename), move(display_filename), settings);
 
     script->m_muted_errors = muted_errors;
     script->set_parse_error(JS::js_null());
@@ -102,6 +114,7 @@ GC::Ref<ClassicScript> ClassicScript::create_from_pre_parsed(ByteString filename
     }
 
     script->m_script_record = *result.release_value();
+    register_source(*script, ScriptRegistry::IsInlineSource::No, 1);
 
     return script;
 }
@@ -114,7 +127,8 @@ GC::Ref<ClassicScript> ClassicScript::create_from_pre_compiled(ByteString filena
     if (muted_errors == MutedErrors::Yes)
         base_url = URL::about_blank();
 
-    auto script = vm.heap().allocate<ClassicScript>(move(base_url), move(filename), settings);
+    auto display_filename = source_code->filename();
+    auto script = vm.heap().allocate<ClassicScript>(move(base_url), move(filename), move(display_filename), settings);
 
     script->m_muted_errors = muted_errors;
     script->set_parse_error(JS::js_null());
@@ -135,6 +149,7 @@ GC::Ref<ClassicScript> ClassicScript::create_from_pre_compiled(ByteString filena
     }
 
     script->m_script_record = *result.release_value();
+    register_source(*script, ScriptRegistry::IsInlineSource::No, 1);
 
     return script;
 }
@@ -147,7 +162,8 @@ GC::Ref<ClassicScript> ClassicScript::create_from_bytecode_cache(ByteString file
     if (muted_errors == MutedErrors::Yes)
         base_url = URL::about_blank();
 
-    auto script = vm.heap().allocate<ClassicScript>(move(base_url), move(filename), settings);
+    auto display_filename = source_code->filename();
+    auto script = vm.heap().allocate<ClassicScript>(move(base_url), move(filename), move(display_filename), settings);
 
     script->m_muted_errors = muted_errors;
     script->set_parse_error(JS::js_null());
@@ -168,6 +184,7 @@ GC::Ref<ClassicScript> ClassicScript::create_from_bytecode_cache(ByteString file
     }
 
     script->m_script_record = *result.release_value();
+    register_source(*script, ScriptRegistry::IsInlineSource::No, 1);
 
     return script;
 }
@@ -253,6 +270,11 @@ JS::Completion ClassicScript::run(RethrowErrors rethrow_errors, GC::Ptr<JS::Envi
 
 ClassicScript::ClassicScript(URL::URL base_url, ByteString filename, EnvironmentSettingsObject& settings)
     : Script(move(base_url), move(filename), settings)
+{
+}
+
+ClassicScript::ClassicScript(URL::URL base_url, ByteString filename, Utf16String display_filename, EnvironmentSettingsObject& settings)
+    : Script(move(base_url), move(filename), move(display_filename), settings)
 {
 }
 

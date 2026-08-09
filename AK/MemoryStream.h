@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/Checked.h>
 #include <AK/Error.h>
 #include <AK/OwnPtr.h>
 #include <AK/Stream.h>
@@ -30,7 +31,10 @@ public:
     virtual bool is_open() const override;
     virtual void close() override;
     virtual ErrorOr<void> truncate(size_t) override;
-    virtual ErrorOr<Bytes> read_some(Bytes bytes) override
+    // NOTE: This is inline for performance but the compiler only emits it in the key function's TU;
+    //       Not marking it default visible will make it hidden for all other TUs, which would make devirtualized
+    //       calls hit link errors against the hidden symbol.
+    [[gnu::visibility("default")]] virtual ErrorOr<Bytes> read_some(Bytes bytes) override
     {
         auto read = m_bytes.slice(m_offset).copy_trimmed_to(bytes);
         m_offset += read;
@@ -74,8 +78,13 @@ public:
                 return Error::from_string_literal("Tried to obtain a non-const span from a read-only FixedMemoryStream");
         }
 
+        Checked<size_t> byte_count = sizeof(T);
+        byte_count *= count;
+        if (byte_count.has_overflow() || byte_count.value() > remaining())
+            return Error::from_string_literal("Read of out-of-bounds span from FixedMemoryStream");
+
         Span<T> span { reinterpret_cast<T*>(m_bytes.offset_pointer(m_offset)), count };
-        TRY(discard(sizeof(T) * count));
+        TRY(discard(byte_count.value()));
         return span;
     }
 

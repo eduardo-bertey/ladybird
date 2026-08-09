@@ -17,8 +17,6 @@ class HTMLAudioElement final : public HTMLMediaElement {
 public:
     virtual ~HTMLAudioElement() override;
 
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder& style) override;
-
     Layout::AudioBox* layout_node();
     Layout::AudioBox const* layout_node() const;
 
@@ -29,7 +27,7 @@ private:
 
     virtual void initialize(JS::Realm&) override;
 
-    virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
+    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
 };
 
 }

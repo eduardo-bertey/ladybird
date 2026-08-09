@@ -11,6 +11,7 @@
 #include <linux/audit.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
+#include <linux/sockios.h>
 #include <signal.h>
 #include <stddef.h>
 #include <sys/ioctl.h>
@@ -91,6 +92,7 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #define IF_DEFINED_execveat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_exit(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_exit_group(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_fallocate(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_fcntl(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_fcntl64(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_fdatasync(if_defined, if_not_defined) if_defined
@@ -109,6 +111,8 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #define IF_DEFINED_getpeername(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_getpid(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_getrandom(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getresgid(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getresuid(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_getrlimit(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_getrusage(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_getsockname(if_defined, if_not_defined) if_defined
@@ -171,13 +175,16 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #define IF_DEFINED_shutdown(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_socket(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_socketpair(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_stat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_statx(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_symlink(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_sysinfo(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_tgkill(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_unlink(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_unlinkat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_umask(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_uname(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_utimensat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_wait4(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_waitid(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_write(if_defined, if_not_defined) if_defined
@@ -258,6 +265,10 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #    undef IF_DEFINED_execveat
 #    define IF_DEFINED_execveat(if_defined, if_not_defined) if_not_defined
 #endif
+#ifndef __NR_fallocate
+#    undef IF_DEFINED_fallocate
+#    define IF_DEFINED_fallocate(if_defined, if_not_defined) if_not_defined
+#endif
 #ifndef __NR_fcntl64
 #    undef IF_DEFINED_fcntl64
 #    define IF_DEFINED_fcntl64(if_defined, if_not_defined) if_not_defined
@@ -309,6 +320,14 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #ifndef __NR_getrandom
 #    undef IF_DEFINED_getrandom
 #    define IF_DEFINED_getrandom(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_getresgid
+#    undef IF_DEFINED_getresgid
+#    define IF_DEFINED_getresgid(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_getresuid
+#    undef IF_DEFINED_getresuid
+#    define IF_DEFINED_getresuid(if_defined, if_not_defined) if_not_defined
 #endif
 #ifndef __NR_membarrier
 #    undef IF_DEFINED_membarrier
@@ -426,9 +445,17 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #    undef IF_DEFINED_shutdown
 #    define IF_DEFINED_shutdown(if_defined, if_not_defined) if_not_defined
 #endif
+#ifndef __NR_stat
+#    undef IF_DEFINED_stat
+#    define IF_DEFINED_stat(if_defined, if_not_defined) if_not_defined
+#endif
 #ifndef __NR_statx
 #    undef IF_DEFINED_statx
 #    define IF_DEFINED_statx(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_symlink
+#    undef IF_DEFINED_symlink
+#    define IF_DEFINED_symlink(if_defined, if_not_defined) if_not_defined
 #endif
 #ifndef __NR_unlink
 #    undef IF_DEFINED_unlink
@@ -445,6 +472,10 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #ifndef __NR_umask
 #    undef IF_DEFINED_umask
 #    define IF_DEFINED_umask(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_utimensat
+#    undef IF_DEFINED_utimensat
+#    define IF_DEFINED_utimensat(if_defined, if_not_defined) if_not_defined
 #endif
 #ifndef __NR_wait4
 #    undef IF_DEFINED_wait4
@@ -543,6 +574,9 @@ static char const* syscall_name(long syscall_number)
 #ifdef __NR_faccessat2
         CASE_SYSCALL_NAME(faccessat2);
 #endif
+#ifdef __NR_fallocate
+        CASE_SYSCALL_NAME(fallocate);
+#endif
 #ifdef __NR_fcntl
         CASE_SYSCALL_NAME(fcntl);
 #endif
@@ -561,8 +595,17 @@ static char const* syscall_name(long syscall_number)
 #ifdef __NR_getdents64
         CASE_SYSCALL_NAME(getdents64);
 #endif
+#ifdef __NR_getresgid
+        CASE_SYSCALL_NAME(getresgid);
+#endif
+#ifdef __NR_getresuid
+        CASE_SYSCALL_NAME(getresuid);
+#endif
 #ifdef __NR_ioctl
         CASE_SYSCALL_NAME(ioctl);
+#endif
+#ifdef __NR_kcmp
+        CASE_SYSCALL_NAME(kcmp);
 #endif
 #ifdef __NR_link
         CASE_SYSCALL_NAME(link);
@@ -633,14 +676,23 @@ static char const* syscall_name(long syscall_number)
 #ifdef __NR_socket
         CASE_SYSCALL_NAME(socket);
 #endif
+#ifdef __NR_stat
+        CASE_SYSCALL_NAME(stat);
+#endif
 #ifdef __NR_statx
         CASE_SYSCALL_NAME(statx);
+#endif
+#ifdef __NR_symlink
+        CASE_SYSCALL_NAME(symlink);
 #endif
 #ifdef __NR_unlink
         CASE_SYSCALL_NAME(unlink);
 #endif
 #ifdef __NR_unlinkat
         CASE_SYSCALL_NAME(unlinkat);
+#endif
+#ifdef __NR_utimensat
+        CASE_SYSCALL_NAME(utimensat);
 #endif
     default:
         return "unknown";
@@ -788,6 +840,7 @@ void SeccompPolicy::allow_filesystem_metadata_queries()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, newfstatat);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, readlink);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, readlinkat);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, stat);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, statx);
 }
 
@@ -804,10 +857,15 @@ void SeccompPolicy::allow_filesystem_writes()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, renameat2);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, mkdir);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, mkdirat);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, symlink);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, rmdir);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fsync);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fdatasync);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fallocate);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, flock);
+    // NB: Mesa's shader disk cache updates entry mtimes for LRU eviction, and glibc routes the
+    //     whole utime() family through utimensat() on modern kernels.
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, utimensat);
 
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
     append(SECCOMP_LOAD_ARGUMENT(1));
@@ -993,6 +1051,14 @@ void SeccompPolicy::allow_network()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, accept);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, accept4);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, shutdown);
+
+    // Required by glibc's if_nametoindex() when resolving IPv6 link-local nameserver scopes.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIOCGIFINDEX, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
 }
 
 void SeccompPolicy::allow_memory_without_executable_mappings()
@@ -1137,6 +1203,11 @@ void SeccompPolicy::allow_gpu_device_operations()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_ctl);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_wait);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_pwait);
+
+#ifdef __NR_kcmp
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_kcmp, 0, 1));
+    append(SECCOMP_ERRNO(ENOSYS));
+#endif
 }
 
 void SeccompPolicy::allow_process_metadata()
@@ -1147,6 +1218,8 @@ void SeccompPolicy::allow_process_metadata()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, geteuid);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getgid);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getegid);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getresgid);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getresuid);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getrandom);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, gettimeofday);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getrlimit);

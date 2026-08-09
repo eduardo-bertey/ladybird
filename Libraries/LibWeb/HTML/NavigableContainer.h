@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Utf16String.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/InitialInsertion.h>
@@ -18,14 +19,14 @@ class WEB_API NavigableContainer : public HTMLElement {
 public:
     static constexpr bool OVERRIDES_FINALIZE = true;
 
-    static GC::Ptr<NavigableContainer> navigable_container_with_content_navigable(GC::Ref<Navigable> navigable);
+    static GC::Ptr<NavigableContainer> navigable_container_with_content_navigable(GC::Ref<LocalNavigable> navigable);
 
     virtual ~NavigableContainer() override;
 
     static HashTable<NavigableContainer*>& all_instances();
 
     GC::Ptr<Navigable> content_navigable() { return m_content_navigable; }
-    GC::Ptr<Navigable const> content_navigable() const { return m_content_navigable.ptr(); }
+    GC::Ptr<Navigable const> content_navigable() const { return m_content_navigable; }
 
     DOM::Document const* content_document() const;
     DOM::Document const* content_document_without_origin_check() const;
@@ -52,7 +53,7 @@ protected:
     Optional<URL::URL> shared_attribute_processing_steps_for_iframe_and_frame(InitialInsertion initial_insertion);
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#navigate-an-iframe-or-frame
-    void navigate_an_iframe_or_frame(URL::URL url, ReferrerPolicy::ReferrerPolicy referrer_policy, Optional<String> srcdoc_string = {}, InitialInsertion = InitialInsertion::No);
+    void navigate_an_iframe_or_frame(URL::URL url, ReferrerPolicy::ReferrerPolicy referrer_policy, Optional<Utf16String> srcdoc_string = {}, InitialInsertion = InitialInsertion::No);
 
     void create_new_child_navigable();
 

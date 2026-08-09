@@ -9,6 +9,7 @@
 
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibGC/Cell.h>
 #include <LibGC/Ptr.h>
 #include <LibGfx/Forward.h>
@@ -23,7 +24,7 @@ namespace Web::CSS {
 
 class WEB_API Length {
 public:
-    struct FontMetrics {
+    struct WEB_API FontMetrics {
         FontMetrics(CSSPixels font_size, Gfx::FontPixelMetrics const&, CSSPixels line_height);
 
         CSSPixels font_size;
@@ -52,17 +53,15 @@ public:
     bool is_font_relative() const { return CSS::is_font_relative(m_unit); }
     bool is_container_relative() const { return CSS::is_container_relative(m_unit); }
     bool is_viewport_relative() const { return CSS::is_viewport_relative(m_unit); }
-    bool is_relative() const { return CSS::is_relative(m_unit); }
-    bool is_computationally_independent() const { return !is_font_relative() && !is_container_relative(); }
 
     double raw_value() const { return m_value; }
     LengthUnit unit() const { return m_unit; }
-    FlyString unit_name() const { return CSS::to_string(m_unit); }
+    Utf16FlyString unit_name() const { return CSS::to_string(m_unit); }
 
     struct ResolutionContext {
         [[nodiscard]] static ResolutionContext for_document(DOM::Document const&);
         [[nodiscard]] static ResolutionContext for_element(DOM::AbstractElement const&);
-        [[nodiscard]] static ResolutionContext for_layout_node(Layout::Node const&);
+        [[nodiscard]] static ResolutionContext for_layout_node(Layout::NodeWithStyle const&);
 
         CSSPixelRect viewport_rect;
         FontMetrics font_metrics;
@@ -77,6 +76,11 @@ public:
         void set_did_resolve_viewport_relative_length(bool& did_resolve_viewport_relative_length) const
         {
             m_did_resolve_viewport_relative_length = &did_resolve_viewport_relative_length;
+        }
+
+        [[nodiscard]] bool* viewport_metric_dependency_flag() const
+        {
+            return m_did_resolve_viewport_relative_length;
         }
 
         void record_viewport_relative_length_resolution() const
@@ -132,7 +136,7 @@ public:
 
     [[nodiscard]] CSSPixels to_px(ResolutionContext const&) const;
 
-    [[nodiscard]] ALWAYS_INLINE CSSPixels to_px(Layout::Node const& node) const
+    [[nodiscard]] ALWAYS_INLINE CSSPixels to_px(Layout::NodeWithStyle const& node) const
     {
         if (is_absolute())
             return absolute_length_to_px();
@@ -188,6 +192,7 @@ public:
     }
 
     void serialize(StringBuilder&, SerializationMode = SerializationMode::Normal) const;
+    void serialize(Utf16StringBuilder&, SerializationMode = SerializationMode::Normal) const;
     String to_string(SerializationMode = SerializationMode::Normal) const;
 
     bool operator==(Length const& other) const
@@ -206,16 +211,14 @@ public:
 
     static Length from_style_value(NonnullRefPtr<StyleValue const> const&, Optional<Length> percentage_basis);
 
-    static Length resolve_calculated(NonnullRefPtr<CalculatedStyleValue const> const&, Layout::Node const&, Length const& reference_value);
-    static Length resolve_calculated(NonnullRefPtr<CalculatedStyleValue const> const&, Layout::Node const&, CSSPixels reference_value);
-
 private:
-    [[nodiscard]] CSSPixels to_px_slow_case(Layout::Node const&) const;
+    [[nodiscard]] CSSPixels to_px_slow_case(Layout::NodeWithStyle const&) const;
 
     LengthUnit m_unit;
     double m_value { 0 };
 };
 
+// FIXME: This should be CSSPixelsOrAuto since it's only used after computation when lengths have been absolutized
 class LengthOrAuto {
 public:
     LengthOrAuto(Length length)
@@ -246,15 +249,12 @@ public:
         return builder.to_string_without_validation();
     }
 
-    CSSPixels to_px_or_zero(Layout::Node const& node) const
+    CSSPixels to_px_or_zero() const
     {
         if (is_auto())
             return 0;
-        return m_length->to_px(node);
+        return m_length->absolute_length_to_px();
     }
-
-    bool is_font_relative() const { return m_length.has_value() && m_length->is_font_relative(); }
-    bool is_computationally_independent() const { return !m_length.has_value() || m_length->is_computationally_independent(); }
 
     bool operator==(LengthOrAuto const&) const = default;
 
@@ -266,6 +266,9 @@ private:
 
     Optional<Length> m_length;
 };
+
+double ratio_between_font_relative_unit_and_px(LengthUnit font_relative_unit, Length::FontMetrics const& font_metrics, Length::FontMetrics const& root_font_metrics);
+double ratio_between_viewport_relative_unit_and_px(LengthUnit viewport_relative_unit, CSSPixelRect const& viewport_rect);
 
 }
 

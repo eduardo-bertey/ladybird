@@ -10,6 +10,7 @@
 #include <LibCore/File.h>
 #include <LibCore/MimeData.h>
 #include <LibCore/Notifier.h>
+#include <LibCore/System.h>
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibHTTP/Cache/Utilities.h>
 #include <LibHTTP/Status.h>
@@ -25,6 +26,12 @@ namespace RequestServer {
 extern OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
 
 static long s_connect_timeout_seconds = 90L;
+
+Request::TransferredBodyFile::~TransferredBodyFile()
+{
+    if (fd != -1)
+        (void)Core::System::close(fd);
+}
 
 static void log_network_activity(URL::URL const& url, ByteString const& method, void* curl_easy_handle, int curl_result_code, bool is_revalidation, RequestType type)
 {
@@ -368,10 +375,13 @@ NonnullOwnPtr<Request> Request::fetch(
     NonnullRefPtr<HTTP::HeaderList> request_headers,
     ByteBuffer request_body,
     HTTP::Cookie::IncludeCredentials include_credentials,
-    ByteString alt_svc_cache_path,
-    Core::ProxyData proxy_data)
+    Optional<ByteString> alt_svc_cache_path,
+    Core::ProxyData proxy_data,
+    bool keep_alive_for_transfer,
+    Optional<u32> address_selection_hint)
 {
-    auto request = adopt_own(*new Request { request_id, RequestType::Fetch, disk_cache, cache_mode, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, move(alt_svc_cache_path), proxy_data });
+    auto request = adopt_own(*new Request { request_id, RequestType::Fetch, disk_cache, cache_mode, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, move(alt_svc_cache_path), proxy_data, keep_alive_for_transfer });
+    request->m_address_selection_hint = address_selection_hint;
     request->process();
 
     return request;
@@ -402,7 +412,7 @@ NonnullOwnPtr<Request> Request::revalidate(
     NonnullRefPtr<HTTP::HeaderList> request_headers,
     ByteBuffer request_body,
     HTTP::Cookie::IncludeCredentials include_credentials,
-    ByteString alt_svc_cache_path,
+    Optional<ByteString> alt_svc_cache_path,
     Core::ProxyData proxy_data)
 {
     auto request = adopt_own(*new Request { request_id, RequestType::BackgroundRevalidation, disk_cache, HTTP::CacheMode::Default, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, move(alt_svc_cache_path), proxy_data });
@@ -424,13 +434,14 @@ Request::Request(
     NonnullRefPtr<HTTP::HeaderList> request_headers,
     ByteBuffer request_body,
     HTTP::Cookie::IncludeCredentials include_credentials,
-    ByteString alt_svc_cache_path,
-    Core::ProxyData proxy_data)
+    Optional<ByteString> alt_svc_cache_path,
+    Core::ProxyData proxy_data,
+    bool keep_alive_for_transfer)
     : m_request_id(request_id)
     , m_type(type)
     , m_disk_cache(disk_cache)
     , m_cache_mode(cache_mode)
-    , m_client(client)
+    , m_client(&client)
     , m_curl_multi_handle(curl_multi)
     , m_resolver(resolver)
     , m_url(move(url))
@@ -441,6 +452,7 @@ Request::Request(
     , m_alt_svc_cache_path(move(alt_svc_cache_path))
     , m_proxy_data(proxy_data)
     , m_response_headers(HTTP::HeaderList::create())
+    , m_keep_alive_for_transfer(keep_alive_for_transfer)
 {
     if constexpr (REQUESTSERVER_WIRE_DEBUG)
         wire_stats().ensure(this).created_at = MonotonicTime::now();
@@ -454,7 +466,7 @@ Request::Request(
     URL::URL url)
     : m_request_id(request_id)
     , m_type(RequestType::Connect)
-    , m_client(client)
+    , m_client(&client)
     , m_curl_multi_handle(curl_multi)
     , m_resolver(resolver)
     , m_url(move(url))
@@ -467,12 +479,16 @@ Request::Request(
 
 Request::~Request()
 {
-    if (!m_response_buffer.is_eof())
-        dbgln("Warning: Request destroyed with buffered data (it's likely that the client disappeared or the request was cancelled)");
+    if constexpr (REQUESTSERVER_DEBUG) {
+        if (!m_response_buffer.is_eof())
+            dbgln("Warning: Request destroyed with buffered data (it's likely that the client disappeared or the request was cancelled)");
+    }
 
     if (m_curl_easy_handle) {
-        auto result = curl_multi_remove_handle(m_curl_multi_handle, m_curl_easy_handle);
-        VERIFY(result == CURLM_OK);
+        if (m_curl_easy_handle_is_in_multi) {
+            auto result = curl_multi_remove_handle(m_curl_multi_handle, m_curl_easy_handle);
+            VERIFY(result == CURLM_OK);
+        }
 
         curl_easy_cleanup(m_curl_easy_handle);
     }
@@ -520,7 +536,7 @@ void Request::notify_fetch_complete(Badge<ConnectionFromClient>, int result_code
     }
 
     if (is_revalidation_request()) {
-        if (acquire_status_code() == 304) {
+        if (result_code == CURLE_OK && acquire_status_code() == 304) {
             if (m_type == RequestType::BackgroundRevalidation && m_disk_cache->mode() == HTTP::DiskCache::Mode::Testing)
                 m_response_headers->set({ HTTP::TEST_CACHE_REVALIDATION_STATUS_HEADER, "fresh"sv });
 
@@ -532,7 +548,12 @@ void Request::notify_fetch_complete(Badge<ConnectionFromClient>, int result_code
         if (revalidation_failed().is_error())
             return;
 
-        transfer_headers_to_client_if_needed();
+        // Only forward the response to the client if the network request actually produced one. If the request failed
+        // at the transport level (e.g. connection refused), there's no response; fall through so the request completes
+        // with a network error — exactly like a non-revalidation request whose connection failed. Otherwise, the client
+        // would receive an empty response with HTTP status 0 — and then wait forever for a body that will never arrive.
+        if (result_code == CURLE_OK)
+            transfer_headers_to_client_if_needed();
     }
 
     m_curl_result_code = result_code;
@@ -611,7 +632,7 @@ void Request::handle_initial_state()
 
                     if (m_cache_entry_reader.has_value()) {
                         if (m_cache_entry_reader->revalidation_type() == HTTP::CacheEntryReader::RevalidationType::StaleWhileRevalidate)
-                            m_client.start_revalidation_request({}, m_method, m_url, m_request_headers, m_request_body, m_include_credentials, m_proxy_data);
+                            m_client->start_revalidation_request({}, m_method, m_url, m_request_headers, m_request_body, m_include_credentials, m_proxy_data);
 
                         if (is_revalidation_request())
                             transition_to_state(State::DNSLookup);
@@ -696,10 +717,20 @@ void Request::handle_read_cache_state()
     }
 
     auto file = body_file.release_value();
+    m_transferred_body_file.emplace();
+    m_transferred_body_file->fd = file.fd;
+    m_transferred_body_file->offset = file.offset;
+    m_transferred_body_file->size = file.size;
+
     m_bytes_transferred_to_client = file.size;
     m_curl_result_code = CURLE_OK;
 
-    m_client.async_request_body_file_available(m_request_id, IPC::File::adopt_fd(file.fd), file.offset, file.size);
+    if (send_transferred_body_file_to_client().is_error()) {
+        m_network_error = Requests::NetworkError::CacheReadFailed;
+        transition_to_state(State::Error);
+        return;
+    }
+
     m_cache_entry_reader.clear();
 
     transition_to_state(State::Complete);
@@ -830,7 +861,7 @@ void Request::handle_retrieve_cookie_state()
 
     if (auto connection = ConnectionFromClient::primary_connection(); connection.has_value()) {
         mark_lifecycle_event(this, &WireStats::cookie_started_at);
-        connection->async_retrieve_http_cookie(m_client.client_id(), m_request_id, m_type, m_url);
+        connection->async_retrieve_http_cookie(m_client->client_id(), m_request_id, m_type, m_url, m_client->is_private());
     } else {
         m_network_error = Requests::NetworkError::RequestServerDied;
         transition_to_state(State::Error);
@@ -872,6 +903,7 @@ void Request::handle_connect_state()
     mark_lifecycle_event(this, &WireStats::curl_added_at);
     auto result = curl_multi_add_handle(m_curl_multi_handle, m_curl_easy_handle);
     VERIFY(result == CURLM_OK);
+    m_curl_easy_handle_is_in_multi = true;
 }
 
 void Request::handle_fetch_state()
@@ -908,8 +940,9 @@ void Request::handle_fetch_state()
     set_option(CURLOPT_URL, m_url.to_byte_string().characters());
     set_option(CURLOPT_PORT, m_url.port_or_default());
     set_option(CURLOPT_CONNECTTIMEOUT, s_connect_timeout_seconds);
-    set_option(CURLOPT_PIPEWAIT, 1L);
-    set_option(CURLOPT_ALTSVC, m_alt_svc_cache_path.characters());
+
+    if (m_alt_svc_cache_path.has_value())
+        set_option(CURLOPT_ALTSVC, m_alt_svc_cache_path->characters());
 
     set_option(CURLOPT_CUSTOMREQUEST, m_method.characters());
     set_option(CURLOPT_FOLLOWLOCATION, 0);
@@ -995,9 +1028,24 @@ void Request::handle_fetch_state()
         VERIFY_NOT_REACHED();
     }
 
+    // CURLOPT_CONNECT_TO pins this handle without poisoning the shared CURLOPT_RESOLVE host cache.
+    if (m_address_selection_hint.has_value() && DNSInfo::the().uses_configured_dns_server()) {
+        auto connect_to = build_curl_connect_to_entry(*m_dns_result, m_url.serialized_host(), m_url.port_or_default(), *m_address_selection_hint);
+
+        if (connect_to.has_value()) {
+            if (curl_slist* connect_to_list = curl_slist_append(nullptr, connect_to->characters())) {
+                set_option(CURLOPT_CONNECT_TO, connect_to_list);
+                m_curl_string_lists.append(connect_to_list);
+            } else {
+                VERIFY_NOT_REACHED();
+            }
+        }
+    }
+
     mark_lifecycle_event(this, &WireStats::curl_added_at);
     auto result = curl_multi_add_handle(m_curl_multi_handle, m_curl_easy_handle);
     VERIFY(result == CURLM_OK);
+    m_curl_easy_handle_is_in_multi = true;
 }
 
 void Request::handle_complete_state()
@@ -1043,9 +1091,9 @@ void Request::handle_complete_state()
         }
 
         if (cached_body_file.has_value())
-            m_client.async_request_cached_body_file_available(m_request_id, IPC::File::adopt_fd(cached_body_file->fd), cached_body_file->offset, cached_body_file->size);
+            m_client->async_request_cached_body_file_available(m_request_id, IPC::File::adopt_fd(cached_body_file->fd), cached_body_file->offset, cached_body_file->size);
 
-        m_client.async_request_finished(m_request_id, m_bytes_transferred_to_client, timing_info, m_network_error);
+        m_client->async_request_finished(m_request_id, m_bytes_transferred_to_client, timing_info, m_network_error);
     }
 
     if (m_cache_entry_writer.has_value()) {
@@ -1053,17 +1101,17 @@ void Request::handle_complete_state()
         m_cache_entry_writer.clear();
     }
 
-    m_client.request_complete({}, *this);
+    m_client->request_complete({}, *this);
 }
 
 void Request::handle_error_state()
 {
     if (m_type == RequestType::Fetch) {
         // FIXME: Implement timing info for failed requests.
-        m_client.async_request_finished(m_request_id, m_bytes_transferred_to_client, {}, m_network_error.value_or(Requests::NetworkError::Unknown));
+        m_client->async_request_finished(m_request_id, m_bytes_transferred_to_client, {}, m_network_error.value_or(Requests::NetworkError::Unknown));
     }
 
-    m_client.request_complete({}, *this);
+    m_client->request_complete({}, *this);
 }
 
 size_t Request::on_header_received(void* buffer, size_t size, size_t nmemb, void* user_data)
@@ -1085,7 +1133,7 @@ size_t Request::on_header_received(void* buffer, size_t size, size_t nmemb, void
                 auto decoder = TextCodec::decoder_for_exact_name("ISO-8859-1"sv);
                 VERIFY(decoder.has_value());
 
-                request.m_reason_phrase = MUST(decoder->to_utf8(reason_phrase));
+                request.m_reason_phrase = MUST(decoder->to_utf8(reason_phrase, TextCodec::IgnoreBOM::No, TextCodec::ErrorMode::Replacement));
                 return total_size;
             }
         }
@@ -1142,6 +1190,69 @@ size_t Request::on_data_received(void* buffer, size_t size, size_t nmemb, void* 
     return total_size;
 }
 
+ErrorOr<void> Request::detach_curl_handle_from_multi()
+{
+    if (!m_curl_easy_handle)
+        return {};
+
+    if (!m_curl_easy_handle_is_in_multi)
+        return {};
+
+    auto remove_result = curl_multi_remove_handle(m_curl_multi_handle, m_curl_easy_handle);
+    if (remove_result != CURLM_OK)
+        return Error::from_string_literal("Failed to remove curl easy handle from multi handle");
+
+    m_curl_easy_handle_is_in_multi = false;
+    return {};
+}
+
+ErrorOr<void> Request::transfer_to_client(ConnectionFromClient& client, u64 request_id)
+{
+    if (m_type == RequestType::BackgroundRevalidation)
+        return Error::from_string_literal("Cannot transfer background revalidation requests");
+
+    auto was_complete = is_complete();
+    auto& previous_client = *m_client;
+    auto previous_request_id = m_request_id;
+
+    if (was_complete)
+        TRY(detach_curl_handle_from_multi());
+    else if (&previous_client != &client)
+        m_network_connection_keep_alive = &previous_client;
+
+    m_client = &client;
+    m_request_id = request_id;
+    m_keep_alive_for_transfer = false;
+
+    if (m_client_request_pipe.has_value())
+        TRY(send_request_pipe_to_client());
+
+    if (m_sent_response_headers_to_client)
+        send_headers_to_client();
+
+    if (m_transferred_body_file.has_value())
+        TRY(send_transferred_body_file_to_client());
+
+    if (was_complete) {
+        if (m_state == State::Complete)
+            m_client->async_request_finished(m_request_id, m_bytes_transferred_to_client, acquire_timing_info(), m_network_error);
+        else
+            m_client->async_request_finished(m_request_id, m_bytes_transferred_to_client, {}, m_network_error.value_or(Requests::NetworkError::Unknown));
+    } else {
+        previous_client.async_request_transferred(previous_request_id);
+    }
+
+    return {};
+}
+
+ErrorOr<void> Request::send_transferred_body_file_to_client()
+{
+    VERIFY(m_transferred_body_file.has_value());
+    auto fd = TRY(Core::System::dup(m_transferred_body_file->fd));
+    m_client->async_request_body_file_available(m_request_id, IPC::File::adopt_fd(fd), m_transferred_body_file->offset, m_transferred_body_file->size);
+    return {};
+}
+
 ErrorOr<void> Request::inform_client_request_started()
 {
     if (m_type == RequestType::BackgroundRevalidation)
@@ -1155,8 +1266,16 @@ ErrorOr<void> Request::inform_client_request_started()
     }
 
     m_client_request_pipe = request_pipe.release_value();
-    m_client.async_request_started(m_request_id, IPC::File::adopt_fd(m_client_request_pipe->reader_fd()));
+    TRY(send_request_pipe_to_client());
 
+    return {};
+}
+
+ErrorOr<void> Request::send_request_pipe_to_client()
+{
+    VERIFY(m_client_request_pipe.has_value());
+    auto reader_fd = TRY(Core::System::dup(m_client_request_pipe->reader_fd()));
+    m_client->async_request_started(m_request_id, IPC::File::adopt_fd(reader_fd));
     return {};
 }
 
@@ -1212,7 +1331,15 @@ void Request::transfer_headers_to_client_if_needed()
         javascript_bytecode_cache_vary_key = m_cache_entry_writer->vary_key();
     }
 
-    m_client.async_headers_became_available(m_request_id, m_response_headers->headers(), m_status_code, m_reason_phrase, move(javascript_bytecode), javascript_bytecode_size, javascript_bytecode_cache_vary_key);
+    send_headers_to_client(move(javascript_bytecode), javascript_bytecode_size, javascript_bytecode_cache_vary_key);
+}
+
+void Request::send_headers_to_client(Optional<IPC::File> javascript_bytecode, u64 javascript_bytecode_size, Optional<u64> javascript_bytecode_cache_vary_key)
+{
+    auto came_from_cache = m_cache_status == CacheStatus::ReadFromCache
+        ? Requests::CameFromCache::Yes
+        : Requests::CameFromCache::No;
+    m_client->async_headers_became_available(m_request_id, m_response_headers->headers(), m_status_code, m_reason_phrase, move(javascript_bytecode), javascript_bytecode_size, javascript_bytecode_cache_vary_key, came_from_cache);
 }
 
 ErrorOr<void> Request::write_queued_bytes_without_blocking()
@@ -1243,8 +1370,10 @@ ErrorOr<void> Request::write_queued_bytes_without_blocking()
         m_client_writer_notifier->set_enabled(false);
 
         m_client_writer_notifier->on_activation = weak_callback(*this, [](auto& self) {
-            if (auto result = self.write_queued_bytes_without_blocking(); result.is_error())
-                dbgln("Warning: Failed to write buffered request data (it's likely the client disappeared): {}", result.error());
+            if (auto result = self.write_queued_bytes_without_blocking(); result.is_error()) {
+                self.m_client_writer_notifier->set_enabled(false);
+                dbgln_if(REQUESTSERVER_DEBUG, "Warning: Failed to write buffered request data (it's likely the client disappeared): {}", result.error());
+            }
         });
     }
 

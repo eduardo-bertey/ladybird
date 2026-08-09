@@ -8,7 +8,8 @@
 
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Compositor/CompositorHost.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
+
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/PageHost.h>
@@ -22,24 +23,42 @@ PageHost::PageHost(ConnectionFromClient& client)
 {
 }
 
-void PageHost::initialize(u64 initial_page_id)
+void PageHost::initialize(u64 initial_page_id, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator)
 {
     VERIFY(m_pages.is_empty());
-    auto& first_page = create_page(initial_page_id);
-    Web::HTML::TraversableNavigable::create_a_fresh_top_level_traversable(first_page.page(), URL::about_blank());
+    m_cross_process_id_allocator = cross_process_id_allocator;
+    auto& first_page = create_page(initial_page_id, root_navigable_id);
+    Web::HTML::LocalTraversableNavigable::create_a_fresh_top_level_traversable(first_page.page(), URL::about_blank());
 }
 
-PageClient& PageHost::create_page(u64 page_id)
+PageClient& PageHost::create_page(u64 page_id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id)
 {
     VERIFY(page_id > 0);
     VERIFY(!m_pages.contains(page_id));
-    m_pages.set(page_id, PageClient::create(Web::Bindings::main_thread_vm(), *this, page_id));
+    m_pages.set(page_id, PageClient::create(Web::Bindings::main_thread_vm(), *this, page_id, pending_root_navigable_id));
     return *m_pages.get(page_id).value();
+}
+
+Web::HTML::CrossProcessId PageHost::allocate_cross_process_id()
+{
+    VERIFY(m_cross_process_id_allocator.has_value());
+    return m_cross_process_id_allocator->allocate();
+}
+
+Web::HTML::CrossProcessId PageHost::allocate_navigable_id()
+{
+    return allocate_cross_process_id();
 }
 
 void PageHost::remove_page(Badge<PageClient>, u64 page_id)
 {
     m_pages.remove(page_id);
+}
+
+void PageHost::close_webdriver_connections_after_sending_pending_messages()
+{
+    for (auto& page : m_pages)
+        page.value->close_webdriver_connection_after_sending_pending_messages();
 }
 
 Optional<PageClient&> PageHost::page(u64 page_id)

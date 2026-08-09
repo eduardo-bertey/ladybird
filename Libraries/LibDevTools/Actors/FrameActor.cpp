@@ -24,6 +24,34 @@
 
 namespace DevTools {
 
+static JsonArray serialize_frame_list(WeakPtr<TabActor> const& tab_actor)
+{
+    JsonArray frames;
+
+    if (auto tab = tab_actor.strong_ref()) {
+        JsonObject frame;
+        frame.set("id"sv, tab->description().id);
+        frame.set("title"sv, tab->description().title);
+        frame.set("url"sv, tab->description().url);
+        frames.must_append(move(frame));
+    }
+
+    return frames;
+}
+
+static void set_resources_available_message(JsonObject& message, StringView resource_type, JsonArray resources)
+{
+    JsonArray resource;
+    resource.must_append(resource_type);
+    resource.must_append(move(resources));
+
+    JsonArray array;
+    array.must_append(move(resource));
+
+    message.set("type"sv, "resources-available-array"sv);
+    message.set("array"sv, move(array));
+}
+
 NonnullRefPtr<FrameActor> FrameActor::create(DevToolsServer& devtools, String name, WeakPtr<TabActor> tab, WeakPtr<WatcherActor> watcher, WeakPtr<CSSPropertiesActor> css_properties, WeakPtr<ConsoleActor> console, WeakPtr<InspectorActor> inspector, WeakPtr<StyleSheetsActor> style_sheets, WeakPtr<ThreadActor> thread, WeakPtr<AccessibilityActor> accessibility)
 {
     return adopt_ref(*new FrameActor(devtools, move(name), move(tab), move(watcher), move(css_properties), move(console), move(inspector), move(style_sheets), move(thread), move(accessibility)));
@@ -150,8 +178,17 @@ void FrameActor::handle_message(Message const& message)
     }
 
     if (message.type == "listFrames"sv) {
+        response.set("frames"sv, serialize_frame_list(m_tab));
         send_response(message, move(response));
         send_pending_navigation_document_events_after_target_switch();
+        return;
+    }
+
+    if (message.type == "listWorkers"sv) {
+        // FIXME: Return dedicated, shared, and service worker targets once
+        //        Ladybird exposes worker targets to DevTools.
+        response.set("workers"sv, JsonArray {});
+        send_response(message, move(response));
         return;
     }
 
@@ -160,19 +197,9 @@ void FrameActor::handle_message(Message const& message)
 
 void FrameActor::send_frame_update_message()
 {
-    JsonArray frames;
-
-    if (auto tab_actor = m_tab.strong_ref()) {
-        JsonObject frame;
-        frame.set("id"sv, tab_actor->description().id);
-        frame.set("title"sv, tab_actor->description().title);
-        frame.set("url"sv, tab_actor->description().url);
-        frames.must_append(move(frame));
-    }
-
     JsonObject message;
     message.set("type"sv, "frameUpdate"sv);
-    message.set("frames"sv, move(frames));
+    message.set("frames"sv, serialize_frame_list(m_tab));
     send_message(move(message));
 }
 
@@ -263,14 +290,16 @@ void FrameActor::style_sheets_available(JsonObject& response, Vector<Web::CSS::S
         if (style_sheet.url.has_value()) {
             if (style_sheet.type == Web::CSS::StyleSheetIdentifier::Type::UserAgent) {
                 // LibWeb sets the URL to a style sheet name for UA style sheets. DevTools would reject these invalid URLs.
-                href = MUST(String::formatted("resource://{}", style_sheet.url.value()));
-                title = *style_sheet.url;
+                auto style_sheet_url = style_sheet.url->to_utf8();
+                href = MUST(String::formatted("resource://{}", style_sheet_url));
+                title = move(style_sheet_url);
                 source_map_base_url = tab_url;
             } else if (style_sheet.type == Web::CSS::StyleSheetIdentifier::Type::StyleElement) {
-                source_map_base_url = *style_sheet.url;
+                source_map_base_url = style_sheet.url->to_utf8();
             } else {
-                href = *style_sheet.url;
-                source_map_base_url = *style_sheet.url;
+                auto style_sheet_url = style_sheet.url->to_utf8();
+                href = style_sheet_url;
+                source_map_base_url = move(style_sheet_url);
             }
         } else {
             source_map_base_url = tab_url;
@@ -306,6 +335,36 @@ void FrameActor::style_sheets_available(JsonObject& response, Vector<Web::CSS::S
     response.set("array"sv, move(array));
 
     style_sheets_actor->set_style_sheets(move(style_sheets));
+}
+
+void FrameActor::send_source_resource_available_message()
+{
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    devtools().delegate().retrieve_sources(tab->description(),
+        async_handler<FrameActor>({}, [](auto& self, auto sources, auto& response) {
+            auto thread = self.m_thread.strong_ref();
+            if (!thread)
+                return;
+
+            set_resources_available_message(response, "source"sv, thread->serialize_sources(sources));
+        }));
+}
+
+void FrameActor::send_source_resource_available_message(Web::HTML::ScriptRegistry::Description const& source)
+{
+    auto thread = m_thread.strong_ref();
+    if (!thread)
+        return;
+
+    JsonArray serialized_sources;
+    serialized_sources.must_append(thread->serialize_source(source));
+
+    JsonObject message;
+    set_resources_available_message(message, "source"sv, move(serialized_sources));
+    send_message(move(message));
 }
 
 void FrameActor::on_console_message(WebView::ConsoleOutput console_output)
@@ -443,6 +502,11 @@ void FrameActor::on_network_request_started(DevToolsDelegate::NetworkRequestData
 {
     auto& actor = devtools().register_actor<NetworkEventActor>(data.request_id);
     actor.set_request_info(move(data.url), move(data.method), data.start_time, move(data.request_headers), move(data.request_body), move(data.initiator_type));
+    if (auto tab = m_tab.strong_ref())
+        actor.set_browsing_context_ids(tab->description().id, tab->inner_window_id());
+    actor.set_referrer_policy(move(data.referrer_policy));
+    actor.set_is_navigation_request(data.is_navigation_request);
+    actor.set_priority(data.priority);
     m_network_events.set(data.request_id, actor);
 
     JsonArray events;
@@ -469,6 +533,8 @@ void FrameActor::on_network_response_headers_received(DevToolsDelegate::NetworkR
 
     auto& actor = *it->value;
     actor.set_response_start(data.status_code, data.reason_phrase);
+    auto loaded_from_cache = data.came_from_cache == Requests::CameFromCache::Yes;
+    actor.set_loaded_from_cache(loaded_from_cache);
 
     // Extract Content-Type before moving headers
     String mime_type;
@@ -487,6 +553,7 @@ void FrameActor::on_network_response_headers_received(DevToolsDelegate::NetworkR
     resource_updates.set("statusText"sv, data.reason_phrase.value_or(String {}));
     resource_updates.set("headersSize"sv, headers_size);
     resource_updates.set("mimeType"sv, mime_type);
+    resource_updates.set("fromCache"sv, loaded_from_cache);
     // FIXME: Get actual HTTP version from response
     resource_updates.set("httpVersion"sv, "HTTP/1.1"sv);
     // FIXME: Get actual remote address and port from connection
@@ -501,8 +568,8 @@ void FrameActor::on_network_response_headers_received(DevToolsDelegate::NetworkR
     update_entry.set("resourceId"sv, static_cast<i64>(data.request_id));
     update_entry.set("resourceType"sv, "network-event"sv);
     update_entry.set("resourceUpdates"sv, move(resource_updates));
-    update_entry.set("browsingContextID"sv, 1);
-    update_entry.set("innerWindowId"sv, 1);
+    update_entry.set("browsingContextID"sv, actor.browsing_context_id());
+    update_entry.set("innerWindowId"sv, actor.inner_window_id());
 
     JsonArray updates;
     updates.must_append(move(update_entry));
@@ -554,8 +621,8 @@ void FrameActor::on_network_request_finished(DevToolsDelegate::NetworkRequestCom
     update_entry.set("resourceId"sv, static_cast<i64>(data.request_id));
     update_entry.set("resourceType"sv, "network-event"sv);
     update_entry.set("resourceUpdates"sv, move(resource_updates));
-    update_entry.set("browsingContextID"sv, 1);
-    update_entry.set("innerWindowId"sv, 1);
+    update_entry.set("browsingContextID"sv, actor.browsing_context_id());
+    update_entry.set("innerWindowId"sv, actor.inner_window_id());
 
     JsonArray updates;
     updates.must_append(move(update_entry));

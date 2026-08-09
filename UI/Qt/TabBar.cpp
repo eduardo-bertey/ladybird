@@ -59,10 +59,10 @@
 namespace Ladybird {
 
 static constexpr auto LADYBIRD_TAB_MIME_TYPE = "application/x-ladybird-tab";
-static constexpr int HORIZONTAL_TAB_STRIP_HEIGHT = 44;
-static constexpr int HORIZONTAL_TAB_HEIGHT = 38;
+static constexpr int HORIZONTAL_TAB_STRIP_HEIGHT = 42;
+static constexpr int HORIZONTAL_TAB_HEIGHT = 36;
 static constexpr int HORIZONTAL_TAB_MIN_WIDTH = 128;
-static constexpr int HORIZONTAL_TAB_MAX_WIDTH = 240;
+static constexpr int HORIZONTAL_TAB_MAX_WIDTH = 232;
 static constexpr int VERTICAL_TAB_HEIGHT = 38;
 static constexpr int VERTICAL_TABS_COLLAPSED_WIDTH = browser_chrome_layout_policy().collapsed_sidebar_width;
 static constexpr int VERTICAL_TABS_DEFAULT_EXPANDED_WIDTH = browser_chrome_layout_policy().expanded_sidebar_width;
@@ -91,6 +91,7 @@ static constexpr auto COLLAPSED_VERTICAL_TAB_BUTTON_PROPERTY = "collapsedVertica
 static constexpr auto FULL_WIDTH_TOOLBAR_PROPERTY = "fullWidthToolbar";
 static constexpr auto VERTICAL_TABS_EXPANDED_PROPERTY = "verticalTabsExpanded";
 static constexpr auto VERTICAL_TABS_BUTTON_PROPERTY = "verticalTabsButton";
+static constexpr auto VERTICAL_TABS_POSITION_PROPERTY = "verticalTabsPosition";
 static constexpr auto VERTICAL_TABS_RESIZE_HANDLE_HOVERED_PROPERTY = "hovered";
 static constexpr auto VERTICAL_TABS_RESIZE_HANDLE_ACTIVE_PROPERTY = "active";
 
@@ -110,10 +111,25 @@ static QPointer<Tab> s_active_tab_dragged_tab;
 static QPointer<TabWidget> s_pending_tab_drop_target;
 static int s_pending_tab_drop_index { -1 };
 
-static bool window_uses_client_side_decorations(QWidget& widget)
+static bool window_has_chrome_in_titlebar(QWidget& widget)
 {
     auto* top_level_window = qobject_cast<BrowserWindow*>(widget.window());
-    return !top_level_window || top_level_window->uses_client_side_decorations();
+    return !top_level_window || top_level_window->has_chrome_in_titlebar();
+}
+
+static bool target_can_accept_tab_drop(QWidget& target, QDropEvent& event)
+{
+    if (!s_active_tab_drag_source)
+        return false;
+    if (!event.mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE))
+        return false;
+
+    auto* source_window = qobject_cast<BrowserWindow*>(s_active_tab_drag_source->window());
+    auto* target_window = qobject_cast<BrowserWindow*>(target.window());
+    if (!source_window || !target_window)
+        return false;
+
+    return source_window->is_private() == target_window->is_private();
 }
 
 static QPainterPath tab_shape_path(QRectF const& rect, qreal top_radius, qreal bottom_radius)
@@ -162,6 +178,17 @@ static constexpr int vertical_tab_width(int available_width, TabLayout tab_layou
 static constexpr int clamp_vertical_tabs_expanded_width(int width)
 {
     return clamp(width, VERTICAL_TABS_MIN_EXPANDED_WIDTH, VERTICAL_TABS_MAX_EXPANDED_WIDTH);
+}
+
+static char const* vertical_tabs_position_property_value(WebView::VerticalTabsPosition position)
+{
+    switch (position) {
+    case WebView::VerticalTabsPosition::Left:
+        return "left";
+    case WebView::VerticalTabsPosition::Right:
+        return "right";
+    }
+    VERIFY_NOT_REACHED();
 }
 
 static QRectF tab_card_shape_rect(QRectF const& rect)
@@ -232,11 +259,6 @@ public:
     }
 
 private:
-    bool is_hovered() const
-    {
-        return rect().contains(mapFromGlobal(QCursor::pos()));
-    }
-
     virtual void enterEvent(QEnterEvent* event) override
     {
         QToolButton::enterEvent(event);
@@ -269,7 +291,7 @@ private:
                       ? horizontal_new_tab_button_shape_rect(QRectF(rect()))
                       : QRectF(rect()).adjusted(4.0, 3.0, -4.0, -3.0));
         auto tab_path = tab_shape_path(shape_rect, 9.0, 9.0);
-        auto hovered = is_hovered();
+        auto hovered = underMouse();
 
         if (isDown()) {
             painter.setBrush(ChromeStyle::chrome_surface_pressed(palette()));
@@ -529,13 +551,25 @@ void TabBar::set_tab_layout(TabLayout tab_layout)
         setUsesScrollButtons(true);
         set_vertical_scroll_offset(0);
     } else {
-        setShape(QTabBar::RoundedWest);
+        setShape(vertical_tabs_are_on_right() ? QTabBar::RoundedEast : QTabBar::RoundedWest);
         setMinimumSize({ 0, 0 });
         setMaximumWidth(QWIDGETSIZE_MAX);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
         setUsesScrollButtons(false);
     }
 
+    refresh_tab_layout();
+}
+
+void TabBar::set_vertical_tabs_position(WebView::VerticalTabsPosition position)
+{
+    if (m_vertical_tabs_position == position)
+        return;
+
+    m_vertical_tabs_position = position;
+    if (m_tab_layout != TabLayout::Horizontal)
+        setShape(vertical_tabs_are_on_right() ? QTabBar::RoundedEast : QTabBar::RoundedWest);
+    hide_tab_preview();
     refresh_tab_layout();
 }
 
@@ -770,13 +804,14 @@ void TabBar::contextMenuEvent(QContextMenuEvent* event)
     if (tab_index < 0)
         return;
 
+    m_pressed_tab = nullptr;
     if (auto* tab = m_tab_widget->tab(tab_index))
         tab->context_menu()->exec(event->globalPos());
 }
 
 void TabBar::dragEnterEvent(QDragEnterEvent* event)
 {
-    if (!m_tab_widget || !s_active_tab_drag_source || !event->mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE)) {
+    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event)) {
         event->ignore();
         return;
     }
@@ -795,7 +830,11 @@ void TabBar::dragLeaveEvent(QDragLeaveEvent* event)
 
 void TabBar::dragMoveEvent(QDragMoveEvent* event)
 {
-    if (!m_tab_widget || !s_active_tab_drag_source || !event->mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE)) {
+    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event)) {
+        if (m_drop_indicator_index != -1) {
+            m_drop_indicator_index = -1;
+            update();
+        }
         event->ignore();
         return;
     }
@@ -813,7 +852,11 @@ void TabBar::dragMoveEvent(QDragMoveEvent* event)
 void TabBar::dropEvent(QDropEvent* event)
 {
     hide_tab_preview();
-    if (!m_tab_widget || !s_active_tab_drag_source || !event->mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE)) {
+    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event)) {
+        if (m_drop_indicator_index != -1) {
+            m_drop_indicator_index = -1;
+            update();
+        }
         event->ignore();
         return;
     }
@@ -861,7 +904,7 @@ void TabBar::mousePressEvent(QMouseEvent* event)
     }
 
     if (tab_layout() != TabLayout::Horizontal) {
-        if (pressed_tab >= 0) {
+        if (pressed_tab >= 0 && event->button() == Qt::LeftButton) {
             setCurrentIndex(pressed_tab);
         } else if (event->button() == Qt::LeftButton && start_window_move()) {
             event->accept();
@@ -937,7 +980,7 @@ void TabBar::mouseReleaseEvent(QMouseEvent* event)
 
 void TabBar::mouseDoubleClickEvent(QMouseEvent* event)
 {
-    if (window_uses_client_side_decorations(*this) && tab_index_at(event->pos()) < 0 && event->button() == Qt::LeftButton) {
+    if (window_has_chrome_in_titlebar(*this) && tab_index_at(event->pos()) < 0 && event->button() == Qt::LeftButton) {
         toggle_window_maximized();
         event->accept();
         return;
@@ -1170,13 +1213,18 @@ QPoint TabBar::tab_preview_position_for(int index, QSize const& popup_size) cons
         if (position.y() + popup_size.height() > available_geometry.bottom())
             position.setY(mapToGlobal(QPoint { 0, tab_rect.top() }).y() - popup_size.height() - TAB_PREVIEW_CARD_GAP + TAB_PREVIEW_SHADOW_MARGIN);
     } else {
+        auto place_popup_to_right = !vertical_tabs_are_on_right();
         position = mapToGlobal(QPoint {
-            tab_rect.right() + TAB_PREVIEW_CARD_GAP - TAB_PREVIEW_SHADOW_MARGIN,
+            place_popup_to_right
+                ? tab_rect.right() + TAB_PREVIEW_CARD_GAP - TAB_PREVIEW_SHADOW_MARGIN
+                : tab_rect.left() - popup_size.width() - TAB_PREVIEW_CARD_GAP + TAB_PREVIEW_SHADOW_MARGIN,
             tab_rect.center().y() - popup_size.height() / 2,
         });
 
-        if (position.x() + popup_size.width() > available_geometry.right())
+        if (place_popup_to_right && position.x() + popup_size.width() > available_geometry.right())
             position.setX(mapToGlobal(QPoint { tab_rect.left(), 0 }).x() - popup_size.width() - TAB_PREVIEW_CARD_GAP + TAB_PREVIEW_SHADOW_MARGIN);
+        else if (!place_popup_to_right && position.x() < available_geometry.left())
+            position.setX(mapToGlobal(QPoint { tab_rect.right(), 0 }).x() + TAB_PREVIEW_CARD_GAP - TAB_PREVIEW_SHADOW_MARGIN);
     }
 
     auto minimum_x = available_geometry.left() + TAB_PREVIEW_CARD_GAP - TAB_PREVIEW_SHADOW_MARGIN;
@@ -1228,6 +1276,11 @@ int TabBar::tab_index_at(QPoint const& position) const
 QSize TabBar::vertical_size_hint(int tab_count) const
 {
     return { vertical_tab_width(m_available_width, tab_layout()), tab_count * VERTICAL_TAB_HEIGHT };
+}
+
+bool TabBar::vertical_tabs_are_on_right() const
+{
+    return m_vertical_tabs_position == WebView::VerticalTabsPosition::Right;
 }
 
 int TabBar::max_vertical_scroll_offset() const
@@ -1448,11 +1501,15 @@ TabWidget::TabWidget(QWidget* parent)
     m_new_tab_button->setToolTip("New Tab");
     m_new_tab_button->installEventFilter(this);
 
-    auto window_control_buttons = create_window_control_buttons(*this, "LadybirdTabStripWindowControls", { 18, 18 }, { 40, 40 });
-    m_window_controls = window_control_buttons.container;
-    m_minimize_window_button = window_control_buttons.minimize;
-    m_maximize_window_button = window_control_buttons.maximize;
-    m_close_window_button = window_control_buttons.close;
+    if constexpr (use_native_macos_window_controls()) {
+        m_window_controls = create_window_controls_spacer(*this, "LadybirdTabStripWindowControls", { NATIVE_MACOS_WINDOW_CONTROLS_WIDTH + NATIVE_MACOS_WINDOW_CONTROLS_GAP, HORIZONTAL_TAB_HEIGHT });
+    } else {
+        auto window_control_buttons = create_window_control_buttons(*this, "LadybirdTabStripWindowControls", { 18, 18 }, { 40, 40 });
+        m_window_controls = window_control_buttons.container;
+        m_minimize_window_button = window_control_buttons.minimize;
+        m_maximize_window_button = window_control_buttons.maximize;
+        m_close_window_button = window_control_buttons.close;
+    }
 
     recreate_icons();
 
@@ -1470,6 +1527,7 @@ TabWidget::TabWidget(QWidget* parent)
     m_vertical_tab_bar_column = new QWidget(this);
     m_vertical_tab_bar_column->setObjectName("LadybirdVerticalTabBar");
 #if defined(AK_OS_MACOS)
+    m_vertical_tab_bar_column->setAttribute(Qt::WA_DontCreateNativeAncestors);
     m_vertical_tab_bar_column->setAttribute(Qt::WA_NativeWindow);
 #endif
     m_vertical_tab_bar_column_layout = new QVBoxLayout(m_vertical_tab_bar_column);
@@ -1488,6 +1546,7 @@ TabWidget::TabWidget(QWidget* parent)
     m_vertical_tabs_resize_handle = new QWidget(this);
     m_vertical_tabs_resize_handle->setObjectName("LadybirdVerticalTabsResizeHandle");
 #if defined(AK_OS_MACOS)
+    m_vertical_tabs_resize_handle->setAttribute(Qt::WA_DontCreateNativeAncestors);
     m_vertical_tabs_resize_handle->setAttribute(Qt::WA_NativeWindow);
 #endif
     m_vertical_tabs_resize_handle->setCursor(Qt::SizeHorCursor);
@@ -1514,6 +1573,7 @@ TabWidget::TabWidget(QWidget* parent)
         m_toolbar_container->setCurrentIndex(index);
         update_vertical_tabs_overlay_geometry();
         update_vertical_tabs_resize_handle();
+        update_vertical_tabs_content_overlay();
     });
 
     connect(m_tab_bar, &QTabBar::tabCloseRequested, this, &TabWidget::tab_close_requested);
@@ -1534,15 +1594,17 @@ TabWidget::TabWidget(QWidget* parent)
         m_stacked_widget->setCurrentIndex(m_tab_bar->currentIndex());
     });
 
-    connect(m_minimize_window_button, &QToolButton::clicked, this, [this] {
-        window()->showMinimized();
-    });
-    connect(m_maximize_window_button, &QToolButton::clicked, this, [this] {
-        toggle_window_maximized();
-    });
-    connect(m_close_window_button, &QToolButton::clicked, this, [this] {
-        window()->close();
-    });
+    if constexpr (!use_native_macos_window_controls()) {
+        connect(m_minimize_window_button, &QToolButton::clicked, this, [this] {
+            window()->showMinimized();
+        });
+        connect(m_maximize_window_button, &QToolButton::clicked, this, [this] {
+            toggle_window_maximized();
+        });
+        connect(m_close_window_button, &QToolButton::clicked, this, [this] {
+            window()->close();
+        });
+    }
 }
 
 void TabWidget::add_tab(Tab* widget, QString const& label)
@@ -1558,6 +1620,7 @@ void TabWidget::insert_tab(int index, Tab* widget, QString const& label)
     m_toolbar_container->insertWidget(index, widget->toolbar_container());
 
     widget->set_vertical_tabs_enabled(m_vertical_tabs_enabled);
+    widget->set_vertical_tabs_position(m_vertical_tabs_position);
 
     update_toolbar_placement();
     update_tab_layout();
@@ -1618,6 +1681,10 @@ void TabWidget::set_tab_bar_visible(bool visible)
         return;
 
     m_tab_bar_visible = visible;
+
+    if (!m_tab_bar_visible)
+        set_vertical_tabs_hover_expanded(false);
+
     update_tab_chrome_visibility();
     update_tab_layout();
 }
@@ -1662,6 +1729,18 @@ void TabWidget::set_vertical_tabs_expand_on_hover(bool expand_on_hover)
     m_vertical_tabs_expand_on_hover = expand_on_hover;
     if (!m_vertical_tabs_expand_on_hover)
         set_vertical_tabs_hover_expanded(false);
+    rebuild_layout();
+}
+
+void TabWidget::set_vertical_tabs_position(WebView::VerticalTabsPosition position)
+{
+    if (m_vertical_tabs_position == position)
+        return;
+
+    m_vertical_tabs_position = position;
+    set_vertical_tabs_hover_expanded(false);
+    for (int index = 0; index < m_stacked_widget->count(); ++index)
+        tab(index)->set_vertical_tabs_position(position);
     rebuild_layout();
 }
 
@@ -1737,6 +1816,8 @@ bool TabWidget::eventFilter(QObject* watched, QEvent* event)
 
             auto* mouse_event = static_cast<QMouseEvent*>(event);
             auto delta = mouse_event->globalPosition().toPoint().x() - m_vertical_tabs_resize_start_global_x;
+            if (vertical_tabs_are_on_right())
+                delta = -delta;
             apply_vertical_tabs_expanded_width(m_vertical_tabs_resize_start_width + delta);
             return true;
         } else if (event->type() == QEvent::MouseButtonRelease) {
@@ -1772,7 +1853,7 @@ bool TabWidget::eventFilter(QObject* watched, QEvent* event)
         }
     }
 
-    if ((watched == m_tab_bar_row || watched == m_vertical_tab_bar_column) && window_uses_client_side_decorations(*this)) {
+    if ((watched == m_tab_bar_row || watched == m_vertical_tab_bar_column) && window_has_chrome_in_titlebar(*this)) {
         auto is_empty_chrome_area = [this, watched](QMouseEvent const& mouse_event) {
             if (watched == m_vertical_tab_bar_column) {
                 auto* child = m_vertical_tab_bar_column->childAt(mouse_event.pos());
@@ -1808,7 +1889,7 @@ void TabWidget::resizeEvent(QResizeEvent* event)
 
 void TabWidget::accept_tab_drag(QDragMoveEvent* event)
 {
-    if (!s_active_tab_drag_source || !event->mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE)) {
+    if (!target_can_accept_tab_drop(*this, *event)) {
         event->ignore();
         return;
     }
@@ -1826,7 +1907,7 @@ void TabWidget::accept_tab_drag(QDragMoveEvent* event)
 
 void TabWidget::accept_tab_drop(QDropEvent* event, int index)
 {
-    if (!s_active_tab_drag_source || !event->mimeData()->hasFormat(LADYBIRD_TAB_MIME_TYPE)) {
+    if (!target_can_accept_tab_drop(*this, *event)) {
         event->ignore();
         return;
     }
@@ -1874,11 +1955,17 @@ bool TabWidget::cursor_is_over_vertical_tabs() const
     if (m_vertical_tab_bar_column->underMouse() || m_tab_bar->underMouse() || m_new_tab_button->underMouse())
         return true;
 
+    auto vertical_tabs_x = vertical_tabs_are_on_right() ? max(0, m_vertical_tabs_content->width() - current_vertical_tabs_width()) : 0;
     auto vertical_tabs_rect = QRect {
-        m_vertical_tabs_content->mapToGlobal(QPoint { 0, 0 }),
-        QSize { current_vertical_tabs_width(), m_vertical_tabs_content->height() }
+        m_vertical_tabs_content->mapToGlobal(QPoint { vertical_tabs_x, 0 }),
+        QSize { current_vertical_tabs_width(), m_vertical_tabs_content->height() },
     };
     return window()->underMouse() && vertical_tabs_rect.contains(QCursor::pos());
+}
+
+bool TabWidget::vertical_tabs_are_on_right() const
+{
+    return m_vertical_tabs_position == WebView::VerticalTabsPosition::Right;
 }
 
 int TabWidget::vertical_tabs_layout_width() const
@@ -1922,6 +2009,7 @@ void TabWidget::rebuild_layout()
     clear_layout(*m_vertical_tab_bar_column_layout);
     clear_layout(*m_vertical_tabs_content_layout);
 
+    m_tab_bar->set_vertical_tabs_position(m_vertical_tabs_position);
     m_tab_bar->set_tab_layout(current_tab_layout());
     update_toolbar_placement();
 
@@ -1930,8 +2018,13 @@ void TabWidget::rebuild_layout()
         m_main_layout->addWidget(m_toolbar_container);
         m_page_column->hide();
 
-        m_vertical_tabs_content_layout->addWidget(m_vertical_tabs_reserved_space);
-        m_vertical_tabs_content_layout->addWidget(m_stacked_widget, 1);
+        if (vertical_tabs_are_on_right()) {
+            m_vertical_tabs_content_layout->addWidget(m_stacked_widget, 1);
+            m_vertical_tabs_content_layout->addWidget(m_vertical_tabs_reserved_space);
+        } else {
+            m_vertical_tabs_content_layout->addWidget(m_vertical_tabs_reserved_space);
+            m_vertical_tabs_content_layout->addWidget(m_stacked_widget, 1);
+        }
         m_main_layout->addWidget(m_vertical_tabs_content, 1);
         m_vertical_tabs_content->show();
     } else {
@@ -1962,19 +2055,17 @@ void TabWidget::rebuild_layout_for_horizontal_tabs()
     m_new_tab_button->setFixedSize(HORIZONTAL_TAB_HEIGHT, HORIZONTAL_TAB_HEIGHT);
     m_new_tab_button->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
 
-    if (use_left_traffic_light_window_controls()) {
+    if constexpr (use_native_macos_window_controls()) {
         m_tab_bar_row_layout->addWidget(m_window_controls, 0, Qt::AlignVCenter);
-        m_tab_bar_row_layout->addSpacing(16);
         m_tab_bar_row_layout->addWidget(m_tab_bar);
         m_tab_bar_row_layout->addWidget(m_new_tab_button, 0, Qt::AlignVCenter);
         m_tab_bar_row_layout->addStretch(1);
-        return;
+    } else {
+        m_tab_bar_row_layout->addWidget(m_tab_bar);
+        m_tab_bar_row_layout->addWidget(m_new_tab_button, 0, Qt::AlignVCenter);
+        m_tab_bar_row_layout->addStretch(1);
+        m_tab_bar_row_layout->addWidget(m_window_controls);
     }
-
-    m_tab_bar_row_layout->addWidget(m_tab_bar);
-    m_tab_bar_row_layout->addWidget(m_new_tab_button, 0, Qt::AlignVCenter);
-    m_tab_bar_row_layout->addStretch(1);
-    m_tab_bar_row_layout->addWidget(m_window_controls);
 }
 
 void TabWidget::rebuild_layout_for_vertical_tabs()
@@ -1983,11 +2074,13 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
     auto side_bar_width = current_vertical_tabs_width();
     m_vertical_tabs_reserved_space->setFixedWidth(reserved_width);
     m_vertical_tab_bar_column->setFixedWidth(side_bar_width);
+    set_dynamic_property_if_needed(*m_vertical_tab_bar_column, VERTICAL_TABS_POSITION_PROPERTY, vertical_tabs_position_property_value(m_vertical_tabs_position));
 
     m_vertical_tab_bar_column_layout->setSpacing(0);
     auto tab_layout = m_tab_bar->tab_layout();
     auto side_margin = vertical_tabs_side_margin(tab_layout != TabLayout::VerticalCollapsed);
-    m_window_controls->layout()->setContentsMargins(0, 0, 0, 0);
+    if (auto* window_controls_layout = m_window_controls->layout())
+        window_controls_layout->setContentsMargins(0, 0, 0, 0);
     m_vertical_tab_bar_column_layout->setContentsMargins(side_margin, VERTICAL_TABS_TOP_MARGIN, side_margin, 8);
 
     update_vertical_tabs_button_layout();
@@ -2049,7 +2142,7 @@ void TabWidget::update_vertical_tabs_resize_handle()
     }
 
     auto handle_width = VERTICAL_TABS_RESIZE_HIT_AREA_WIDTH;
-    auto divider_x = vertical_tabs_layout_width() - 1;
+    auto divider_x = vertical_tabs_are_on_right() ? width() - vertical_tabs_layout_width() : vertical_tabs_layout_width() - 1;
     auto chrome_rect = vertical_tabs_chrome_rect();
     m_vertical_tabs_resize_handle->setGeometry(
         divider_x - (handle_width / 2),
@@ -2066,9 +2159,10 @@ void TabWidget::update_vertical_tabs_content_separator()
     if (!show_content_separator)
         return;
 
-    auto separator_x = max(0, current_vertical_tabs_width() - 1);
+    auto separator_x = vertical_tabs_are_on_right() ? 0 : max(0, current_vertical_tabs_width() - 1);
     auto separator_y = max(0, m_toolbar_container->height() - 1);
-    m_vertical_tabs_content_separator->setGeometry(separator_x, separator_y, max(0, width() - separator_x), 1);
+    auto separator_width = vertical_tabs_are_on_right() ? max(0, width() - current_vertical_tabs_width()) : max(0, width() - separator_x);
+    m_vertical_tabs_content_separator->setGeometry(separator_x, separator_y, separator_width, 1);
     m_vertical_tabs_content_separator->raise();
 }
 
@@ -2086,6 +2180,8 @@ void TabWidget::update_vertical_tabs_hover_layout()
     auto tab_layout = m_tab_bar->tab_layout();
     auto side_margin = vertical_tabs_side_margin(tab_layout != TabLayout::VerticalCollapsed);
 
+    m_tab_bar->set_vertical_tabs_position(m_vertical_tabs_position);
+    set_dynamic_property_if_needed(*m_vertical_tab_bar_column, VERTICAL_TABS_POSITION_PROPERTY, vertical_tabs_position_property_value(m_vertical_tabs_position));
     m_vertical_tab_bar_column_layout->setContentsMargins(side_margin, VERTICAL_TABS_TOP_MARGIN, side_margin, 8);
     update_vertical_tabs_button_layout();
 
@@ -2096,10 +2192,11 @@ void TabWidget::update_vertical_tabs_hover_layout()
 QRect TabWidget::vertical_tabs_chrome_rect() const
 {
     auto chrome_height = m_toolbar_container->height();
+    auto chrome_width = current_vertical_tabs_width();
     return {
-        0,
+        vertical_tabs_are_on_right() ? max(0, width() - chrome_width) : 0,
         chrome_height,
-        current_vertical_tabs_width(),
+        chrome_width,
         max(0, height() - chrome_height)
     };
 }
@@ -2132,6 +2229,7 @@ void TabWidget::update_tab_layout()
         auto side_bar_width = current_vertical_tabs_width();
         m_vertical_tabs_reserved_space->setFixedWidth(reserved_width);
         m_vertical_tab_bar_column->setFixedWidth(side_bar_width);
+        set_dynamic_property_if_needed(*m_vertical_tab_bar_column, VERTICAL_TABS_POSITION_PROPERTY, vertical_tabs_position_property_value(m_vertical_tabs_position));
         update_vertical_tabs_button_layout();
         update_vertical_tabs_overlay_geometry();
         m_vertical_tabs_content_layout->activate();
@@ -2239,7 +2337,26 @@ void TabWidget::set_vertical_tabs_hover_expanded(bool expanded)
         m_vertical_tabs_hover_collapse_timer->start();
     else
         m_vertical_tabs_hover_collapse_timer->stop();
+
     update_vertical_tabs_hover_layout();
+    update_vertical_tabs_content_overlay();
+}
+
+void TabWidget::update_vertical_tabs_content_overlay()
+{
+    auto index = current_index();
+    if (index < 0)
+        return;
+
+    int overlap = 0;
+    if (m_tab_bar_visible && m_vertical_tabs_hover_expanded && m_tab_bar->tab_layout() != TabLayout::Horizontal)
+        overlap = max(0, current_vertical_tabs_width() - vertical_tabs_layout_width());
+
+    auto left = vertical_tabs_are_on_right() ? 0 : overlap;
+    auto right = vertical_tabs_are_on_right() ? overlap : 0;
+
+    if (auto* current = tab(index))
+        current->view().set_vertical_tab_overlay_insets(left, right);
 }
 
 void TabWidget::defer_update_vertical_tabs_hover_expanded()
@@ -2260,11 +2377,13 @@ void TabWidget::update_vertical_tabs_hover_expanded()
 
 void TabWidget::update_window_button_icons()
 {
-    auto is_maximized = window()->isMaximized();
-    m_minimize_window_button->setIcon(create_chrome_icon(ChromeIcon::WindowMinimize, palette()));
-    m_maximize_window_button->setIcon(create_chrome_icon(is_maximized ? ChromeIcon::WindowRestore : ChromeIcon::WindowMaximize, palette()));
-    m_maximize_window_button->setToolTip(is_maximized ? "Restore" : "Maximize");
-    m_close_window_button->setIcon(create_chrome_icon(ChromeIcon::WindowClose, palette()));
+    if (m_minimize_window_button && m_maximize_window_button && m_close_window_button) {
+        auto is_maximized = window()->isMaximized();
+        m_minimize_window_button->setIcon(create_chrome_icon(ChromeIcon::WindowMinimize, palette()));
+        m_maximize_window_button->setIcon(create_chrome_icon(is_maximized ? ChromeIcon::WindowRestore : ChromeIcon::WindowMaximize, palette()));
+        m_maximize_window_button->setToolTip(is_maximized ? "Restore" : "Maximize");
+        m_close_window_button->setIcon(create_chrome_icon(ChromeIcon::WindowClose, palette()));
+    }
 
     for (int index = 0; index < m_stacked_widget->count(); ++index)
         tab(index)->update_window_control_icons();

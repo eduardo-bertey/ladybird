@@ -293,9 +293,12 @@ Iterator
 KeyboardEvent
 KeyframeEffect
 Location
+Lock
+LockManager
 ManagedMediaSource
 ManagedSourceBuffer
 Map
+MathMLAnchorElement
 MathMLElement
 MediaCapabilities
 MediaDeviceInfo
@@ -446,6 +449,7 @@ SVGSVGElement
 SVGScriptElement
 SVGStopElement
 SVGStyleElement
+SVGSwitchElement
 SVGSymbolElement
 SVGTSpanElement
 SVGTextContentElement

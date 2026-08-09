@@ -12,6 +12,7 @@
 #include <AK/Vector.h>
 #include <LibURL/URL.h>
 #include <LibWebView/ProcessType.h>
+#include <LibWebView/SiteIsolation.h>
 
 namespace WebView {
 
@@ -24,11 +25,6 @@ enum class HeadlessMode {
 };
 
 enum class NewWindow {
-    No,
-    Yes,
-};
-
-enum class ForceNewProcess {
     No,
     Yes,
 };
@@ -88,7 +84,6 @@ struct BrowserOptions {
     int window_width { 800 };
     int window_height { 600 };
     NewWindow new_window { NewWindow::No };
-    ForceNewProcess force_new_process { ForceNewProcess::No };
     AllowPopups allow_popups { AllowPopups::No };
     DisableScripting disable_scripting { DisableScripting::No };
     DisableSQLDatabase disable_sql_database { DisableSQLDatabase::No };
@@ -105,12 +100,12 @@ struct BrowserOptions {
 enum class HTTPDiskCacheMode {
     Disabled,
     Enabled,
-    Partitioned,
     Testing,
 };
 
 struct RequestServerOptions {
     Vector<ByteString> certificates;
+    ByteString cache_path;
     HTTPDiskCacheMode http_disk_cache_mode { HTTPDiskCacheMode::Disabled };
     Optional<ByteString> resource_substitution_map_path;
 };
@@ -131,11 +126,6 @@ enum class EnableIDLTracing {
 };
 
 enum class EnableMemoryHTTPCache {
-    No,
-    Yes,
-};
-
-enum class DisableSiteIsolation {
     No,
     Yes,
 };
@@ -180,17 +170,13 @@ enum class FileSchemeUrlsHaveTupleOrigins {
     Yes,
 };
 
-enum class ReportSessionHistoryUpdatesInTestMode {
-    No,
-    Yes,
-};
-
 struct WebContentOptions {
     Optional<ByteString> config_path {};
+    Optional<ByteString> cache_path {};
     Optional<StringView> user_agent_preset {};
     IsTestMode is_test_mode { IsTestMode::No };
     LogAllJSExceptions log_all_js_exceptions { LogAllJSExceptions::No };
-    DisableSiteIsolation disable_site_isolation { DisableSiteIsolation::No };
+    SiteIsolationMode site_isolation_mode { SiteIsolationMode::TopLevel };
     EnableIDLTracing enable_idl_tracing { EnableIDLTracing::No };
     EnableMemoryHTTPCache enable_http_memory_cache { EnableMemoryHTTPCache::No };
     ExposeExperimentalInterfaces expose_experimental_interfaces { ExposeExperimentalInterfaces::No };
@@ -203,7 +189,6 @@ struct WebContentOptions {
     PaintViewportScrollbars paint_viewport_scrollbars { PaintViewportScrollbars::Yes };
     EnableAsyncScrolling enable_async_scrolling { EnableAsyncScrolling::Yes };
     FileSchemeUrlsHaveTupleOrigins file_scheme_urls_have_tuple_origins { FileSchemeUrlsHaveTupleOrigins::No };
-    ReportSessionHistoryUpdatesInTestMode report_session_history_updates_in_test_mode { ReportSessionHistoryUpdatesInTestMode::No };
     Optional<StringView> default_time_zone {};
     Optional<u64> style_invalidation_counter_dump_interval {};
 };

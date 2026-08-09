@@ -10,7 +10,6 @@
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
 #include <LibWeb/CSS/CSSTransition.h>
-#include <LibWeb/CSS/Interpolation.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -36,7 +35,7 @@ GC::Ref<CSSTransition> CSSTransition::start_a_transition(
     return realm.create<CSSTransition>(realm, abstract_element, property_id, transition_generation, delay, start_time, end_time, start_value, end_value, reversing_adjusted_start_value, reversing_shortening_factor);
 }
 
-StringView CSSTransition::transition_property() const
+Utf16FlyString const& CSSTransition::transition_property() const
 {
     return string_from_property_id(m_transition_property);
 }
@@ -85,8 +84,7 @@ int CSSTransition::class_specific_composite_order(GC::Ref<Animations::Animation>
     // 5. Otherwise, sort A and B in ascending order by the Unicode codepoints that make up the expanded transition
     //    property name of each transition (i.e. without attempting case conversion and such that ‘-moz-column-width’
     //    sorts before ‘column-width’).
-    // FIXME: This should operate on Unicode strings, not StringViews.
-    return transition_property().compare(other->transition_property());
+    return transition_property() <=> other->transition_property();
 }
 
 CSSTransition::CSSTransition(
@@ -119,7 +117,9 @@ CSSTransition::CSSTransition(
     // that have been disassociated from their owning element but are still idle do not have a defined composite order.
 
     // Construct a KeyframesEffect for our animation
-    m_keyframe_effect->set_target(abstract_element);
+    // NB: The current style computation collects this effect before publishing its result, so scheduling a second
+    //     animated style update here would evaluate the same transition twice.
+    m_keyframe_effect->set_target(abstract_element, Animations::KeyframeEffect::InvalidateEffect::No);
     m_keyframe_effect->set_specified_start_delay(delay);
     m_keyframe_effect->set_specified_iteration_duration(end_time - start_time);
     // AD-HOC: CSS Transitions require the start value to apply during transition-delay. A default KeyframeEffect does
@@ -145,11 +145,11 @@ CSSTransition::CSSTransition(
     m_keyframe_effect->set_key_frame_set(key_frame_set);
     set_timeline(abstract_element.document().timeline());
     set_owning_element(abstract_element);
-    set_effect(m_keyframe_effect);
+    set_effect(m_keyframe_effect, Animations::Animation::ShouldInvalidate::No);
     abstract_element.element().set_transition(abstract_element.pseudo_element(), m_transition_property, *this);
 
     HTML::TemporaryExecutionContext context(realm);
-    play().release_value_but_fixme_should_propagate_errors();
+    play(Animations::Animation::ShouldInvalidate::No).release_value_but_fixme_should_propagate_errors();
 }
 
 void CSSTransition::initialize(JS::Realm& realm)

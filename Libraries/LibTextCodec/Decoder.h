@@ -19,10 +19,20 @@
 
 namespace TextCodec {
 
+enum class IgnoreBOM {
+    Yes,
+    No,
+};
+
+// https://encoding.spec.whatwg.org/#concept-encoding-error-mode
+enum class ErrorMode {
+    Replacement,
+    Fatal,
+};
+
 class TEXTCODEC_API Decoder {
 public:
-    virtual bool validate(StringView);
-    virtual ErrorOr<String> to_utf8(StringView);
+    virtual ErrorOr<String> to_utf8(StringView, IgnoreBOM, ErrorMode);
     virtual ErrorOr<Utf16String> to_utf16(StringView);
     virtual ErrorOr<size_t> length_in_utf16_code_units(StringView);
     ErrorOr<void> process_code_points(StringView, Function<ErrorOr<void>(u32)>);
@@ -36,13 +46,16 @@ class TEXTCODEC_API StreamingDecoder final {
     AK_MAKE_NONCOPYABLE(StreamingDecoder);
 
 public:
-    explicit StreamingDecoder(StringView encoding);
+    StreamingDecoder(StringView encoding, IgnoreBOM, ErrorMode);
     ~StreamingDecoder();
 
     ErrorOr<String> to_utf8(ReadonlyBytes);
+    ErrorOr<Utf16String> to_utf16(ReadonlyBytes);
     ErrorOr<String> finish();
+    ErrorOr<Utf16String> finish_to_utf16();
 
 private:
+    ErrorMode m_error_mode { ErrorMode::Replacement };
     void* m_decoder { nullptr };
 };
 
@@ -51,7 +64,9 @@ private:
 TEXTCODEC_API Optional<Decoder&> decoder_for_exact_name(StringView encoding);
 
 TEXTCODEC_API Optional<Decoder&> decoder_for(StringView encoding);
+TEXTCODEC_API Optional<Decoder&> decoder_for(Utf16View encoding);
 TEXTCODEC_API Optional<StringView> get_standardized_encoding(StringView encoding);
+TEXTCODEC_API Optional<StringView> get_standardized_encoding(Utf16View encoding);
 
 // This returns the appropriate Unicode decoder for the sniffed BOM or nothing if there is no appropriate decoder.
 TEXTCODEC_API Optional<Decoder&> bom_sniff_to_decoder(StringView);
@@ -65,5 +80,6 @@ TEXTCODEC_API ErrorOr<size_t> convert_input_to_utf16_length_using_given_decoder_
 TEXTCODEC_API StringView get_output_encoding(StringView encoding);
 
 TEXTCODEC_API String isomorphic_decode(StringView);
+TEXTCODEC_API Utf16String isomorphic_decode_to_utf16(StringView);
 
 }

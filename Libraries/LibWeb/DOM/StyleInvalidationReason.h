@@ -19,6 +19,7 @@ namespace Web::DOM {
     X(CSSStylePropertiesSetPropertyStyleValue)      \
     X(CSSStylePropertiesTextChange)                 \
     X(CustomElementStateChange)                     \
+    X(CustomPropertyRegistrationChange)             \
     X(CustomStateSetChange)                         \
     X(EditingInsertion)                             \
     X(EditingDeletion)                              \
@@ -43,6 +44,7 @@ namespace Web::DOM {
     X(MediaQueryChangedMatchState)                  \
     X(NavigableSetViewportSize)                     \
     X(NodeInsertBefore)                             \
+    X(NodeMove)                                     \
     X(NodeRemove)                                   \
     X(NodeSetTextContent)                           \
     X(Other)                                        \

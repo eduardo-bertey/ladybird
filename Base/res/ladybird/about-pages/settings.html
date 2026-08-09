@@ -65,6 +65,10 @@
                 width: 50%;
             }
 
+            .inline-container input[type="checkbox"] {
+                flex-shrink: 0;
+            }
+
             .button-container {
                 display: flex;
                 justify-content: flex-end;
@@ -392,6 +396,13 @@
                         <label for="vertical-tabs-expand-on-hover">Expand vertical tabs on hover when collapsed</label>
                         <input id="vertical-tabs-expand-on-hover" type="checkbox" switch />
                     </div>
+                    <div class="card-group inline-container hidden">
+                        <label for="vertical-tabs-position">Vertical tabs side</label>
+                        <select id="vertical-tabs-position">
+                            <option value="left">Left</option>
+                            <option value="right">Right</option>
+                        </select>
+                    </div>
                 </div>
             </div>
 
@@ -468,6 +479,18 @@
                             This setting is controlled via the command line
                         </span>
                         <button id="autoplay-settings" class="secondary-button">Settings...</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-body">
+                    <div class="card-group inline-container">
+                        <label for="enable-geolocation">
+                            Enable geolocation
+                            <p class="description">Allow websites to request your actual location.</p>
+                        </label>
+                        <input id="enable-geolocation" type="checkbox" switch />
                     </div>
                 </div>
             </div>
@@ -688,6 +711,13 @@
                     </label>
                 </div>
                 <div class="input-field-container">
+                    <input id="clear-browsing-data-download-history" type="checkbox" value="" checked />
+                    <label for="clear-browsing-data-download-history">
+                        Download history
+                        <p class="description">Remove records of downloaded files, but keep the files themselves</p>
+                    </label>
+                </div>
+                <div class="input-field-container">
                     <input id="clear-browsing-data-site-data" type="checkbox" value="" checked />
                     <label for="clear-browsing-data-site-data">
                         Cookies and site data<span id="clear-browsing-data-site-data-size"></span>
@@ -716,6 +746,7 @@
         <script src="resource://ladybird/about-pages/settings/advanced.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/browsing-behavior.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/default-zoom-level.js" type="module"></script>
+        <script src="resource://ladybird/about-pages/settings/geolocation.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/languages.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/network.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/new-tab-page.js" type="module"></script>
@@ -725,6 +756,8 @@
         <script src="resource://ladybird/about-pages/settings/tabs.js" type="module"></script>
 
         <script type="module">
+            import { tabForDeepLink } from "resource://ladybird/about-pages/settings/dialog-deep-link.js";
+
             function switchTab(name) {
                 const button = document.querySelector(`.tab-button[data-tab="${name}"]`);
                 const panel = document.getElementById(`tab-${name}`);
@@ -748,7 +781,7 @@
 
             const hash = location.hash.slice(1);
             if (hash) {
-                switchTab(hash);
+                switchTab(tabForDeepLink(hash));
             }
 
             // FIXME: Remove this once closedby="any" triggers for Esc key.

@@ -162,9 +162,9 @@ The generated code provides:
   the same name.
 - `FlyString to_string(AtRuleID)`, mostly for debug logging.
 - A `DescriptorID` enum, listing every descriptor.
-- `Optional<DescriptorID> descriptor_id_from_string(AtRuleID, StringView)` for getting a DescriptorID from a string, if
+- `Optional<DescriptorID> descriptor_id_from_string(AtRuleID, Utf16View)` for getting a DescriptorID from a string, if
   it exists in that at-rule.
-- `FlyString to_string(DescriptorID)` for serializing descriptor names.
+- `Utf16FlyString const& to_string(DescriptorID)` for serializing descriptor names.
 - `bool at_rule_supports_descriptor(AtRuleID, DescriptorID)` to query if the given at-rule allows the descriptor.
 - `RefPtr<StyleValue const> descriptor_initial_value(AtRuleID, DescriptorID)` for getting a descriptor's initial value.
 - `DescriptorMetadata get_descriptor_metadata(AtRuleID, DescriptorID)` returns data used for parsing the descriptor.
@@ -183,23 +183,25 @@ Each at-rule object has the following fields. Both are required.
 
 Each descriptor object can have the following fields:
 
-| Field                                    | Default | Required | Description                                                                |
-|------------------------------------------|---------|----------|----------------------------------------------------------------------------|
-| `allow-arbitrary-substitution-functions` | `false` | No       | Boolean. Whether this descriptor supports arbitrary substitution functions |
-| `initial`                                | Nothing | No       | String. The descriptor's initial value if none is provided.                |
-| `legacy-alias-for`                       | Nothing | No       | String. The name of a different descriptor that this is an alias for.      |
-| `syntax`                                 | N/A     | Yes      | Array of strings. Each string is one option, taken from the spec.          |
-| `FIXME` or `NOTE`                        | Nothing | No       | Strings, for when you want to leave a note.                                |
+| Field                                    | Default | Required | Description                                                                                            |
+|------------------------------------------|---------|----------|--------------------------------------------------------------------------------------------------------|
+| `allow-arbitrary-substitution-functions` | `false` | No       | Boolean. Whether this descriptor supports arbitrary substitution functions                             |
+| `allow-css-wide-keywords`                | `false` | No       | Boolean. Whether PropertyID based parsing should include CSS-wide keywords (e.g. `initial`, `inherit`) |
+| `initial`                                | Nothing | No       | String. The descriptor's initial value if none is provided.                                            |
+| `legacy-alias-for`                       | Nothing | No       | String. The name of a different descriptor that this is an alias for.                                  |
+| `syntax`                                 | N/A     | Yes      | Array of strings. Each string is one option, taken from the spec.                                      |
+| `FIXME` or `NOTE`                        | Nothing | No       | Strings, for when you want to leave a note.                                                            |
 
 ### Custom descriptor fields
 
 Each custom descriptor object has the following fields
 
-| Field                                    | Default | Required | Description                                                                |
-|------------------------------------------|---------|----------|----------------------------------------------------------------------------|
-| `allow-arbitrary-substitution-functions` | `false` | No       | Boolean. Whether this descriptor supports arbitrary substitution functions |
-| `syntax`                                 | N/A     | Yes      | Array of strings. Each string is one option.                               |
-| `FIXME` or `NOTE`                        | Nothing | No       | Strings, for when you want to leave a note.                                |
+| Field                                    | Default | Required | Description                                                                                            |
+|------------------------------------------|---------|----------|--------------------------------------------------------------------------------------------------------|
+| `allow-arbitrary-substitution-functions` | `false` | No       | Boolean. Whether this descriptor supports arbitrary substitution functions                             |
+| `allow-css-wide-keywords`                | `false` | No       | Boolean. Whether PropertyID based parsing should include CSS-wide keywords (e.g. `initial`, `inherit`) |
+| `syntax`                                 | N/A     | Yes      | Array of strings. Each string is one option.                                                           |
+| `FIXME` or `NOTE`                        | Nothing | No       | Strings, for when you want to leave a note.                                                            |
 
 ## Keywords.json
 
@@ -279,13 +281,14 @@ The generated code provides:
 - `bool is_element_backed_pseudo_element(PseudoElement)` returns whether the pseudo-element is element-backed
 - `bool is_tree_abiding_pseudo_element(PseudoElement)` returns whether the pseudo-element is tree-abiding
 - `bool is_pseudo_element_root(PseudoElement)` returns whether the pseudo-element is a [pseudo-element root](https://drafts.csswg.org/css-view-transitions/#pseudo-element-root)
-- `bool pseudo_element_supports_property(PseudoElement, PropertyID)` returns whether the property can be applied to this pseudo-element
 
 ### `property-whitelist`
 
 This is an array of strings. Properties can be named directly ("color"), or categories of properties with a leading `#`
 ("#font-properties"), as the specs often says a group is allowed instead of listing the properties exactly.
 Any properties we don't support yet can be prefixed with "FIXME:" and will be ignored.
+The property groups and the properties that always apply are defined in
+`PseudoElementPropertyGroups.txt` and generated into the Rust cascade tables.
 
 The following categories are supported:
 

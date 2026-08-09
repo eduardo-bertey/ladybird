@@ -9,6 +9,8 @@
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/JsonValue.h>
+#include <AK/Utf16String.h>
+#include <LibCore/GeolocationProvider.h>
 #include <LibCore/StandardPaths.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
@@ -27,6 +29,7 @@ static constexpr auto TAB_SETTINGS_KEY = "tabs"sv;
 static constexpr auto VERTICAL_TABS_ENABLED_KEY = "verticalTabsEnabled"sv;
 static constexpr auto VERTICAL_TABS_EXPANDED_KEY = "verticalTabsExpanded"sv;
 static constexpr auto VERTICAL_TABS_EXPAND_ON_HOVER_KEY = "verticalTabsExpandOnHover"sv;
+static constexpr auto VERTICAL_TABS_POSITION_KEY = "verticalTabsPosition"sv;
 static constexpr auto VERTICAL_TABS_EXPANDED_WIDTH_KEY = "verticalTabsExpandedWidth"sv;
 
 static constexpr auto SHOW_MENU_BAR_KEY = "showMenuBar"sv;
@@ -66,6 +69,8 @@ static constexpr auto DISK_CACHE_MAXIMUM_SIZE_KEY = "maxSize"sv;
 
 static constexpr auto GLOBAL_PRIVACY_CONTROL_KEY = "globalPrivacyControl"sv;
 
+static constexpr auto GEOLOCATION_ENABLED_KEY = "geolocationEnabled"sv;
+
 static constexpr auto DNS_SETTINGS_KEY = "dnsSettings"sv;
 
 static constexpr auto CONFIG_VARIABLES_KEY = "configVariables"sv;
@@ -96,19 +101,35 @@ static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefini
         .array_element_type = JsonValue::Type::String,
     },
     {
-        .id = ConfigVariableID::UseRoundedWindowCorners,
-        .name = "ui.window.use_rounded_corners"sv,
-        .title = "Use rounded window corners"sv,
-        .description = "Clip browser windows to rounded corners."sv,
+        .id = ConfigVariableID::UseClientSideWindowDecorations,
+        .name = "ui.window.use_client_side_decorations"sv,
+        .title = "Use client-side window decorations"sv,
+        .description = "Use custom title bar and window controls instead of the system window frame."sv,
         .default_value = true,
         .array_element_type = {},
     },
     {
-        .id = ConfigVariableID::UseServerSideWindowDecorations,
-        .name = "ui.window.use_server_side_decorations"sv,
-        .title = "Use server-side window decorations"sv,
-        .description = "Use the system window frame instead of the custom title bar and window controls."sv,
+        .id = ConfigVariableID::MaximumConnectionsPerDownload,
+        .name = "downloads.maximum_connections_per_download"sv,
+        .title = "Maximum connections per download"sv,
+        .description = "Download a file over up to this many parallel connections when the server supports byte ranges. Set to 1 to always download over a single connection."sv,
+        .default_value = 4,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::SplitDownloadsWithoutValidators,
+        .name = "downloads.split_without_validators"sv,
+        .title = "Split downloads without server validators"sv,
+        .description = "Allow multi-connection downloads even when the server sends no ETag or Last-Modified header, without which the browser cannot verify that every connection is being served the same file."sv,
         .default_value = false,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::RestartStalledConnections,
+        .name = "downloads.restart_stalled_connections"sv,
+        .title = "Restart stalled download connections"sv,
+        .description = "When one connection of a multi-connection download stops receiving data, drop it and request the rest of its byte range over a new connection."sv,
+        .default_value = true,
         .array_element_type = {},
     },
 } };
@@ -116,6 +137,26 @@ static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefini
 ReadonlySpan<ConfigVariableDefinition const> config_variable_definitions()
 {
     return CONFIG_VARIABLE_DEFINITIONS;
+}
+
+static StringView vertical_tabs_position_to_string(VerticalTabsPosition position)
+{
+    switch (position) {
+    case VerticalTabsPosition::Left:
+        return "left"sv;
+    case VerticalTabsPosition::Right:
+        return "right"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static Optional<VerticalTabsPosition> vertical_tabs_position_from_string(StringView position)
+{
+    if (position == "left"sv)
+        return VerticalTabsPosition::Left;
+    if (position == "right"sv)
+        return VerticalTabsPosition::Right;
+    return {};
 }
 
 Optional<ConfigVariableID> config_variable_id_from_name(StringView name)
@@ -176,12 +217,8 @@ static bool config_variable_value_is_valid(ConfigVariableDefinition const& varia
     return true;
 }
 
-Settings Settings::create(Badge<Application>)
+Settings Settings::create(ByteString settings_path)
 {
-    // FIXME: Move this to a generic "Ladybird config directory" helper.
-    auto settings_directory = ByteString::formatted("{}/Ladybird", Core::StandardPaths::config_directory());
-    auto settings_path = ByteString::formatted("{}/Settings.json", settings_directory);
-
     Settings settings { move(settings_path) };
 
     auto settings_json = read_json_file(settings.m_settings_path);
@@ -248,7 +285,8 @@ Settings Settings::create(Badge<Application>)
             return;
 
         if (auto policy = saved_settings->get_string(SITE_SETTING_POLICY_KEY); policy.has_value()) {
-            if (auto parsed = Web::HTML::autoplay_policy_from_string(*policy); parsed.has_value())
+            auto policy_utf16 = Utf16String::from_utf8_without_validation(*policy);
+            if (auto parsed = Web::HTML::autoplay_policy_from_string(policy_utf16.utf16_view()); parsed.has_value())
                 site_setting.policy = *parsed;
         }
 
@@ -269,6 +307,9 @@ Settings Settings::create(Badge<Application>)
 
     if (auto global_privacy_control = settings_json.value().get_bool(GLOBAL_PRIVACY_CONTROL_KEY); global_privacy_control.has_value())
         settings.m_global_privacy_control = *global_privacy_control ? GlobalPrivacyControl::Yes : GlobalPrivacyControl::No;
+
+    if (auto geolocation_enabled = settings_json.value().get_bool(GEOLOCATION_ENABLED_KEY); geolocation_enabled.has_value())
+        settings.m_geolocation_enabled = *geolocation_enabled && Core::GeolocationProvider::is_available();
 
     if (auto dns_settings = settings_json.value().get(DNS_SETTINGS_KEY); dns_settings.has_value())
         settings.m_dns_settings = parse_dns_settings(*dns_settings);
@@ -307,6 +348,7 @@ JsonValue Settings::serialize_json() const
     tab_settings.set(VERTICAL_TABS_ENABLED_KEY, m_tab_settings.vertical_tabs_enabled);
     tab_settings.set(VERTICAL_TABS_EXPANDED_KEY, m_tab_settings.vertical_tabs_expanded);
     tab_settings.set(VERTICAL_TABS_EXPAND_ON_HOVER_KEY, m_tab_settings.vertical_tabs_expand_on_hover);
+    tab_settings.set(VERTICAL_TABS_POSITION_KEY, vertical_tabs_position_to_string(m_tab_settings.vertical_tabs_position));
     if (m_tab_settings.vertical_tabs_expanded_width.has_value())
         tab_settings.set(VERTICAL_TABS_EXPANDED_WIDTH_KEY, *m_tab_settings.vertical_tabs_expanded_width);
     settings.set(TAB_SETTINGS_KEY, move(tab_settings));
@@ -370,7 +412,7 @@ JsonValue Settings::serialize_json() const
             site_filters.must_append(site_filter);
 
         JsonObject setting;
-        setting.set(SITE_SETTING_POLICY_KEY, Web::HTML::autoplay_policy_to_string(site_setting.policy));
+        setting.set(SITE_SETTING_POLICY_KEY, MUST(Web::HTML::autoplay_policy_to_string(site_setting.policy).to_utf8()));
         setting.set(SITE_SETTING_SITE_FILTERS_KEY, move(site_filters));
 
         settings.set(key, move(setting));
@@ -386,6 +428,8 @@ JsonValue Settings::serialize_json() const
     settings.set(BROWSING_DATA_KEY, move(browsing_data));
 
     settings.set(GLOBAL_PRIVACY_CONTROL_KEY, m_global_privacy_control == GlobalPrivacyControl::Yes);
+
+    settings.set(GEOLOCATION_ENABLED_KEY, m_geolocation_enabled);
 
     // dnsSettings :: { mode: "system" } | { mode: "custom", server: string, port: u16, type: "udp" | "tls", forciblyEnabled: bool, dnssec: bool }
     JsonObject dns_settings;
@@ -441,6 +485,10 @@ TabSettings Settings::parse_tab_settings(JsonValue const& settings)
         tab_settings.vertical_tabs_expanded = *vertical_tabs_expanded;
     if (auto vertical_tabs_expand_on_hover = settings.as_object().get_bool(VERTICAL_TABS_EXPAND_ON_HOVER_KEY); vertical_tabs_expand_on_hover.has_value())
         tab_settings.vertical_tabs_expand_on_hover = *vertical_tabs_expand_on_hover;
+    if (auto vertical_tabs_position = settings.as_object().get_string(VERTICAL_TABS_POSITION_KEY); vertical_tabs_position.has_value()) {
+        if (auto parsed_position = vertical_tabs_position_from_string(*vertical_tabs_position); parsed_position.has_value())
+            tab_settings.vertical_tabs_position = *parsed_position;
+    }
     if (auto vertical_tabs_expanded_width = settings.as_object().get_integer<u16>(VERTICAL_TABS_EXPANDED_WIDTH_KEY); vertical_tabs_expanded_width.has_value())
         tab_settings.vertical_tabs_expanded_width = *vertical_tabs_expanded_width;
 
@@ -656,6 +704,16 @@ void Settings::set_autocomplete_engine(Optional<StringView> autocomplete_engine_
         observer.autocomplete_engine_changed();
 }
 
+void Settings::set_autocomplete_engine(AutocompleteEngine autocomplete_engine)
+{
+    // Custom engines are not persisted: settings stores the engine by name and reloads it
+    // from the builtin list, so a non-builtin engine would not round-trip.
+    m_autocomplete_engine = autocomplete_engine;
+
+    for (auto& observer : m_observers)
+        observer.autocomplete_engine_changed();
+}
+
 void Settings::set_autoplay_policy(Web::HTML::AutoplayPolicy policy)
 {
     m_autoplay.policy = policy;
@@ -759,6 +817,15 @@ DNSSettings Settings::parse_dns_settings(JsonValue const& dns_settings)
     return SystemDNS {};
 }
 
+void Settings::set_geolocation_enabled(bool enabled)
+{
+    m_geolocation_enabled = enabled && Core::GeolocationProvider::is_available();
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.geolocation_settings_changed();
+}
+
 void Settings::set_dns_settings(DNSSettings const& dns_settings, bool override_by_command_line)
 {
     m_dns_settings = dns_settings;
@@ -784,6 +851,15 @@ bool Settings::config_variable_as_bool(ConfigVariableID id) const
     auto value = config_variable(id).get_bool();
     VERIFY(value.has_value());
     return *value;
+}
+
+u32 Settings::config_variable_as_u32(ConfigVariableID id) const
+{
+    auto const& variable = config_variable_definition(id);
+    VERIFY(variable.default_value.is_number());
+
+    auto value = config_variable(id).get_u32();
+    return value.value_or_lazy_evaluated([&] { return variable.default_value.get_u32().value(); });
 }
 
 Vector<String> Settings::config_variable_as_string_array(ConfigVariableID id) const

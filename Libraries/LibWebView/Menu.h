@@ -27,13 +27,18 @@ enum class ActionID {
     NavigateBack,
     NavigateForward,
     Reload,
+    ViewDownloads,
     ViewHistory,
+    ClearBrowsingData,
 
+    Undo,
+    Redo,
     CopySelection,
     CutSelection,
     Paste,
     SelectAll,
 
+    LookUpSelectedText,
     SearchSelectedText,
 
     TakeVisibleScreenshot,
@@ -49,7 +54,9 @@ enum class ActionID {
     ToggleBookmarksBar,
     BookmarkItem,
 
+    OpenAllBookmarksInTabs,
     AddBookmark,
+    AddBookmarkAllTabs,
     AddBookmarkFolder,
     DeleteBookmark,
     DeleteBookmarkFolder,
@@ -64,6 +71,9 @@ enum class ActionID {
 
     OpenInNewTab,
     OpenInNewWindow,
+    OpenInNewPrivateWindow,
+    DownloadLinkedFile,
+    DownloadLinkedFileAs,
     CopyURL,
 
     OpenImage,
@@ -96,6 +106,7 @@ enum class ActionID {
     DumpLayoutTree,
     DumpPaintTree,
     DumpStackingContextTree,
+    DumpSiteIsolationProcessTree,
     DumpDisplayList,
     DumpStyleSheets,
     DumpStyles,

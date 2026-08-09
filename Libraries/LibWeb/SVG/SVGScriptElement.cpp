@@ -6,6 +6,7 @@
  */
 
 #include <AK/ScopeGuard.h>
+#include <AK/Utf16String.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibWeb/Bindings/SVGScriptElement.h>
 #include <LibWeb/DOM/Document.h>
@@ -49,7 +50,7 @@ void SVGScriptElement::adopted_from(DOM::Document& old_document)
         m_document_load_event_delayer.emplace(document());
 }
 
-void SVGScriptElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGScriptElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
     if (name == SVG::AttributeNames::href || name == SVG::AttributeNames::type) {
@@ -93,7 +94,7 @@ void SVGScriptElement::process_the_script_element()
     // FIXME: Support type="module" scripts
     auto maybe_script_type = attribute(SVG::AttributeNames::type);
     if (maybe_script_type.has_value() && !maybe_script_type->is_empty()) {
-        auto script_type = MUST(maybe_script_type->to_ascii_lowercase().trim_ascii_whitespace());
+        auto script_type = maybe_script_type->to_ascii_lowercase().trim_ascii_whitespace();
         if (!MimeSniff::is_javascript_mime_type_essence_match(script_type)) {
             dbgln("SVGScriptElement: Unsupported script type: {}", *maybe_script_type);
             return;
@@ -104,7 +105,7 @@ void SVGScriptElement::process_the_script_element()
     //    using the current value of the 'xlink:href' attribute is fetched. Further processing of the
     //    'script' element is dependent on the external script content, and will block here until the
     //    resource has been fetched or is determined to be an invalid IRI reference.
-    if (has_attribute(SVG::AttributeNames::href) || has_attribute_ns(Namespace::XLink.to_string(), SVG::AttributeNames::href)) {
+    if (has_attribute(SVG::AttributeNames::href) || has_attribute_ns(Namespace::XLink, SVG::AttributeNames::href)) {
         auto href_value = href()->base_val();
 
         auto maybe_script_url = document().encoding_parse_url(href_value);
@@ -152,21 +153,21 @@ void SVGScriptElement::process_the_script_element()
         return;
     }
 
-    auto script_content = child_text_content().to_utf8_but_should_be_ported_to_utf16();
+    auto script_content = child_text_content();
     if (script_content.is_empty())
         return;
 
     // 3. The 'script' element's "already processed" flag is set to true.
     m_already_processed = true;
     m_script = HTML::ClassicScript::create(m_document->url().basename(), script_content,
-        HTML::relevant_settings_object(*this), m_document->base_url(), m_source_line_number);
+        HTML::relevant_settings_object(*this), m_document->base_url(), m_source_line_number, HTML::ClassicScript::MutedErrors::No, HTML::ScriptRegistry::IsInlineSource::Yes);
     execute_script();
 }
 
 void SVGScriptElement::finish_external_script_fetch(URL::URL const& script_url, ReadonlyBytes body)
 {
     if (!body.is_empty() && in_a_document_tree() && !is_scripting_disabled()) {
-        auto script_content = String::from_utf8(body);
+        auto script_content = Utf16String::try_from_utf8({ body });
         if (script_content.is_error())
             dbgln("Failed to decode SVG external script as UTF-8");
         else

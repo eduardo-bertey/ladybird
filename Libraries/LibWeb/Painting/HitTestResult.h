@@ -10,9 +10,11 @@
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
 #include <AK/Types.h>
+#include <LibGC/Ptr.h>
 #include <LibWeb/DOM/AbstractRange.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/PixelUnits.h>
+#include <LibWeb/TextAffinity.h>
 
 namespace Web::Painting {
 
@@ -22,7 +24,9 @@ class Paintable;
 struct HitTestResult {
     NonnullRefPtr<Paintable> paintable;
     RefPtr<ChromeWidget> chrome_widget {};
+    GC::Ptr<DOM::Node> dom_node_override {};
     size_t index_in_node { 0 };
+    bool is_text_fragment { false };
     enum InternalPosition {
         None,
         Before,
@@ -38,6 +42,7 @@ struct HitTestResult {
 struct CaretPosition {
     NonnullRefPtr<Paintable> paintable;
     DOM::BoundaryPoint boundary;
+    TextAffinity affinity { TextAffinity::Downstream };
     Optional<DOM::BoundaryPoint> secondary_boundary {};
     Optional<CSSPixelRect> debug_rect {};
 };

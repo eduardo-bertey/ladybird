@@ -23,11 +23,11 @@ class TextDecoderStream final
     GC_DECLARE_ALLOCATOR(TextDecoderStream);
 
 public:
-    static WebIDL::ExceptionOr<GC::Ref<TextDecoderStream>> construct_impl(JS::Realm&, FlyString label, Bindings::TextDecoderOptions const&);
+    static WebIDL::ExceptionOr<GC::Ref<TextDecoderStream>> construct_impl(JS::Realm&, Utf16String const& label, Bindings::TextDecoderOptions const&);
     virtual ~TextDecoderStream() override;
 
 private:
-    TextDecoderStream(JS::Realm&, GC::Ref<Streams::TransformStream>, TextCodec::Decoder&, FlyString encoding, ErrorMode, bool ignore_bom);
+    TextDecoderStream(JS::Realm&, GC::Ref<Streams::TransformStream>, FlyString encoding, TextCodec::ErrorMode, bool ignore_bom);
 
     virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
@@ -35,10 +35,7 @@ private:
     WebIDL::ExceptionOr<void> decode_and_enqueue_chunk(JS::Value);
     WebIDL::ExceptionOr<void> flush_and_enqueue();
 
-    WebIDL::ExceptionOr<void> enqueue_decoded_output(String const&);
-
-    // https://encoding.spec.whatwg.org/#textdecodercommon-i-o-queue
-    NonnullOwnPtr<TextCodec::StreamingDecoder> m_streaming_decoder;
+    WebIDL::ExceptionOr<void> enqueue_decoded_output(Utf16String const&);
 };
 
 }

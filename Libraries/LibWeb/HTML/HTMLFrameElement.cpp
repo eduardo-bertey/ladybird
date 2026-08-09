@@ -65,7 +65,7 @@ void HTMLFrameElement::removed_from(IsSubtreeRoot is_subtree_root, DOM::Node* ol
 }
 
 // https://html.spec.whatwg.org/multipage/obsolete.html#frames:frame-3
-void HTMLFrameElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLFrameElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
@@ -80,13 +80,6 @@ i32 HTMLFrameElement::default_tab_index_value() const
 {
     // See the base function for the spec comments.
     return 0;
-}
-
-void HTMLFrameElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
-{
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
 }
 
 // https://html.spec.whatwg.org/multipage/obsolete.html#process-the-frame-attributes

@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <LibJS/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
@@ -33,7 +35,7 @@ public:
     virtual ~Environment() override;
 
     // An id https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-id
-    String id;
+    Utf16String id;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-creation-url
     URL::URL creation_url;
@@ -61,7 +63,7 @@ public:
 
 protected:
     Environment() = default;
-    Environment(String id, URL::URL creation_url, Optional<URL::URL> top_level_creation_url, Optional<URL::Origin> top_level_origin, GC::Ptr<BrowsingContext> target_browsing_context)
+    Environment(Utf16String id, URL::URL creation_url, Optional<URL::URL> top_level_creation_url, Optional<URL::Origin> top_level_origin, GC::Ptr<BrowsingContext> target_browsing_context)
         : id(move(id))
         , creation_url(move(creation_url))
         , top_level_creation_url(move(top_level_creation_url))
@@ -115,9 +117,9 @@ public:
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-time-origin
     virtual double time_origin() const = 0;
 
-    Optional<URL::URL> parse_url(StringView);
-    Optional<URL::URL> encoding_parse_url(StringView);
-    Optional<String> encoding_parse_and_serialize_url(StringView);
+    Optional<URL::URL> parse_url(Utf16View);
+    Optional<URL::URL> encoding_parse_url(Utf16View);
+    Optional<Utf16String> encoding_parse_and_serialize_url(Utf16View);
 
     JS::Realm& realm();
     JS::Object& global_object();
@@ -132,6 +134,7 @@ public:
     SerializedEnvironmentSettingsObject serialize();
 
     GC::Ref<StorageAPI::StorageManager> storage_manager();
+    GC::Ref<WebLocks::LockManager> lock_manager();
 
     // https://w3c.github.io/ServiceWorker/#get-the-service-worker-registration-object
     GC::Ref<ServiceWorker::ServiceWorkerRegistration> get_service_worker_registration_object(ServiceWorker::Registration const&);
@@ -185,6 +188,10 @@ private:
     // Each environment settings object has an associated StorageManager object.
     GC::Ptr<StorageAPI::StorageManager> m_storage_manager;
 
+    // https://w3c.github.io/web-locks/#navigator-mixins
+    // Each environment settings object has a LockManager object.
+    GC::Ptr<WebLocks::LockManager> m_lock_manager;
+
     // https://w3c.github.io/ServiceWorker/#environment-settings-object-service-worker-registration-object-map
     // An environment settings object has a service worker registration object map,
     // a map where the keys are service worker registrations and the values are ServiceWorkerRegistration objects.
@@ -209,9 +216,9 @@ void prepare_to_run_script(EnvironmentSettingsObject&);
 void clean_up_after_running_script(EnvironmentSettingsObject const&);
 WEB_API void prepare_to_run_callback(EnvironmentSettingsObject&);
 WEB_API void clean_up_after_running_callback(EnvironmentSettingsObject const&);
-WEB_API bool module_type_allowed(EnvironmentSettingsObject const&, StringView module_type);
+WEB_API bool module_type_allowed(EnvironmentSettingsObject const&, Utf16View module_type);
 
-WEB_API void add_module_to_resolved_module_set(EnvironmentSettingsObject&, String const& serialized_base_url, String const& normalized_specifier, Optional<URL::URL> const& as_url);
+WEB_API void add_module_to_resolved_module_set(EnvironmentSettingsObject&, Utf16View serialized_base_url, Utf16View normalized_specifier, Optional<URL::URL> const& as_url);
 
 WEB_API EnvironmentSettingsObject& incumbent_settings_object();
 WEB_API JS::Realm& incumbent_realm();

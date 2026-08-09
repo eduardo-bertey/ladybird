@@ -5,10 +5,11 @@
  */
 
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/Layout/NavigableContainerViewport.h>
 #include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BorderRadiusCornerClipper.h>
 #include <LibWeb/Painting/DisplayListRecorder.h>
 #include <LibWeb/Painting/NavigableContainerViewportPaintable.h>
@@ -21,7 +22,7 @@ NonnullRefPtr<NavigableContainerViewportPaintable> NavigableContainerViewportPai
 }
 
 NavigableContainerViewportPaintable::NavigableContainerViewportPaintable(Layout::NavigableContainerViewport const& layout_box)
-    : PaintableBox(layout_box)
+    : Paintable(layout_box)
 {
 }
 
@@ -30,7 +31,7 @@ void NavigableContainerViewportPaintable::paint(DisplayListRecordingContext& con
     if (!is_visible())
         return;
 
-    PaintableBox::paint(context, phase);
+    Paintable::paint(context, phase);
 
     if (phase == PaintPhase::Foreground) {
         auto absolute_rect = this->absolute_rect();
@@ -38,28 +39,34 @@ void NavigableContainerViewportPaintable::paint(DisplayListRecordingContext& con
         ScopedCornerRadiusClip corner_clip { context, clip_rect, normalized_border_radii_data(ShrinkRadiiForBorders::Yes) };
 
         auto const& navigable_container = this->navigable_container();
-        auto* hosted_document = const_cast<DOM::Document*>(navigable_container.content_document_without_origin_check());
-        if (!hosted_document)
-            return;
-
-        if (hosted_document->is_render_blocked())
-            return;
-
         auto content_navigable = navigable_container.content_navigable();
         VERIFY(content_navigable);
-        if (content_navigable->has_been_destroyed() || !content_navigable->has_compositor_context())
+        auto& local_navigable = as<HTML::LocalNavigable>(*content_navigable);
+        if (local_navigable.has_been_destroyed())
             return;
+
+        auto context_id = document().page().client().compositor_context_id_for_remote_child_frame(content_navigable->id());
+        if (!context_id.has_value()) {
+            if (!local_navigable.has_compositor_context())
+                return;
+
+            auto* hosted_document = const_cast<DOM::Document*>(navigable_container.content_document_without_origin_check());
+            if (hosted_document && hosted_document->is_render_blocked())
+                return;
+
+            context_id = local_navigable.compositor_context().id();
+        }
 
         context.display_list_recorder().save();
         context.display_list_recorder().add_clip_rect(clip_rect.to_type<int>());
         context.display_list_recorder().draw_composited_context(
             context.enclosing_device_rect(absolute_rect).to_type<int>(),
-            content_navigable->compositor_context().id(),
+            *context_id,
             Gfx::ScalingMode::NearestNeighbor);
         context.display_list_recorder().restore();
 
         if constexpr (HIGHLIGHT_FOCUSED_FRAME_DEBUG) {
-            if (content_navigable->is_focused()) {
+            if (local_navigable.is_focused()) {
                 context.display_list_recorder().draw_rect(clip_rect.to_type<int>(), Color::Cyan);
             }
         }

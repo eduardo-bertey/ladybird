@@ -7,7 +7,6 @@
 #pragma once
 
 #include <AK/Array.h>
-#include <AK/Badge.h>
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
 #include <AK/JsonValue.h>
@@ -23,10 +22,16 @@
 
 namespace WebView {
 
+enum class VerticalTabsPosition : u8 {
+    Left,
+    Right,
+};
+
 struct TabSettings {
     bool vertical_tabs_enabled { false };
     bool vertical_tabs_expanded { true };
     bool vertical_tabs_expand_on_hover { false };
+    VerticalTabsPosition vertical_tabs_position { VerticalTabsPosition::Left };
     Optional<u16> vertical_tabs_expanded_width;
 };
 
@@ -59,8 +64,10 @@ enum class ConfigVariableID : u8 {
     ShowWebContentProcessIDInTabTitle,
     ShowAdvancedDebugMenu,
     ContentBlockerListPaths,
-    UseRoundedWindowCorners,
-    UseServerSideWindowDecorations,
+    UseClientSideWindowDecorations,
+    MaximumConnectionsPerDownload,
+    SplitDownloadsWithoutValidators,
+    RestartStalledConnections,
 
     Count,
 };
@@ -97,11 +104,12 @@ public:
     virtual void global_privacy_control_changed() { }
     virtual void dns_settings_changed() { }
     virtual void config_variable_changed(ConfigVariableID) { }
+    virtual void geolocation_settings_changed() { }
 };
 
 class WEBVIEW_API Settings {
 public:
-    static Settings create(Badge<Application>);
+    static Settings create(ByteString settings_path);
 
     JsonValue serialize_json() const;
 
@@ -141,6 +149,7 @@ public:
 
     Optional<AutocompleteEngine> const& autocomplete_engine() const { return m_autocomplete_engine; }
     void set_autocomplete_engine(Optional<StringView> autocomplete_engine_name);
+    void set_autocomplete_engine(AutocompleteEngine);
 
     AutoplaySiteSetting const& autoplay_settings() const { return m_autoplay; }
     void set_autoplay_policy(Web::HTML::AutoplayPolicy);
@@ -155,12 +164,16 @@ public:
     GlobalPrivacyControl global_privacy_control() const { return m_global_privacy_control; }
     void set_global_privacy_control(GlobalPrivacyControl);
 
+    bool geolocation_enabled() const { return m_geolocation_enabled; }
+    void set_geolocation_enabled(bool);
+
     static DNSSettings parse_dns_settings(JsonValue const&);
     DNSSettings const& dns_settings() const { return m_dns_settings; }
     void set_dns_settings(DNSSettings const&, bool override_by_command_line = false);
 
     JsonValue const& config_variable(ConfigVariableID) const;
     bool config_variable_as_bool(ConfigVariableID) const;
+    u32 config_variable_as_u32(ConfigVariableID) const;
     Vector<String> config_variable_as_string_array(ConfigVariableID) const;
     void set_config_variable(ConfigVariableID, JsonValue);
     void set_config_variable(StringView name, JsonValue const&);
@@ -190,6 +203,7 @@ private:
     Optional<AutocompleteEngine> m_autocomplete_engine;
     AutoplaySiteSetting m_autoplay;
     BrowsingDataSettings m_browsing_data_settings;
+    bool m_geolocation_enabled { false };
     GlobalPrivacyControl m_global_privacy_control { GlobalPrivacyControl::No };
     DNSSettings m_dns_settings { SystemDNS() };
     bool m_dns_override_by_command_line { false };

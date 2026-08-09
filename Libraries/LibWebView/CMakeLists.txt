@@ -2,28 +2,46 @@ set(SOURCES
     Application.cpp
     Attribute.cpp
     Autocomplete.cpp
+    AutocompleteMuxer.cpp
+    AutocompleteRanker.cpp
+    AutocompleteService.cpp
     BookmarkStore.cpp
+    CanonicalNavigable.cpp
+    CanonicalTraversable.cpp
     BrowserProcess.cpp
+    CompositorClient.cpp
+    CompositorConnection.cpp
+    CompositorHostBase.cpp
     ConsoleOutput.cpp
     CookieJar.cpp
+    DictionaryLookup.cpp
     DOMNodeProperties.cpp
+    DownloadPresentation.cpp
+    DownloadSegmentation.cpp
+    DownloadStore.cpp
     FileDownloader.cpp
+    Geolocation.cpp
     HeadlessWebView.cpp
+    HelperProcess.cpp
     HistoryDebug.cpp
     HistoryStore.cpp
-    HelperProcess.cpp
     HSTSStore.cpp
     Menu.cpp
     Mutation.cpp
+    Omnibox.cpp
+    OmniboxEngagement.cpp
     Plugins/ImageCodecPlugin.cpp
+    PrivateBrowsing.cpp
     Process.cpp
     ProcessHandle.cpp
     ProcessManager.cpp
     ProcessMonitor.cpp
+    Profile.cpp
     SearchEngine.cpp
     SessionHistory.cpp
     Settings.cpp
     SiteIsolation.cpp
+    SiteIsolationManager.cpp
     SourceHighlighter.cpp
     StorageJar.cpp
     URL.cpp
@@ -31,15 +49,15 @@ set(SOURCES
     Utilities.cpp
     ViewImplementation.cpp
     WebContentClient.cpp
-    WebWorkerClient.cpp
-    WorkerProcessManager.cpp
     WebUI.cpp
     WebUI/BookmarksUI.cpp
+    WebUI/DownloadsUI.cpp
     WebUI/HistoryUI.cpp
     WebUI/ProcessesUI.cpp
     WebUI/SettingsUI.cpp
     WebUI/VersionUI.cpp
-    CompositorClient.cpp
+    WebWorkerClient.cpp
+    WorkerProcessManager.cpp
 )
 
 if (APPLE)
@@ -89,7 +107,7 @@ compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIClient.ipc ${CMAKE_B
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIServerEndpoint.h)
 
 ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibWebView PRIVATE LibCore LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibJS LibWeb LibUnicode LibURL LibSync LibSyntax LibTextCodec)
+target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibJS LibMedia LibWeb LibUnicode LibURL LibSync LibSyntax LibTextCodec LibThreading)
 
 # Third-party
 if (HAS_FONTCONFIG)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, the Ladybird developers.
+ * Copyright (c) 2024-present, the Ladybird developers.
  * Copyright (c) 2024, Felipe Muñoz Mazur <felipe.munoz.mazur@protonmail.com>
  *
  * SPDX-License-Identifier: BSD-2-Clause
@@ -16,7 +16,7 @@
 #include <LibWeb/HTML/CloseWatcherManager.h>
 #include <LibWeb/HTML/EventHandler.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
-#include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Window.h>
 
 namespace Web::HTML {

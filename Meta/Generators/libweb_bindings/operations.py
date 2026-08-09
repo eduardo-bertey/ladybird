@@ -286,7 +286,8 @@ def write_operation(
         write_default_to_json_operation(out, context, includes, interface, operation)
         return
 
-    return_type_is_promise = operation.return_type.name == "Promise"
+    return_type_is_promise = operation.return_type_is_promise()
+    should_wrap_promise_rejections = return_type_is_promise and overload_index is None
 
     arguments = ", ".join(idl_identifier_cpp_name(parameter) for parameter in operation.parameters)
     callee_arguments = arguments
@@ -307,7 +308,7 @@ def write_operation(
     [[maybe_unused]] auto& realm = *vm.current_realm();
 """
     )
-    if return_type_is_promise:
+    if should_wrap_promise_rejections:
         includes.add("LibWeb/WebIDL/Promise.h")
         out.write(
             """    auto steps = [&realm, &vm]() -> JS::ThrowCompletionOr<GC::Ref<WebIDL::Promise>> {
@@ -346,7 +347,7 @@ def write_operation(
             f"""    [[maybe_unused]] auto R = TRY(throw_dom_exception_if_needed(vm, [&] {{ return {callee}::{idl_implementation_cpp_name(operation)}({callee_arguments}); }}));
 """
         )
-        if return_type_is_promise:
+        if should_wrap_promise_rejections:
             out.write(
                 f"""        return R;
     }};
@@ -391,7 +392,7 @@ def write_operation(
 """
         )
         return
-    if return_type_is_promise:
+    if should_wrap_promise_rejections:
         out.write(
             f"""    [[maybe_unused]] auto R = TRY(throw_dom_exception_if_needed(vm, [&] {{ return idl_object->{idl_implementation_cpp_name(operation)}({arguments}); }}));
         return R;
@@ -427,11 +428,11 @@ def default_to_json_getter_steps(
 ) -> str:
     is_reflected = "Reflect" in attribute.extended_attributes
     if is_reflected and attribute.type.name == "boolean":
-        return f'auto {value_name} = idl_object->has_attribute("{reflected_attribute_name(attribute)}"_fly_string);'
-    if is_reflected:
         return (
-            f'auto {value_name} = idl_object->get_attribute_value("{reflected_attribute_name(attribute)}"_fly_string);'
+            f'auto {value_name} = idl_object->has_attribute("{reflected_attribute_name(attribute)}"_utf16_fly_string);'
         )
+    if is_reflected:
+        return f'auto {value_name} = idl_object->get_attribute_value("{reflected_attribute_name(attribute)}"_utf16_fly_string);'
     return f"auto {value_name} = TRY(throw_dom_exception_if_needed(vm, [&] {{ return idl_object->{idl_implementation_cpp_name(attribute)}(); }}));"
 
 

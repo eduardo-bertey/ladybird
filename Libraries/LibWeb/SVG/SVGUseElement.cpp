@@ -19,6 +19,7 @@
 #include <LibWeb/Layout/SVGGraphicsBox.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/SVG/AttributeNames.h>
+#include <LibWeb/SVG/FragmentIdentifier.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGSymbolElement.h>
@@ -72,6 +73,24 @@ void SVGUseElement::adopted_from(DOM::Document& old_document)
 
     if (m_load_event_delayer.has_value())
         m_load_event_delayer.emplace(document());
+
+    m_document_observer->retarget_for_adoption(document());
+
+    auto href = href_value();
+    if (!href.has_value())
+        return;
+
+    m_href = document().encoding_parse_url(*href);
+    if (!m_href.has_value())
+        return;
+
+    if (!is_referenced_element_same_document()) {
+        fetch_the_document(*m_href);
+        return;
+    }
+
+    if (auto to_clone = referenced_element())
+        clone_element_tree_as_our_shadow_tree(to_clone);
 }
 
 void SVGUseElement::inserted()
@@ -88,9 +107,7 @@ void SVGUseElement::inserted()
     // The insertion that connected us may have inserted our referenced element along with us, with its insertion
     // steps running before ours, i.e. before we were registered to be notified about changes to it. If our shadow
     // tree has not been populated yet, try resolving the reference again.
-    // NB: While the document is still loading, the document-completely-loaded hook repopulates empty shadow trees,
-    //     so there is nothing to do here in that case.
-    if (!instance_root() && document().is_completely_loaded()
+    if (!instance_root()
         && m_href.has_value() && m_href->fragment().has_value() && is_referenced_element_same_document()) {
         clone_element_tree_as_our_shadow_tree(referenced_element());
     }
@@ -123,7 +140,7 @@ void SVGUseElement::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<Node> old_
 
     register_for_referenced_element_changes();
 
-    if (!instance_root() && document().is_completely_loaded()
+    if (!instance_root()
         && m_href.has_value() && m_href->fragment().has_value() && is_referenced_element_same_document()) {
         clone_element_tree_as_our_shadow_tree(referenced_element());
     }
@@ -152,30 +169,37 @@ void SVGUseElement::unregister_for_referenced_element_changes()
     document().unregister_svg_use_element({}, *this);
 }
 
-void SVGUseElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGUseElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
     // https://svgwg.org/svg2-draft/struct.html#UseLayout
     if (name == SVG::AttributeNames::x) {
-        m_x = AttributeParser::parse_coordinate(value.value_or(String {}));
+        m_x = AttributeParser::parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::y) {
-        m_y = AttributeParser::parse_coordinate(value.value_or(String {}));
-    } else if (name == SVG::AttributeNames::href || name == "xlink:href"_fly_string) {
+        m_y = AttributeParser::parse_number_percentage(value.value_or({}));
+    } else if (name == SVG::AttributeNames::href || name == SVG::AttributeNames::xlink_href) {
         // When the ‘href’ attribute is set (or, in the absence of an ‘href’ attribute, an ‘xlink:href’ attribute), the user agent must process the URL.
         process_the_url(value);
     }
 }
 
+Optional<Utf16String> SVGUseElement::href_value() const
+{
+    if (auto href = get_attribute_ns(Optional<Utf16FlyString> {}, AttributeNames::href); href.has_value())
+        return href;
+    return get_attribute_ns(Namespace::XLink, AttributeNames::href);
+}
+
 // https://www.w3.org/TR/SVG2/linking.html#processingURL
-void SVGUseElement::process_the_url(Optional<String> const& href)
+void SVGUseElement::process_the_url(Optional<Utf16String> const& href)
 {
     // In all other cases, the URL is for a resource to be used in this SVG document. The user agent
     // must parse the URL to separate out the target fragment from the rest of the URL, and compare
     // it with the document base URL. If all parts other than the target fragment are equal, this is
     // a same-document URL reference, and processing the URL must continue as indicated in Identifying
     // the target element with the current document as the referenced document.
-    m_href = document().url().complete_url(href.value_or(String {}));
+    m_href = document().encoding_parse_url(href.value_or({}));
     if (!m_href.has_value())
         return;
 
@@ -193,9 +217,20 @@ bool SVGUseElement::is_referenced_element_same_document() const
 
 Gfx::AffineTransform SVGUseElement::element_transform() const
 {
+    CSSPixelSize viewport_size;
+    if (auto* svg_svg_element = first_flat_tree_ancestor_of_type<SVGSVGElement>()) {
+        if (auto view_box = svg_svg_element->active_view_box(); view_box.has_value())
+            viewport_size = { CSSPixels::nearest_value_for(view_box->width), CSSPixels::nearest_value_for(view_box->height) };
+        else if (auto svg_svg_layout_node = svg_svg_element->unsafe_layout_node())
+            viewport_size = { svg_svg_layout_node->computed_values().width().to_px(0), svg_svg_layout_node->computed_values().height().to_px(0) };
+    }
+
+    auto x = m_x.value_or(NumberPercentage::create_number(0)).resolve_relative_to(viewport_size.width().to_float());
+    auto y = m_y.value_or(NumberPercentage::create_number(0)).resolve_relative_to(viewport_size.height().to_float());
+
     // The x and y properties define an additional transformation (translate(x,y), where x and y represent the computed value of the corresponding property)
     // to be applied to the ‘use’ element, after any transformations specified with other properties
-    return Base::element_transform().translate(m_x.value_or(0), m_y.value_or(0));
+    return Base::element_transform().translate(x, y);
 }
 
 void SVGUseElement::svg_element_changed(SVGElement& svg_element)
@@ -228,8 +263,8 @@ void SVGUseElement::svg_element_removed(SVGElement& svg_element)
         return;
     }
 
-    auto id = String::from_utf8_with_replacement_character(URL::percent_decode(*m_href->fragment()), String::WithBOMHandling::No);
-    if (AK::StringUtils::matches(svg_element.get_attribute_value("id"_fly_string), id)) {
+    auto id = decode_fragment_identifier(*m_href->fragment());
+    if (svg_element.get_attribute_value("id"_utf16_fly_string) == id) {
         shadow_root()->remove_all_children();
     }
 }
@@ -244,7 +279,7 @@ GC::Ptr<DOM::Element> SVGUseElement::referenced_element() const
         return nullptr;
 
     if (is_referenced_element_same_document()) {
-        auto id = String::from_utf8_with_replacement_character(URL::percent_decode(*m_href->fragment()), String::WithBOMHandling::No);
+        auto id = decode_fragment_identifier(*m_href->fragment());
         return document().get_element_by_id(id);
     }
 
@@ -255,7 +290,7 @@ GC::Ptr<DOM::Element> SVGUseElement::referenced_element() const
     if (!data || !is<SVG::SVGDecodedImageData>(*data))
         return nullptr;
 
-    return as<SVG::SVGDecodedImageData>(*data).svg_document().get_element_by_id(*m_href->fragment());
+    return as<SVG::SVGDecodedImageData>(*data).svg_document().get_element_by_id(decode_fragment_identifier(*m_href->fragment()));
 }
 
 // https://svgwg.org/svg2-draft/linking.html#processingURL-fetch
@@ -360,48 +395,13 @@ bool SVGUseElement::would_create_circular_reference_impl(
     return found_circular_reference;
 }
 
-// https://www.w3.org/TR/SVG11/shapes.html#RectElementXAttribute
-GC::Ref<SVGAnimatedLength> SVGUseElement::x() const
-{
-    // FIXME: Populate the unit type when it is parsed (0 here is "unknown").
-    // FIXME: Create a proper animated value when animations are supported.
-    auto base_length = SVGLength::create(realm(), 0, m_x.value_or(0), SVGLength::ReadOnly::No);
-    auto anim_length = SVGLength::create(realm(), 0, m_x.value_or(0), SVGLength::ReadOnly::Yes);
-    return SVGAnimatedLength::create(realm(), base_length, anim_length);
-}
-
-// https://www.w3.org/TR/SVG11/shapes.html#RectElementYAttribute
-GC::Ref<SVGAnimatedLength> SVGUseElement::y() const
-{
-    // FIXME: Populate the unit type when it is parsed (0 here is "unknown").
-    // FIXME: Create a proper animated value when animations are supported.
-    auto base_length = SVGLength::create(realm(), 0, m_y.value_or(0), SVGLength::ReadOnly::No);
-    auto anim_length = SVGLength::create(realm(), 0, m_y.value_or(0), SVGLength::ReadOnly::Yes);
-    return SVGAnimatedLength::create(realm(), base_length, anim_length);
-}
-
-GC::Ref<SVGAnimatedLength> SVGUseElement::width() const
-{
-    return fake_animated_length_fixme();
-}
-
-GC::Ref<SVGAnimatedLength> SVGUseElement::height() const
-{
-    return fake_animated_length_fixme();
-}
-
 // https://svgwg.org/svg2-draft/struct.html#TermInstanceRoot
 GC::Ptr<SVGElement> SVGUseElement::instance_root() const
 {
     return const_cast<DOM::ShadowRoot&>(*shadow_root()).first_child_of_type<SVGElement>();
 }
 
-GC::Ptr<SVGElement> SVGUseElement::animated_instance_root() const
-{
-    return instance_root();
-}
-
-RefPtr<Layout::Node> SVGUseElement::create_layout_node(CSS::ComputedProperties const& style)
+RefPtr<Layout::Node> SVGUseElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
 {
     return make_ref_counted<Layout::SVGGraphicsBox>(document(), *this, style);
 }

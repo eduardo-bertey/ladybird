@@ -4,13 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/JsonArray.h>
-#include <AK/JsonObject.h>
 #include <AK/String.h>
 #include <LibCore/EventLoop.h>
-#include <LibCore/System.h>
+#include <LibCore/Process.h>
 #include <LibWebView/ProcessManager.h>
-#include <signal.h>
 
 namespace WebView {
 
@@ -94,6 +91,18 @@ void ProcessManager::for_each_process(Function<void(Process&)> callback)
         callback(entry.value);
 }
 
+void ProcessManager::for_each_process_statistics(Function<void(Process&, Core::Platform::ProcessInfo const&)> callback)
+{
+    verify_event_loop();
+    m_statistics.for_each_process([&](auto const& process) {
+        auto process_handle = m_processes.get(process.pid);
+        if (!process_handle.has_value())
+            return;
+
+        callback(*process_handle, process);
+    });
+}
+
 #if defined(AK_OS_MACH)
 void ProcessManager::set_process_mach_port(pid_t pid, Core::MachPort&& port)
 {
@@ -138,13 +147,8 @@ void ProcessManager::force_exit_after_timeout(pid_t pid, int timeout_ms)
         if (!process.has_value())
             return;
 
-#if defined(AK_OS_WINDOWS)
-        constexpr auto signal = SIGTERM;
-#else
-        constexpr auto signal = SIGKILL;
-#endif
         dbgln("Force-killing unresponsive {} process {}", process_name_from_type(process->type()), pid);
-        auto result = Core::System::kill(pid, signal);
+        auto result = Core::Process::terminate_process(pid, Core::Process::TerminationMode::Forceful);
         if (result.is_error())
             dbgln("Failed to force-kill process {}: {}", pid, result.error());
     });
@@ -156,32 +160,6 @@ void ProcessManager::update_all_process_statistics()
 {
     verify_event_loop();
     (void)update_process_statistics(m_statistics);
-}
-
-JsonValue ProcessManager::serialize_json()
-{
-    verify_event_loop();
-    JsonArray serialized;
-
-    m_statistics.for_each_process([&](auto const& process) {
-        auto& process_handle = m_processes.get(process.pid).value();
-
-        auto type = WebView::process_name_from_type(process_handle.type());
-        auto const& title = process_handle.title();
-
-        auto process_name = title.has_value()
-            ? MUST(String::formatted("{} - {}", type, *title))
-            : String::from_utf8_without_validation(type.bytes());
-
-        JsonObject object;
-        object.set("name"sv, move(process_name));
-        object.set("pid"sv, process.pid);
-        object.set("cpu"sv, process.cpu_percent);
-        object.set("memory"sv, process.memory_usage_bytes);
-        serialized.must_append(move(object));
-    });
-
-    return serialized;
 }
 
 void ProcessManager::verify_event_loop() const

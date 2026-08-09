@@ -6,13 +6,13 @@
 
 #include <LibWeb/CSS/StyleValues/PositionStyleValue.h>
 #include <LibWeb/Painting/DisplayListRecordingContext.h>
-#include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/ReplacedElementCommon.h>
 #include <LibWeb/PixelUnits.h>
 
 namespace Web::Painting {
 
-Gfx::IntRect get_replaced_box_painting_area(PaintableBox const& paintable, DisplayListRecordingContext const& context, CSS::ObjectFit object_fit, Gfx::IntSize content_size)
+Gfx::IntRect get_replaced_box_painting_area(Paintable const& paintable, DisplayListRecordingContext const& context, CSS::ObjectFit object_fit, CSSPixelSize content_size)
 {
     if (content_size.is_empty())
         return {};
@@ -23,7 +23,7 @@ Gfx::IntRect get_replaced_box_painting_area(PaintableBox const& paintable, Displ
 
     auto paintable_rect_device_pixels = context.rounded_device_rect(paintable_rect);
 
-    auto bitmap_aspect_ratio = CSSPixels(content_size.height()) / content_size.width();
+    auto bitmap_aspect_ratio = content_size.height() / content_size.width();
     auto image_aspect_ratio = paintable_rect.height() / paintable_rect.width();
 
     auto scale_x = CSSPixelFraction(1);
@@ -66,8 +66,8 @@ Gfx::IntRect get_replaced_box_painting_area(PaintableBox const& paintable, Displ
         break;
     }
 
-    auto scaled_bitmap_width = CSSPixels(content_size.width()) * scale_x;
-    auto scaled_bitmap_height = CSSPixels(content_size.height()) * scale_y;
+    auto scaled_bitmap_width = content_size.width() * scale_x;
+    auto scaled_bitmap_height = content_size.height() * scale_y;
 
     auto residual_horizontal = paintable_rect.width() - scaled_bitmap_width;
     auto residual_vertical = paintable_rect.height() - scaled_bitmap_height;
@@ -77,16 +77,16 @@ Gfx::IntRect get_replaced_box_painting_area(PaintableBox const& paintable, Displ
 
     auto offset_x = CSSPixels::from_raw(0);
     if (object_position.edge_x == CSS::PositionEdge::Left) {
-        offset_x = object_position.offset_x.to_px(paintable.layout_node(), residual_horizontal);
+        offset_x = object_position.offset_x.to_px(residual_horizontal);
     } else if (object_position.edge_x == CSS::PositionEdge::Right) {
-        offset_x = residual_horizontal - object_position.offset_x.to_px(paintable.layout_node(), residual_horizontal);
+        offset_x = residual_horizontal - object_position.offset_x.to_px(residual_horizontal);
     }
 
     auto offset_y = CSSPixels::from_raw(0);
     if (object_position.edge_y == CSS::PositionEdge::Top) {
-        offset_y = object_position.offset_y.to_px(paintable.layout_node(), residual_vertical);
+        offset_y = object_position.offset_y.to_px(residual_vertical);
     } else if (object_position.edge_y == CSS::PositionEdge::Bottom) {
-        offset_y = residual_vertical - object_position.offset_y.to_px(paintable.layout_node(), residual_vertical);
+        offset_y = residual_vertical - object_position.offset_y.to_px(residual_vertical);
     }
 
     return Gfx::IntRect(

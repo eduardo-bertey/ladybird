@@ -49,23 +49,12 @@ void HTMLTableElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_t_bodies);
 }
 
-void HTMLTableElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
+static unsigned parse_border(Utf16View value)
 {
-    Base::adjust_computed_style(style);
-
-    // Tables must not inherit -libweb-* values for text-align.
-    // FIXME: Find the spec for this.
-    auto text_align = style.style().text_align();
-    if (text_align == CSS::TextAlign::LibwebLeft || text_align == CSS::TextAlign::LibwebCenter || text_align == CSS::TextAlign::LibwebRight)
-        style.set_property(CSS::PropertyID::TextAlign, CSS::KeywordStyleValue::create(CSS::Keyword::Start));
+    return parse_non_negative_integer(value).value_or(0);
 }
 
-static unsigned parse_border(StringView value)
-{
-    return value.to_number<unsigned>().value_or(0);
-}
-
-bool HTMLTableElement::is_presentational_hint(FlyString const& name) const
+bool HTMLTableElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -85,7 +74,7 @@ bool HTMLTableElement::is_presentational_hint(FlyString const& name) const
 void HTMLTableElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
     Base::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
         if (name == HTML::AttributeNames::width) {
             if (auto parsed_value = parse_nonzero_dimension_value(value))
                 properties.append({ .property_id = CSS::PropertyID::Width, .value = parsed_value.release_nonnull() });
@@ -97,7 +86,7 @@ void HTMLTableElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pr
             return;
         }
         if (name == HTML::AttributeNames::align) {
-            if (value.equals_ignoring_ascii_case("center"sv)) {
+            if (value.equals_ignoring_ascii_case(u"center"sv)) {
                 properties.append({ .property_id = CSS::PropertyID::MarginLeft, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Auto) });
                 properties.append({ .property_id = CSS::PropertyID::MarginRight, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Auto) });
             } else if (auto parsed_value = parse_css_value(CSS::Parser::ParsingParams { document() }, value, CSS::PropertyID::Float)) {
@@ -154,7 +143,7 @@ void HTMLTableElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pr
     });
 }
 
-void HTMLTableElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLTableElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
@@ -509,7 +498,7 @@ WebIDL::ExceptionOr<void> HTMLTableElement::delete_row(WebIDL::Long index)
 
 unsigned int HTMLTableElement::border() const
 {
-    return parse_border(get_attribute_value(HTML::AttributeNames::border));
+    return parse_border(get_attribute_value_view(HTML::AttributeNames::border).value_or({}));
 }
 
 Optional<u32> HTMLTableElement::cellpadding() const

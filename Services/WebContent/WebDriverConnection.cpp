@@ -14,6 +14,8 @@
 #include <AK/LexicalPath.h>
 #include <AK/RefCounted.h>
 #include <AK/Time.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16String.h>
 #include <AK/Vector.h>
 #include <LibCore/File.h>
 #include <LibCore/Process.h>
@@ -29,7 +31,6 @@
 #include <LibIPC/Transport.h>
 #include <LibJS/Runtime/Value.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
@@ -54,10 +55,11 @@
 #include <LibWeb/HTML/HTMLOptionElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigationObserver.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SelectedFile.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HTML/XMLSerializer.h>
 #include <LibWeb/Loader/FileRequest.h>
@@ -141,7 +143,7 @@ static Gfx::IntRect compute_window_rect(Web::Page const& page)
     };
 }
 
-static Optional<size_t> current_top_level_entry_index(Web::HTML::TraversableNavigable::SessionHistorySnapshot const& session_history_snapshot)
+static Optional<size_t> current_top_level_entry_index(Web::HTML::LocalTraversableNavigable::SessionHistorySnapshot const& session_history_snapshot)
 {
     VERIFY(session_history_snapshot.current_used_step_index < session_history_snapshot.used_session_history_steps.size());
     auto current_step = session_history_snapshot.used_session_history_steps[session_history_snapshot.current_used_step_index];
@@ -155,7 +157,7 @@ static Optional<size_t> current_top_level_entry_index(Web::HTML::TraversableNavi
     return result;
 }
 
-static JsonObject serialize_session_history_snapshot_for_webdriver(Web::HTML::TraversableNavigable::SessionHistorySnapshot const& session_history_snapshot)
+static JsonObject serialize_session_history_snapshot_for_webdriver(Web::HTML::LocalTraversableNavigable::SessionHistorySnapshot const& session_history_snapshot)
 {
     JsonObject serialized;
     serialized.set("currentUsedStepIndex"sv, session_history_snapshot.current_used_step_index);
@@ -226,7 +228,7 @@ static Optional<Web::DOM::Element&> container_for_element(Web::DOM::Element& ele
 }
 
 template<typename T>
-static bool fire_an_event(FlyString const& name, Optional<Web::DOM::Element&> target)
+static bool fire_an_event(Utf16FlyString const& name, Optional<Web::DOM::Element&> target)
 {
     // FIXME: This is supposed to call the https://dom.spec.whatwg.org/#concept-event-fire DOM algorithm,
     //        but that doesn't seem to be implemented elsewhere. So, we'll ad-hack it for now. :^)
@@ -257,7 +259,7 @@ ErrorOr<NonnullRefPtr<WebDriverConnection>> WebDriverConnection::connect(Web::Pa
     auto transport = TRY(IPC::Transport::from_socket(move(socket)));
 #endif
     auto connection = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) WebDriverConnection(move(transport), page_client)));
-    connection->async_did_set_window_handle(page_client.page().top_level_traversable()->window_handle());
+    connection->async_did_set_window_handle(page_client.page().top_level_traversable()->window_handle().to_utf8());
     return connection;
 }
 
@@ -321,9 +323,8 @@ void WebDriverConnection::close_session()
     set_is_webdriver_active(false);
 
     // 5. Optionally, close all top-level browsing contexts, without prompting to unload.
-    for (auto navigable : Web::HTML::all_navigables()) {
-        if (auto traversable = navigable->top_level_traversable())
-            traversable->close_top_level_traversable();
+    for (auto navigable : Web::HTML::all_local_navigables()) {
+        as<Web::HTML::LocalTraversableNavigable>(*navigable->top_level_traversable()).close_top_level_traversable();
     }
 }
 
@@ -390,7 +391,7 @@ Messages::WebDriverClient::NavigateToResponse WebDriverConnection::navigate_to(J
     // FIXME: 3. If url is not an absolute URL or is not an absolute URL with fragment or not a local scheme, return error with error code invalid argument.
 
     auto const& current_url = current_top_level_browsing_context()->active_document()->url();
-    auto will_replace_web_content_process = !current_top_level_browsing_context()->page().client().is_url_suitable_for_same_process_navigation(current_url, url.value());
+    auto will_replace_web_content_process = current_top_level_browsing_context()->page().client().decide_navigation_process(current_url, url.value(), Web::NavigationTarget::TopLevel) == Web::NavigationProcessDecision::Remote;
 
     // 4. Handle any user prompts and return its value if it is an error.
     handle_any_user_prompts([this, url = move(url), will_replace_web_content_process]() {
@@ -467,7 +468,7 @@ Messages::WebDriverClient::BackResponse WebDriverConnection::back()
             metadata->will_replace_web_content_process = traversal_result.will_replace_web_content_process;
             metadata->wait_for_navigation_completion = true;
             if (metadata->will_replace_web_content_process)
-                async_did_start_window_replacement(current_top_level_browsing_context()->page().top_level_traversable()->window_handle());
+                async_did_start_window_replacement(current_top_level_browsing_context()->page().top_level_traversable()->window_handle().to_utf8());
             if (metadata->sync_response_returned)
                 async_driver_execution_complete(JsonValue {});
             else
@@ -499,7 +500,7 @@ Messages::WebDriverClient::ForwardResponse WebDriverConnection::forward()
             metadata->will_replace_web_content_process = traversal_result.will_replace_web_content_process;
             metadata->wait_for_navigation_completion = true;
             if (metadata->will_replace_web_content_process)
-                async_did_start_window_replacement(current_top_level_browsing_context()->page().top_level_traversable()->window_handle());
+                async_did_start_window_replacement(current_top_level_browsing_context()->page().top_level_traversable()->window_handle().to_utf8());
             if (metadata->sync_response_returned)
                 async_driver_execution_complete(JsonValue {});
             else
@@ -568,7 +569,7 @@ Messages::WebDriverClient::LoadUrlFromUiResponse WebDriverConnection::load_url_f
         return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload has an invalid `url`"sv);
 
     auto const& current_url = current_top_level_browsing_context()->active_document()->url();
-    auto will_replace_web_content_process = !current_top_level_browsing_context()->page().client().is_url_suitable_for_same_process_navigation(current_url, *url);
+    auto will_replace_web_content_process = current_top_level_browsing_context()->page().client().decide_navigation_process(current_url, *url, Web::NavigationTarget::TopLevel) == Web::NavigationProcessDecision::Remote;
 
     auto& page_client = static_cast<WebContent::PageClient&>(current_top_level_browsing_context()->page().client());
     auto response = page_client.request_webdriver_load_url_from_ui(*url);
@@ -596,7 +597,7 @@ Messages::WebDriverClient::TraverseHistoryFromUiResponse WebDriverConnection::tr
         }
 
         if (traversal_result.will_replace_web_content_process)
-            async_did_start_window_replacement(current_top_level_browsing_context()->page().top_level_traversable()->window_handle());
+            async_did_start_window_replacement(current_top_level_browsing_context()->page().top_level_traversable()->window_handle().to_utf8());
 
         JsonObject result;
         result.set("willReplaceWebContentProcess"sv, traversal_result.will_replace_web_content_process);
@@ -684,15 +685,16 @@ Messages::WebDriverClient::SwitchToWindowResponse WebDriverConnection::switch_to
     // 4. If handle is equal to the associated window handle for some top-level browsing context, let context be the that
     //    browsing context, and set the current top-level browsing context with session and context.
     //    Otherwise, return error with error code no such window.
+    auto handle_utf16 = Utf16String::from_utf8(handle);
     bool found_matching_context = false;
 
-    for (auto navigable : Web::HTML::all_navigables()) {
-        auto traversable = navigable->top_level_traversable();
-        if (!traversable || !traversable->active_browsing_context())
+    for (auto navigable : Web::HTML::all_local_navigables()) {
+        auto& traversable = as<Web::HTML::LocalTraversableNavigable>(*navigable->top_level_traversable());
+        if (!traversable.active_browsing_context())
             continue;
 
-        if (handle == traversable->window_handle()) {
-            set_current_top_level_browsing_context(*traversable->active_browsing_context());
+        if (handle_utf16 == traversable.window_handle()) {
+            set_current_top_level_browsing_context(*traversable.active_browsing_context());
             found_matching_context = true;
             break;
         }
@@ -743,10 +745,10 @@ Messages::WebDriverClient::NewWindowResponse WebDriverConnection::new_window(Jso
         VERIFY(active_window);
 
         Web::HTML::TemporaryExecutionContext execution_context { active_window->document()->realm() };
-        auto [target_navigable, no_opener, window_type] = MUST(active_window->window_open_steps_internal("about:blank"sv, ""sv, "noopener"sv));
+        auto [target_navigable, no_opener, window_type] = MUST(active_window->window_open_steps_internal(u"about:blank"sv, u""sv, u"noopener"sv));
 
         // 6. Let handle be the associated window handle of the newly created window.
-        auto handle = target_navigable->traversable_navigable()->window_handle();
+        auto handle = target_navigable->traversable_navigable()->window_handle().to_utf8();
 
         // 7. Let type be "tab" if the newly created window shares an OS-level window with the current browsing context, or "window" otherwise.
         auto type = "tab"sv;
@@ -848,7 +850,7 @@ Messages::WebDriverClient::SwitchToFrameResponse WebDriverConnection::switch_to_
 
             // 5. Set the current browsing context with session and element's content navigable's active browsing context.
             auto& navigable_container = static_cast<Web::HTML::NavigableContainer&>(*element);
-            set_current_browsing_context(*navigable_container.content_navigable()->active_browsing_context());
+            set_current_browsing_context(*as<Web::HTML::LocalNavigable>(*navigable_container.content_navigable()).active_browsing_context());
 
             async_driver_execution_complete(JsonValue {});
         });
@@ -1434,17 +1436,19 @@ Messages::WebDriverClient::GetElementAttributeResponse WebDriverConnection::get_
         // 5. Let result be the result of the first matching condition:
         String result {};
 
+        auto const utf16_name = Utf16FlyString::from_utf8(name);
+
         // -> If name is a boolean attribute
-        if (Web::HTML::is_boolean_attribute(name)) {
+        if (Web::HTML::is_boolean_attribute(utf16_name)) {
             // "true" (string) if the element hasAttribute() with name, otherwise null.
-            if (element->has_attribute(name))
+            if (element->has_attribute(utf16_name))
                 result = "true"_string;
         }
         // -> Otherwise
         else {
             // The result of getting an attribute by name name.
-            if (auto attr = element->get_attribute(name); attr.has_value())
-                result = attr.release_value();
+            if (auto attr = element->get_attribute(utf16_name); attr.has_value())
+                result = attr.release_value().to_utf8();
         }
 
         // 5. Return success with data result.
@@ -1511,8 +1515,8 @@ Messages::WebDriverClient::GetElementCssValueResponse WebDriverConnection::get_e
                         if (auto const* style_property = data->get(property->name()))
                             computed_value = style_property->value->to_string(Web::CSS::SerializationMode::Normal);
                     }
-                } else if (auto computed_properties = element->computed_properties()) {
-                    computed_value = computed_properties->property(property->id()).to_string(Web::CSS::SerializationMode::Normal);
+                } else if (auto computed_values = element->computed_values()) {
+                    computed_value = computed_values->computed_style_value(property->id())->to_string(Web::CSS::SerializationMode::Normal);
                 }
             }
         }
@@ -1565,7 +1569,7 @@ Messages::WebDriverClient::GetElementTagNameResponse WebDriverConnection::get_el
         auto qualified_name = element->local_name();
 
         // 5. Return success with data qualified name.
-        async_driver_execution_complete({ qualified_name.to_string() });
+        async_driver_execution_complete({ qualified_name.view().to_utf8_but_should_be_ported_to_utf16() });
     });
 
     return JsonValue {};
@@ -1647,7 +1651,7 @@ Messages::WebDriverClient::GetComputedRoleResponse WebDriverConnection::get_comp
 
         // 5. Return success with data role.
         if (role.has_value()) {
-            async_driver_execution_complete({ Web::ARIA::role_name(*role) });
+            async_driver_execution_complete({ Web::ARIA::role_name(*role).to_utf8() });
             return;
         }
         async_driver_execution_complete(JsonValue {});
@@ -1671,7 +1675,7 @@ Messages::WebDriverClient::GetComputedLabelResponse WebDriverConnection::get_com
         auto label = element->accessible_name(element->document()).release_value_but_fixme_should_propagate_errors();
 
         // 5. Return success with data label.
-        async_driver_execution_complete({ move(label) });
+        async_driver_execution_complete({ label.to_utf8() });
     });
 
     return JsonValue {};
@@ -2056,7 +2060,9 @@ Web::WebDriver::Response WebDriverConnection::element_send_keys_impl(StringView 
                         return;
                     }
 
-                    selected_files.append(Web::HTML::SelectedFile { LexicalPath::basename(path), contents_or_error.release_value() });
+                    selected_files.append(Web::HTML::SelectedFile {
+                        Utf16String::from_utf8(LexicalPath::basename(path)),
+                        contents_or_error.release_value() });
                     self(move(paths), index + 1, move(selected_files));
                 });
 
@@ -2069,11 +2075,8 @@ Web::WebDriver::Response WebDriverConnection::element_send_keys_impl(StringView 
             // 7. Fire these events in order on element:
             //     1. input
             //     2. change
-            // NOTE: These events are fired by `did_select_files` as an element task. So instead of firing them here, we
-            //       spin the event loop once before informing the client that the action is complete.
-            Web::HTML::queue_a_task(Web::HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(connection->current_browsing_context().heap(), [connection]() {
-                connection->async_driver_execution_complete(JsonValue {});
-            }));
+            // NOTE: These events are fired synchronously by `did_select_files`.
+            connection->async_driver_execution_complete(JsonValue {});
         };
 
         read_files_and_apply_selection(move(files), 0, {});
@@ -2375,12 +2378,20 @@ Web::WebDriver::Response WebDriverConnection::add_cookie_impl(JsonObject const& 
     //     The value if the entry exists, otherwise the current browsing context’s active document’s URL domain.
     // NOTE: The otherwise case is handled by the CookieJar
     if (data.has("domain"sv)) {
-        cookie.domain = TRY(Web::WebDriver::get_property(data, "domain"sv));
+        auto domain = TRY(Web::WebDriver::get_property(data, "domain"sv));
+
+        // NB: Clients conventionally send parent-domain cookies with a leading '.', which the Set-Cookie parser
+        //     would strip. Strip it here as well, since the cookie store never sees a leading dot.
+        if (domain.starts_with_bytes("."sv))
+            domain = MUST(domain.substring_from_byte_offset(1));
 
         // FIXME: Spec issue: We must return InvalidCookieDomain for invalid domains, rather than InvalidArgument.
         // https://github.com/w3c/webdriver/issues/1570
-        if (!HTTP::Cookie::domain_matches(*cookie.domain, document->domain()))
+        auto document_domain = document->domain().to_utf8();
+        if (!HTTP::Cookie::domain_matches(document_domain, domain))
             return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidCookieDomain, "Cookie domain does not match document domain"sv);
+
+        cookie.domain = move(domain);
     }
 
     // Cookie secure only
@@ -2591,7 +2602,7 @@ Messages::WebDriverClient::GetAlertTextResponse WebDriverConnection::get_alert_t
 
     // 4. Return success with data message.
     if (message.has_value())
-        return message.value();
+        return message->to_utf8();
     return JsonValue {};
 }
 
@@ -2630,7 +2641,7 @@ Messages::WebDriverClient::SendAlertTextResponse WebDriverConnection::send_alert
     }
 
     // 6. Perform user agent dependent steps to set the value of current user prompt’s text field to text.
-    current_browsing_context().page().client().page_did_request_set_prompt_text(text);
+    current_browsing_context().page().client().page_did_request_set_prompt_text(Utf16String::from_utf8(text));
 
     // 7. Return success with data null.
     return JsonValue {};
@@ -2725,7 +2736,7 @@ void WebDriverConnection::set_current_browsing_context(Web::HTML::BrowsingContex
     // 2. Set the session's current parent browsing context to the parent browsing context of context, if that context
     //    exists, or null otherwise.
     if (auto navigable = browsing_context.active_document()->navigable(); navigable && navigable->parent())
-        m_current_parent_browsing_context = navigable->parent()->active_browsing_context();
+        m_current_parent_browsing_context = as<Web::HTML::LocalNavigable>(*navigable->parent()).active_browsing_context();
     else
         m_current_parent_browsing_context = nullptr;
 }
@@ -2776,7 +2787,7 @@ Web::WebDriver::PromptHandlerConfiguration WebDriverConnection::get_the_prompt_h
 }
 
 // https://w3c.github.io/webdriver/#dfn-annotated-unexpected-alert-open-error
-static Web::WebDriver::Error create_annotated_unexpected_alert_open_error(Optional<String> const& text)
+static Web::WebDriver::Error create_annotated_unexpected_alert_open_error(Optional<Utf16String> const& text)
 {
     // An annotated unexpected alert open error is an error with error code unexpected alert open and an optional error
     // data dictionary with the following entries:
@@ -2784,7 +2795,7 @@ static Web::WebDriver::Error create_annotated_unexpected_alert_open_error(Option
     //         The current user prompt's message.
     auto data = text.map([&](auto const& text) -> JsonValue {
         JsonObject data;
-        data.set("text"sv, text);
+        data.set("text"sv, text.to_utf8());
         return data;
     });
 
@@ -3043,7 +3054,9 @@ public:
         GC::Ref<GC::Timer> timer)
         : m_browsing_context(browsing_context)
         , m_location_strategy(location_strategy)
-        , m_selector(move(selector))
+        , m_selector(location_strategy == Web::WebDriver::LocationStrategy::TagName
+                  ? Variant<String, Utf16FlyString> { Utf16FlyString::from_utf8(selector) }
+                  : Variant<String, Utf16FlyString> { move(selector) })
         , m_get_start_node(get_start_node)
         , m_on_complete(on_complete)
         , m_timer(timer)
@@ -3106,7 +3119,7 @@ private:
     GC::Ref<Web::HTML::BrowsingContext const> m_browsing_context;
 
     Web::WebDriver::LocationStrategy m_location_strategy;
-    String m_selector;
+    Variant<String, Utf16FlyString> m_selector;
 
     WebDriverConnection::GetStartNode m_get_start_node;
     WebDriverConnection::OnFindComplete m_on_complete;

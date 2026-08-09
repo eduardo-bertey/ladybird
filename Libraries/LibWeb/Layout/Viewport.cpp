@@ -11,13 +11,13 @@
 #include <LibWeb/Dump.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
-#include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/StackingContext.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 
 namespace Web::Layout {
 
-Viewport::Viewport(DOM::Document& document, CSS::ComputedProperties const& style)
+Viewport::Viewport(DOM::Document& document, NonnullRefPtr<CSS::ComputedValues const> style)
     : BlockContainer(document, &document, style)
 {
 }
@@ -74,7 +74,7 @@ void Viewport::update_text_blocks()
     };
 
     for_each_in_inclusive_subtree([&](auto const& layout_node) {
-        if (layout_node.display().is_none() || !layout_node.first_paintable() || !layout_node.first_paintable()->is_visible())
+        if (auto const* layout_node_with_style = as_if<NodeWithStyle>(layout_node); layout_node_with_style && layout_node_with_style->display().is_none())
             return TraversalDecision::Continue;
 
         auto const pseudo = layout_node.generated_for_pseudo_element();
@@ -86,6 +86,10 @@ void Viewport::update_text_blocks()
         }
 
         if (auto* text_node = as_if<Layout::TextNode>(layout_node)) {
+            auto const& computed_values = text_node->parent()->computed_values();
+            if (computed_values.visibility() != CSS::Visibility::Visible || computed_values.opacity() == 0)
+                return TraversalDecision::Continue;
+
             // https://html.spec.whatwg.org/multipage/interaction.html#inert-subtrees
             // When a node is inert:
             // - The user agent should ignore the node for the purposes of find-in-page.
@@ -97,7 +101,7 @@ void Viewport::update_text_blocks()
             if (dom_node.is_inert())
                 return TraversalDecision::Continue;
 
-            auto white_space_collapse = text_node->computed_values().white_space_collapse();
+            auto white_space_collapse = computed_values.white_space_collapse();
             auto const should_collapse = first_is_one_of(white_space_collapse,
                 CSS::WhiteSpaceCollapse::Collapse,
                 CSS::WhiteSpaceCollapse::PreserveBreaks);
