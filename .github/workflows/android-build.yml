@@ -78,14 +78,31 @@ jobs:
           done
           # The host tool links AK, which needs simdutf and mimalloc as real libraries, plus the
           # fmt and fast_float headers. Android-triplet .a libs cannot link into a macOS binary,
-          # so install these four for the HOST triplet (arm64-osx). Run from $RUNNER_TEMP (outside
-          # the repo) so vcpkg uses classic mode instead of walking up to the repo's vcpkg.json.
-          cd "$RUNNER_TEMP"
-          "$VCPKG_ROOT/vcpkg" install \
-            "simdutf@9.0.0" "mimalloc@2.2.7" "fmt@12.2.0#1" "fast-float@8.2.10#1" \
-            --triplet arm64-osx \
+          # so install these four for the HOST triplet (arm64-osx), pinned to the same versions
+          # the Android manifest resolves (classic mode cannot be version-pinned, so use a small
+          # standalone manifest with overrides; the repo's vcpkg-configuration.json overlay still
+          # applies when walking up from Build/host-tools).
+          HOST_MANIFEST_DIR="${{ github.workspace }}/Build/host-tools/vcpkg-manifest"
+          mkdir -p "$HOST_MANIFEST_DIR"
+          cat > "$HOST_MANIFEST_DIR/vcpkg.json" <<'EOF'
+{
+  "name": "ladybird-host-tools",
+  "version": "1",
+  "dependencies": [ "simdutf", "mimalloc", "fmt", "fast-float" ],
+  "overrides": [
+    { "name": "simdutf", "version": "9.0.0" },
+    { "name": "mimalloc", "version": "2.2.7" },
+    { "name": "fmt", "version": "12.2.0", "port-version": 1 },
+    { "name": "fast-float", "version": "8.2.10", "port-version": 1 }
+  ],
+  "builtin-baseline": "40f3c709db80acf154ac4b17a1f83c564ebd022e"
+}
+EOF
+          cd "$HOST_MANIFEST_DIR"
+          "$VCPKG_ROOT/vcpkg" install --triplet arm64-osx \
             --binarysource="clear;files,${{ github.workspace }}/Build/caches/vcpkg-binary-cache,readwrite"
           cd "${{ github.workspace }}"
+          HOST_VCPKG_INSTALLED="$HOST_MANIFEST_DIR/vcpkg_installed/arm64-osx"
           # generate_interpreter_layout must run on the build host (macOS), so build it for the host.
           # AK requires a C++23 compiler with deducing-this support (clang >= 18), so use brew's llvm@21.
           # The *Windows.cpp sources are Windows-only and must be excluded on macOS.
@@ -98,13 +115,13 @@ jobs:
           done
           "$(brew --prefix llvm@21)/bin/clang++" -std=c++23 -O1 -fno-exceptions -fsigned-char \
             -I. -ILibraries \
-            -I"$VCPKG_ROOT/installed/arm64-osx/include" \
+            -I"$HOST_VCPKG_INSTALLED/include" \
             -DFMT_HEADER_ONLY \
             -Dprivate=public -Dprotected=public \
             -Wno-everything \
             $AK_SOURCES Libraries/LibJS/Interpreter/GenerateLayout.cpp \
-            "$VCPKG_ROOT/installed/arm64-osx/lib/libsimdutf.a" \
-            "$VCPKG_ROOT/installed/arm64-osx/lib/libmimalloc.a" \
+            "$HOST_VCPKG_INSTALLED/lib/libsimdutf.a" \
+            "$HOST_VCPKG_INSTALLED/lib/libmimalloc.a" \
             -Wl,-U,_ak_assertion_handler \
             -o Build/host-tools/generate_interpreter_layout
 
