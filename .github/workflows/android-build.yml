@@ -78,6 +78,7 @@ jobs:
           if-no-files-found: error
 
       - name: Save Caches
+        if: always()
         uses: ./.github/actions/cache-save
         with:
           arch: 'Lagom'

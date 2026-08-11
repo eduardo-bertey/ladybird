@@ -119,6 +119,10 @@ elseif (APPLE)
             LINKER:-u,_ladybird_rust_realloc
         )
     endif()
+elseif (ANDROID)
+    # AK uses __android_log_write() for logging on Android; make sure consumers
+    # of the static AK library link against Android's log library.
+    target_link_libraries(AK PUBLIC log)
 endif()
 
 # Manually install AK headers
