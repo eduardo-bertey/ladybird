@@ -270,6 +270,12 @@ static void install_compiled_fault_handlers()
 
 static void install_compiled_fault_handlers() { }
 
+static StringView cranelift_trap_message(u8 trap_code)
+{
+    (void)trap_code;
+    return "Unknown trap"sv;
+}
+
 #endif
 
 }
