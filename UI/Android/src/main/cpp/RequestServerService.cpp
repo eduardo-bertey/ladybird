@@ -32,7 +32,16 @@ ErrorOr<int> service_main(int ipc_socket)
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
     auto socket = TRY(Core::LocalSocket::adopt_fd(ipc_socket));
-    auto client = TRY(RequestServer::ConnectionFromClient::try_create(make<IPC::Transport>(move(socket))));
+
+    RequestServer::ConnectionFromClient::ConnectionMap connections;
+    Optional<HTTP::DiskCache&> disk_cache;
+    auto client = RequestServer::ConnectionFromClient::construct(
+        make<IPC::Transport>(move(socket)),
+        RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes,
+        RequestServer::IsPrivate::No,
+        connections,
+        disk_cache,
+        ""sv);
 
     return event_loop.exec();
 }
