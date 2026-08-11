@@ -137,7 +137,7 @@ runs:
 
     - name: 'Resolve wasm-tools release'
       id: 'wasm-tools'
-      if: ${{ inputs.type == 'build' && inputs.os != 'Linux' }}
+      if: ${{ inputs.type == 'build' && inputs.os != 'Linux' && inputs.os != 'Android' }}
       shell: bash
       run: |
         VERSION=1.243.0
@@ -160,14 +160,14 @@ runs:
 
     - name: 'Cache wasm-tools'
       id: 'wasm-tools-cache'
-      if: ${{ inputs.type == 'build' && inputs.os != 'Linux' }}
+      if: ${{ inputs.type == 'build' && inputs.os != 'Linux' && inputs.os != 'Android' }}
       uses: actions/cache@v6
       with:
         path: ${{ github.workspace }}/${{ steps.wasm-tools.outputs.name }}
         key: ${{ steps.wasm-tools.outputs.name }}
 
     - name: 'Install wasm-tools'
-      if: ${{ inputs.type == 'build' && inputs.os != 'Linux' && steps.wasm-tools-cache.outputs.cache-hit != 'true' }}
+      if: ${{ inputs.type == 'build' && inputs.os != 'Linux' && inputs.os != 'Android' && steps.wasm-tools-cache.outputs.cache-hit != 'true' }}
       shell: bash
       run: |
         FILENAME="${{ steps.wasm-tools.outputs.filename }}"
@@ -193,7 +193,7 @@ runs:
         rm "${FILENAME}"
 
     - name: 'Add wasm-tools to PATH'
-      if: ${{ inputs.type == 'build' && inputs.os != 'Linux' }}
+      if: ${{ inputs.type == 'build' && inputs.os != 'Linux' && inputs.os != 'Android' }}
       shell: bash
       run: echo "${GITHUB_WORKSPACE}/${{ steps.wasm-tools.outputs.name }}" >> "$GITHUB_PATH"
 
