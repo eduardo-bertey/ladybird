@@ -74,7 +74,8 @@ jobs:
             printf '#pragma once\n#define %s\n' "$api" > "$d/Export.h"
           done
           # generate_interpreter_layout must run on the build host (macOS), so build it for the host.
-          xcrun clang++ -std=c++23 -O1 -fno-exceptions -fsigned-char \
+          # AK requires a C++23 compiler with deducing-this support (clang >= 18), so use brew's llvm@21.
+          "$(brew --prefix llvm@21)/bin/clang++" -std=c++23 -O1 -fno-exceptions -fsigned-char \
             -I. -ILibraries \
             -Dprivate=public -Dprotected=public \
             -Wno-everything \
