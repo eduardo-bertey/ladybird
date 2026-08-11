@@ -1,0 +1,86 @@
+name: Android Build
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+env:
+  # runner.workspace = /home/runner/work/ladybird
+  # github.workspace = /home/runner/work/ladybird/ladybird
+  LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  VCPKG_ROOT:  ${{ github.workspace }}/Build/vcpkg
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || format('{0}-{1}', github.ref, github.run_number) }}
+  cancel-in-progress: true
+
+jobs:
+  CI:
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Set Up Environment
+        id: 'setup'
+        uses: ./.github/actions/setup
+        with:
+          os: 'Android'
+          arch: 'Lagom'
+
+      - name: Set Up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: 17
+
+      - name: Set Up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # === PREPARE FOR BUILDING ===
+
+      - name: Restore Caches
+        uses: ./.github/actions/cache-restore
+        id: 'cache-restore'
+        with:
+          os: 'Android'
+          arch: 'Lagom'
+          toolchain: 'Clang'
+          cache_key_extra: 'Android Build'
+          ccache_path: ${{ steps.setup.outputs.ccache_path }}
+          vcpkg_cache_path: ${{ steps.setup.outputs.vcpkg_cache_path }}
+
+      - name: Install NDK and SDK components
+        run: |
+          yes | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --licenses
+          yes | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "platform-tools" "build-tools;35.0.0" "platforms;android-35"
+          yes | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "ndk;29.0.13599879"
+
+      # === BUILD ===
+
+      - name: Build APK
+        working-directory: ${{ github.workspace }}/UI/Android
+        run: ./gradlew assembleDebug
+        env:
+          GRADLE_OPTS: '-Xmx3072m'
+          LADYBIRD_CACHE_DIR: ${{ github.workspace }}/Build/caches
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladybird-apk
+          path: UI/Android/build/outputs/apk/*/app-*.apk
+          if-no-files-found: error
+
+      - name: Save Caches
+        uses: ./.github/actions/cache-save
+        with:
+          arch: 'Lagom'
+          ccache_path: ${{ steps.setup.outputs.ccache_path }}
+          ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          vcpkg_cache_path: ${{ steps.setup.outputs.vcpkg_cache_path }}
+          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
