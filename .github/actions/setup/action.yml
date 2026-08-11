@@ -93,7 +93,8 @@ runs:
       if: ${{ inputs.os == 'macOS' || inputs.os == 'Android' }}
       shell: bash
       run: |
-        brew update
+        export HOMEBREW_NO_AUTO_UPDATE=1
+        brew update || true
 
         brew install \
             autoconf \
