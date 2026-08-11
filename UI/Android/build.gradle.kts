@@ -28,8 +28,12 @@ android {
                     "-DANDROID_STL=c++_shared",
                     "-DLADYBIRD_CACHE_DIR=$cacheDir",
                     "-DVCPKG_ROOT=$sourceDir/Build/vcpkg",
-                    "-DVCPKG_TARGET_ANDROID=ON"
+                    "-DVCPKG_TARGET_ANDROID=ON",
+                    "-DENABLE_CRANELIFT_JIT=OFF"
                 )
+                System.getenv("LADYBIRD_HOST_LAYOUT_GENERATOR")?.let {
+                    arguments += "-DLADYBIRD_HOST_LAYOUT_GENERATOR=$it"
+                }
             }
         }
         ndk {
