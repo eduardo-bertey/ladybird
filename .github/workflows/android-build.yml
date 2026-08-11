@@ -76,9 +76,7 @@ jobs:
             api="$(echo "${name#Lib}" | tr '[:lower:]' '[:upper:]')_API"
             printf '#pragma once\n#define %s\n' "$api" > "$d/Export.h"
           done
-          # In manifest mode vcpkg installs to <workspace>/vcpkg_installed/<triplet>;
-          # pin the installed dir under Build/ so the include path below is stable.
-          export VCPKG_INSTALLED_DIR="${{ github.workspace }}/Build/vcpkg/installed"
+          # In manifest mode vcpkg installs to <manifest_root>/vcpkg_installed/<triplet>.
           # Install the Android-triplet vcpkg deps now so we can reuse their (arch-independent)
           # headers for the host tool. This is the same install the gradle build would do anyway.
           "$VCPKG_ROOT/vcpkg" install --triplet arm64-android \
@@ -86,14 +84,20 @@ jobs:
           # generate_interpreter_layout must run on the build host (macOS), so build it for the host.
           # AK requires a C++23 compiler with deducing-this support (clang >= 18), so use brew's llvm@21.
           # The *Windows.cpp sources are Windows-only and must be excluded on macOS.
-          shopt -s extglob
+          AK_SOURCES=""
+          for f in AK/*.cpp; do
+            case "$f" in
+              *Windows.cpp) continue ;;
+            esac
+            AK_SOURCES="$AK_SOURCES $f"
+          done
           "$(brew --prefix llvm@21)/bin/clang++" -std=c++23 -O1 -fno-exceptions -fsigned-char \
             -I. -ILibraries \
-            -I"${{ github.workspace }}/Build/vcpkg/installed/arm64-android/include" \
+            -I"${{ github.workspace }}/vcpkg_installed/arm64-android/include" \
             -DFMT_HEADER_ONLY \
             -Dprivate=public -Dprotected=public \
             -Wno-everything \
-            AK/*!(Windows).cpp Libraries/LibJS/Interpreter/GenerateLayout.cpp \
+            $AK_SOURCES Libraries/LibJS/Interpreter/GenerateLayout.cpp \
             -o Build/host-tools/generate_interpreter_layout
 
       # === BUILD ===
