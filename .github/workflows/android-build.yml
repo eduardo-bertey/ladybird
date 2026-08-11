@@ -81,7 +81,9 @@ jobs:
           # so install these four for the HOST triplet (arm64-osx). Run from $RUNNER_TEMP (outside
           # the repo) so vcpkg uses classic mode instead of walking up to the repo's vcpkg.json.
           cd "$RUNNER_TEMP"
-          "$VCPKG_ROOT/vcpkg" install simdutf mimalloc fmt fast-float --triplet arm64-osx \
+          "$VCPKG_ROOT/vcpkg" install \
+            "simdutf@9.0.0" "mimalloc@2.2.7" "fmt@12.2.0#1" "fast-float@8.2.10#1" \
+            --triplet arm64-osx \
             --binarysource="clear;files,${{ github.workspace }}/Build/caches/vcpkg-binary-cache,readwrite"
           cd "${{ github.workspace }}"
           # generate_interpreter_layout must run on the build host (macOS), so build it for the host.
