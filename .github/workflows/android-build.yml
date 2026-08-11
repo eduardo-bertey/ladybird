@@ -76,11 +76,14 @@ jobs:
             api="$(echo "${name#Lib}" | tr '[:lower:]' '[:upper:]')_API"
             printf '#pragma once\n#define %s\n' "$api" > "$d/Export.h"
           done
-          # In manifest mode vcpkg installs to <manifest_root>/vcpkg_installed/<triplet>.
-          # Install the Android-triplet vcpkg deps now so we can reuse their (arch-independent)
-          # headers for the host tool. This is the same install the gradle build would do anyway.
-          "$VCPKG_ROOT/vcpkg" install --triplet arm64-android \
+          # The host tool links AK, which needs simdutf and mimalloc. Android-triplet .a
+          # libraries cannot link into a macOS binary, so install just those two for the
+          # HOST triplet (arm64-osx). Run from a dir without a vcpkg.json to force classic mode.
+          mkdir -p Build/host-tools/vcpkg-classic
+          cd Build/host-tools/vcpkg-classic
+          "$VCPKG_ROOT/vcpkg" install simdutf mimalloc --triplet arm64-osx \
             --binarysource="clear;files,${{ github.workspace }}/Build/caches/vcpkg-binary-cache,readwrite"
+          cd "${{ github.workspace }}"
           # generate_interpreter_layout must run on the build host (macOS), so build it for the host.
           # AK requires a C++23 compiler with deducing-this support (clang >= 18), so use brew's llvm@21.
           # The *Windows.cpp sources are Windows-only and must be excluded on macOS.
@@ -93,11 +96,14 @@ jobs:
           done
           "$(brew --prefix llvm@21)/bin/clang++" -std=c++23 -O1 -fno-exceptions -fsigned-char \
             -I. -ILibraries \
-            -I"${{ github.workspace }}/vcpkg_installed/arm64-android/include" \
+            -I"$VCPKG_ROOT/installed/arm64-osx/include" \
             -DFMT_HEADER_ONLY \
             -Dprivate=public -Dprotected=public \
             -Wno-everything \
             $AK_SOURCES Libraries/LibJS/Interpreter/GenerateLayout.cpp \
+            "$VCPKG_ROOT/installed/arm64-osx/lib/libsimdutf.a" \
+            "$VCPKG_ROOT/installed/arm64-osx/lib/libmimalloc.a" \
+            -Wl,-U,_ak_assertion_handler \
             -o Build/host-tools/generate_interpreter_layout
 
       # === BUILD ===
