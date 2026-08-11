@@ -80,8 +80,9 @@ jobs:
           # fmt and fast_float headers. Android-triplet .a libs cannot link into a macOS binary,
           # so install these four for the HOST triplet (arm64-osx), pinned to the same versions
           # the Android manifest resolves (classic mode cannot be version-pinned, so use a small
-          # standalone manifest with overrides; the repo's vcpkg-configuration.json overlay still
-          # applies when walking up from Build/host-tools).
+          # standalone manifest with overrides. simdutf 9.0.0 has no entry in the builtin-baseline's
+          # version database, so it must come from the repo's overlay-port (same as the Android
+          # build does); point vcpkg at it via a local vcpkg-configuration.json.
           HOST_MANIFEST_DIR="${{ github.workspace }}/Build/host-tools/vcpkg-manifest"
           mkdir -p "$HOST_MANIFEST_DIR"
           cat > "$HOST_MANIFEST_DIR/vcpkg.json" <<'EOF'
@@ -96,6 +97,11 @@ jobs:
               { "name": "fast-float", "version": "8.2.10", "port-version": 1 }
             ],
             "builtin-baseline": "40f3c709db80acf154ac4b17a1f83c564ebd022e"
+          }
+          EOF
+          cat > "$HOST_MANIFEST_DIR/vcpkg-configuration.json" <<'EOF'
+          {
+            "overlay-ports": [ "../../../Meta/CMake/vcpkg/overlay-ports" ]
           }
           EOF
           cd "$HOST_MANIFEST_DIR"
