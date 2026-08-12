@@ -245,10 +245,12 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<u32> screenshot_delay;
     Optional<StringView> screenshot_path;
     bool new_window = false;
+#if !defined(AK_OS_ANDROID)
     bool force_new_process = false;
     Optional<StringView> profile_name;
     Optional<StringView> profile_path;
     bool temporary_profile = false;
+#endif
     bool allow_popups = false;
     bool disable_scripting = false;
     bool disable_sql_database = false;
