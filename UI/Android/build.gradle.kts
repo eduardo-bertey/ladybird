@@ -29,13 +29,7 @@ android {
                     "-DLADYBIRD_CACHE_DIR=$cacheDir",
                     "-DVCPKG_ROOT=$sourceDir/Build/vcpkg",
                     "-DVCPKG_TARGET_ANDROID=ON",
-                    "-DENABLE_CRANELIFT_JIT=OFF",
-                    // Limit ninja compile jobs to avoid the CI runner running out of
-                    // memory when compiling the heaviest LibWeb/LibJS translation
-                    // units. CMAKE_BUILD_PARALLEL_LEVEL is ignored here because AGP
-                    // invokes ninja directly; job pools are honored regardless.
-                    "-DCMAKE_JOB_POOLS=compile=2",
-                    "-DCMAKE_JOB_POOL_COMPILE=compile"
+                    "-DENABLE_CRANELIFT_JIT=OFF"
                 )
                 System.getenv("LADYBIRD_HOST_LAYOUT_GENERATOR")?.let {
                     arguments += "-DLADYBIRD_HOST_LAYOUT_GENERATOR=$it"

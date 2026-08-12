@@ -34,6 +34,14 @@ if (ANDROID OR IOS)
     set(BUILD_SHARED_LIBS OFF)
 endif()
 
+if (ANDROID)
+    # The CI runner runs out of memory when compiling the heaviest LibWeb/LibJS
+    # translation units in parallel (clang++ aborts with an empty libc++abi
+    # message). Cap the number of simultaneous compiles via ninja job pools.
+    set(CMAKE_JOB_POOL_COMPILE "compile")
+    set(CMAKE_JOB_POOLS "compile=2")
+endif()
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Ensure that when single-value arguments are passed to `cmake_parse_arguments()`
