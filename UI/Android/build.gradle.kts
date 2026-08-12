@@ -29,7 +29,10 @@ android {
                     "-DLADYBIRD_CACHE_DIR=$cacheDir",
                     "-DVCPKG_ROOT=$sourceDir/Build/vcpkg",
                     "-DVCPKG_TARGET_ANDROID=ON",
-                    "-DENABLE_CRANELIFT_JIT=OFF"
+                    "-DENABLE_CRANELIFT_JIT=OFF",
+                    // Limit ninja parallelism to avoid the CI runner running out of
+                    // memory when compiling the heaviest LibWeb translation units.
+                    "-DCMAKE_BUILD_PARALLEL_LEVEL=2"
                 )
                 System.getenv("LADYBIRD_HOST_LAYOUT_GENERATOR")?.let {
                     arguments += "-DLADYBIRD_HOST_LAYOUT_GENERATOR=$it"
