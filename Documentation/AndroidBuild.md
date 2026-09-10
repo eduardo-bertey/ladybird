@@ -11,7 +11,7 @@ todo lo anterior esté verde). Todo `workflow_dispatch` (nada automático).
 |---|----------|--------|--------|-----|------|
 | 01 | `android-01-core.yml` | `LibCore` | 🟢 verde | `34538245769` | AK + Unicode + Core |
 | 02 | `android-02-gfx.yml` | `LibGfx` | 🟢 verde | `34539005924` | gráficos + decodificadores |
-| 03 | `android-03-js.yml` | `LibJS` | 🟡 compilando (reintento) | `34533011358` | falló 1 vez por host-tools, ver errores difíciles |
+| 03 | `android-03-js.yml` | `LibJS` | 🟢 verde | `34539009088` | falló 1 vez por host-tools, ver errores difíciles |
 | 04 | `android-04-media.yml` | `LibMedia` | 🟢 verde | `34539012121` | FFmpeg de vcpkg (video sist. pendiente #421) |
 | 05 | `android-05-web.yml` | `LibWeb` | ⏳ en cola (reintento) | `34533014956` | la más pesada, pool compile=2 |
 | 06 | `android-06-webview.yml` | `LibWebView` | 🟡 compilando (reintento) | `34533018921` | vista web + IPC |
