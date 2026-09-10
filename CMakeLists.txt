@@ -40,9 +40,11 @@ if (ANDROID)
     # The CI runner runs out of memory when compiling the heaviest LibWeb/LibJS
     # translation units in parallel (clang++ aborts with an empty libc++abi
     # message). Cap the number of simultaneous compiles via ninja job pools.
-    # NB: the Ninja generator reads CMAKE_JOB_POOLS from the CMake cache, so a
-    # plain set() is not enough for the pool definition to be emitted.
-    set(CMAKE_JOB_POOLS "compile=2" CACHE STRING "Ninja job pools for the Android build" FORCE)
+    # NB: Ninja pools are declared with the JOB_POOLS global property.
+    # CMAKE_JOB_POOLS is not a real CMake variable, so the old code assigned
+    # every target to a pool that was never defined and ninja died with
+    # "unknown pool name 'compile'". APPEND to not clobber link_pool.
+    set_property(GLOBAL APPEND PROPERTY JOB_POOLS "compile=2")
     set(CMAKE_JOB_POOL_COMPILE "compile" CACHE STRING "Compile pool for the Android build" FORCE)
 endif()
 
