@@ -46,6 +46,18 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 5. El interprete ASM en ARM64 (lo que rompia el compilador anterior)
+
+- **Contexto:** en Android arm64 el ASM **sí** está activo
+  (`FLAP_ARCH=aarch64` en `Libraries/LibJS/CMakeLists.txt`): flapc (binario
+  Rust compilado para el host) genera `interpreter_aarch64.S` y
+  `generate_interpreter_layout` (host) produce `layout.conf` con los offsets.
+  Sin esa cadena el cross-compile muere (issue #8672).
+- **Test de regresión:** `android-08-js-asm.yml` compila LibJS y verifica que
+  existan `interpreter_aarch64.S` + `layout.conf`, que el `.S` se ensambló
+  (`.S.o`) y que ese objeto está dentro de la estática LibJS (vía `llvm-ar`).
+  Si alguien rompe flapc/layout/ASM, da rojo aunque el resto compile.
+
 ## 4. LibJS corta TODO el configure sin generador del host
 
 - **Síntoma:** `CMake Error at Libraries/LibJS/CMakeLists.txt:358:
