@@ -1,0 +1,51 @@
+name: Android parte 08 - JS ASM (interprete aarch64)
+
+# Test de regresion para lo que rompia el compilador anterior: el interprete
+# ASM de LibJS en cross-compile (ver issue #8672 y
+# Documentation/AndroidErroresDificiles.md punto 5).
+# En Android arm64 el ASM SI esta activo (FLAP_ARCH=aarch64): flapc (Rust)
+# genera interpreter_aarch64.S y el generador del host produce layout.conf.
+# Este workflow compila LibJS y VERIFICA que esos artefactos existan y que el
+# objeto ASM este linkeado en la estatica. Si alguien rompe la cadena
+# flapc/layout/ASM, esto da rojo aunque el resto compile.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || format('{0}-{1}', github.ref, github.run_number) }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Compilar LibJS para arm64-v8a
+        uses: ./.github/actions/android-part
+        with:
+          target: LibJS
+
+      - name: Verificar cadena ASM aarch64
+        shell: bash
+        run: |
+          set -eux
+          BUILD="${{ github.workspace }}/Build/android-arm64"
+          JS_DIR="$BUILD/Libraries/LibJS/Interpreter"
+          # 1. flapc genero el .S para aarch64
+          test -s "$JS_DIR/interpreter_aarch64.S"
+          grep -q "aarch64\|AARCH64\|arch" "$JS_DIR/interpreter_aarch64.S" || head -5 "$JS_DIR/interpreter_aarch64.S"
+          # 2. el generador del host produjo layout.conf con offsets
+          test -s "$JS_DIR/layout.conf"
+          # 3. el .S se ensamblo (objeto existe)
+          ASM_OBJ=$(find "$BUILD" -name "interpreter_aarch64.S.o" | head -1)
+          test -n "$ASM_OBJ"
+          echo "ASM_OBJ=$ASM_OBJ"
+          # 4. el objeto ASM esta dentro de la estatica LibJS
+          JS_LIB=$(find "$BUILD" -name "*.a" -path "*LibJS*" | head -1)
+          test -n "$JS_LIB"
+          echo "JS_LIB=$JS_LIB"
+          LLVM_AR=$(echo "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/"*/bin/llvm-ar)
+          "$LLVM_AR" t "$JS_LIB" | grep -i "interpreter_aarch64"
+          echo "ASM-AARCH64-OK"
