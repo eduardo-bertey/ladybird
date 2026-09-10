@@ -45,3 +45,16 @@
 - El primer error *de compilación* real de cada librería (cuando aparezca).
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
+
+## 4. LibJS corta TODO el configure sin generador del host
+
+- **Síntoma:** `CMake Error at Libraries/LibJS/CMakeLists.txt:358:
+  Cross-compiling requires a host-built generate_interpreter_layout`,
+  aunque el target pedido fuera LibGfx/LibCore (nada que ver con JS).
+- **Causa raíz:** el `cmake -S .` configura el proyecto entero,
+  incondicionalmente. El intento de optimizar salteando host tools para las
+  partes que "no lo necesitaban" estaba mal: sin
+  `-DLADYBIRD_HOST_LAYOUT_GENERATOR` el configure muere antes de compilar
+  nada.
+- **Fix:** host tools SIEMPRE en la acción compartida (se sacó el flag
+  `need-host-tools`). Cuestan ~10 min por parte pero son obligatorias.
