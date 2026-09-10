@@ -39,6 +39,7 @@ if (LAGOM_USE_LINKER)
 endif()
 
 if (LAGOM_LINK_POOL_SIZE)
-    set_property(GLOBAL PROPERTY JOB_POOLS link_pool=${LAGOM_LINK_POOL_SIZE})
+    # NB: APPEND, no SET: un SET borraria otras pools (ej. compile de Android).
+    set_property(GLOBAL APPEND PROPERTY JOB_POOLS link_pool=${LAGOM_LINK_POOL_SIZE})
     set(CMAKE_JOB_POOL_LINK link_pool CACHE STRING "Linking job pool")
 endif()

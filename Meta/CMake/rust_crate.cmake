@@ -6,7 +6,10 @@
 # When corrosion supports dependency tracking, we can use corrosion_import_crate() instead of this function. See:
 # https://github.com/corrosion-rs/corrosion/issues/206
 # https://github.com/corrosion-rs/corrosion/issues/624
-set_property(GLOBAL PROPERTY JOB_POOLS "${JOB_POOLS};cargo=1")
+# NB: APPEND, no SET: un SET con "${JOB_POOLS}" (variable, vacia) borraria las
+# pools ya definidas (ej. compile=2 de Android) y ninja muere con
+# "unknown pool name".
+set_property(GLOBAL APPEND PROPERTY JOB_POOLS "cargo=1")
 
 function(import_rust_crate)
     cmake_parse_arguments(PARSE_ARGV 0 ARG "PANIC_UNWIND" "MANIFEST_PATH;CRATE_NAME;FFI_OUTPUT_DIR;FFI_HEADER" "FEATURES;FFI_HEADERS")
