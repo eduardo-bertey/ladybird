@@ -196,6 +196,18 @@ TEST_CASE(from_utf16)
     }
 }
 
+TEST_CASE(to_well_formed_utf8)
+{
+    auto ascii = Utf16String::from_utf16(u"hello!"sv);
+    EXPECT_EQ(ascii.to_well_formed_utf8(), "hello!"sv);
+
+    auto valid = Utf16String::from_utf16(u"hello 😀!"sv);
+    EXPECT_EQ(valid.to_well_formed_utf8(), "hello 😀!"sv);
+
+    auto invalid = Utf16String::from_utf16(u"hello \xd800 there \xdc00!"sv);
+    EXPECT_EQ(invalid.to_well_formed_utf8(), "hello � there �!"sv);
+}
+
 TEST_CASE(from_code_point)
 {
     u32 code_point = 0;
@@ -988,6 +1000,44 @@ TEST_CASE(move_operations)
     test("hello"_utf16);
     test("hello there general!"_utf16);
     test("hello 😀 there!"_utf16);
+}
+
+TEST_CASE(raw_ownership_transfer)
+{
+    {
+        auto string = "short"_utf16;
+        auto raw = move(string).into_raw();
+
+        EXPECT(string.is_empty());
+
+        auto adopted_string = Utf16String::adopt_raw(raw);
+        EXPECT_EQ(adopted_string, "short"sv);
+    }
+
+    {
+        auto string = "this is a long ASCII string"_utf16;
+        auto raw = move(string).into_raw();
+        auto const* header = reinterpret_cast<AK::Detail::Utf16StringDataHeader const*>(raw);
+
+        EXPECT(string.is_empty());
+        EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 1u);
+
+        auto adopted_string = Utf16String::adopt_raw(raw);
+        EXPECT_EQ(adopted_string, "this is a long ASCII string"sv);
+        EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 1u);
+
+        auto leaked_raw = adopted_string.to_raw_leaked();
+        EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 2u);
+        Utf16String::unref_raw(leaked_raw);
+        EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 1u);
+
+        {
+            auto copied_string = Utf16String::from_raw(raw);
+            EXPECT_EQ(copied_string, adopted_string);
+            EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 2u);
+        }
+        EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 1u);
+    }
 }
 
 TEST_CASE(equals)

@@ -42,24 +42,18 @@ public:
 
     GC::Ptr<Element> get_element_by_id(Utf16View id) const;
 
-    bool has_child_affected_by_last_child_pseudo_class() const { return m_has_child_affected_by_last_child_pseudo_class; }
-    void set_has_child_affected_by_last_child_pseudo_class(bool value) { m_has_child_affected_by_last_child_pseudo_class = value; }
-
-    bool has_child_affected_by_backward_positional_pseudo_class() const { return m_has_child_affected_by_backward_positional_pseudo_class; }
-    void set_has_child_affected_by_backward_positional_pseudo_class(bool value) { m_has_child_affected_by_backward_positional_pseudo_class = value; }
-
 protected:
     ParentNode(Document& document, NodeType type)
         : Node(document, type)
     {
     }
 
-    virtual void visit_edges(Cell::Visitor&) override;
-
 private:
-    GC::Ptr<HTMLCollection> m_children;
-    bool m_has_child_affected_by_last_child_pseudo_class { false };
-    bool m_has_child_affected_by_backward_positional_pseudo_class { false };
+    friend class Node;
+
+    // The counters behind Node::dom_tree_version() and Node::character_data_version(), for the tree rooted here.
+    u64 m_dom_tree_version { 0 };
+    u64 m_character_data_version { 0 };
 };
 
 template<>

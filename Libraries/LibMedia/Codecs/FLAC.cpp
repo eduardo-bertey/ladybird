@@ -5,15 +5,35 @@
  */
 
 #include <AK/BuiltinWrappers.h>
+#include <LibMedia/BitReader.h>
 #include <LibMedia/Codecs/FLAC.h>
 #include <LibMedia/MediaStream.h>
 
 namespace Media::Codecs {
 
+DecoderErrorOr<FixedArray<u8>> FLAC::codec_initialization_data_from_isobmff_configuration(ReadonlyBytes configuration)
+{
+    if (configuration.size() < sizeof(u32))
+        return DecoderError::corrupted("FLAC configuration is too small"sv);
+
+    auto version = configuration[0];
+    if (version == 0) {
+        auto flags = (configuration[1] << 16) | (configuration[2] << 8) | configuration[3];
+        if (flags != 0)
+            return DecoderError::corrupted("FLAC configuration has unsupported flags"sv);
+    } else {
+        return DecoderError::corrupted("FLAC configuration has an unsupported version"sv);
+    }
+
+    auto initialization_data = DECODER_TRY_ALLOC(FixedArray<u8>::create(configuration));
+    "fLaC"sv.bytes().copy_to(initialization_data.span());
+    return initialization_data;
+}
+
 template<Integral T>
 static Optional<T> read_big_endian_value(MediaStreamCursor& cursor)
 {
-    auto value = cursor.read_value<T>(AK::Endianness::Big);
+    auto value = cursor.read_value<T>();
     if (value.is_error())
         return {};
     return value.release_value();
@@ -99,18 +119,18 @@ Optional<FLAC::FrameInfo> FLAC::parse_frame_header(MediaStreamCursor& cursor, u1
     if (cursor.read_until_filled(header).is_error())
         return {};
 
-    u16 maybe_sync_code = (static_cast<u16>(header[0]) << 8) | header[1];
-    if (maybe_sync_code != sync_code)
+    BitReader reader { header };
+    if (reader.read_bits<u16>(16) != sync_code)
         return {};
 
     bool variable_block_size = (sync_code & 1) != 0;
-    u8 block_size_bits = (header[2] >> 4) & 0x0F;
-    u8 sample_rate_bits = header[2] & 0x0F;
-    u8 channels_bits = (header[3] >> 4) & 0x0F;
-    u8 bit_depth_bits = (header[3] >> 1) & 0x07;
-    u8 reserved_bit = header[3] & 0x01;
+    auto block_size_bits = reader.read_bits<u8>(4);
+    auto sample_rate_bits = reader.read_bits<u8>(4);
+    auto channels_bits = reader.read_bits<u8>(4);
+    auto bit_depth_bits = reader.read_bits<u8>(3);
+    auto reserved_bit_is_set = reader.read_bit();
 
-    if (reserved_bit != 0)
+    if (reserved_bit_is_set)
         return {};
 
     auto coded_number = read_coded_number(cursor);

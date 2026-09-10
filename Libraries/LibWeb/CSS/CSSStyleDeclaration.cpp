@@ -7,6 +7,7 @@
 
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 
@@ -20,6 +21,22 @@ CSSStyleDeclaration::CSSStyleDeclaration(Computed computed, Readonly readonly)
 {
 }
 
+void CSSStyleDeclaration::prepare_to_update_style_attribute()
+{
+    VERIFY(!is_computed());
+    if (!owner_node().has_value()) {
+        if (auto rule = parent_rule())
+            flush_deferred_style_change_events_for_rule(*rule);
+        return;
+    }
+
+    // OPTIMIZATION: A geometry read can leave paint-only selector facts pending. An inline
+    //               declaration is not a replayable fact, so consume the boundary while the old
+    //               declaration block is still authoritative.
+    owner_node()->element().document().flush_deferred_style_change_event();
+    owner_node()->element().prepare_for_inline_style_change();
+}
+
 // https://drafts.csswg.org/cssom/#update-style-attribute-for
 void CSSStyleDeclaration::update_style_attribute()
 {
@@ -31,11 +48,19 @@ void CSSStyleDeclaration::update_style_attribute()
     if (!owner_node().has_value())
         return;
 
+    auto& element = owner_node()->element();
+    // OPTIMIZATION: Keep the parsed declaration block authoritative and serialize it only when
+    //               something observes the textual attribute value.
+    if (element.can_defer_inline_style_attribute_update()) {
+        element.did_update_inline_style();
+        return;
+    }
+
     // 4. Set declaration block’s updating flag.
     set_is_updating(true);
 
     // 5. Set an attribute value for owner node using "style" and the result of serializing declaration block.
-    owner_node()->element().set_attribute_value(HTML::AttributeNames::style, serialized());
+    element.set_attribute_value(HTML::AttributeNames::style, serialized());
 
     // 6. Unset declaration block’s updating flag.
     set_is_updating(false);

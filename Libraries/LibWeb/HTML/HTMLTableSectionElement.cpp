@@ -5,7 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
@@ -40,9 +40,7 @@ GC::Ref<DOM::HTMLCollection> HTMLTableSectionElement::rows() const
     // The rows attribute must return an HTMLCollection rooted at this element,
     // whose filter matches only tr elements that are children of this element.
     if (!m_rows) {
-        m_rows = DOM::HTMLCollection::create(const_cast<HTMLTableSectionElement&>(*this), DOM::HTMLCollection::Scope::Children, [](Element const& element) {
-            return is<HTMLTableRowElement>(element);
-        });
+        m_rows = DOM::HTMLCollection::create(const_cast<HTMLTableSectionElement&>(*this), DOM::HTMLCollection::Scope::Children, [](Element const& element) { return is<HTMLTableRowElement>(element); }, DOM::HTMLCollection::AttributeInvalidationType::None);
     }
     return *m_rows;
 }

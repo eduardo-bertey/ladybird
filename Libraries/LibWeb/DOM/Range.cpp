@@ -8,7 +8,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/NeverDestroyed.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/DOM/Comment.h>
 #include <LibWeb/DOM/Document.h>
@@ -29,23 +28,17 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/TextNode.h>
-#include <LibWeb/Layout/TextOffsetMapping.h>
+#include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Namespace.h>
-#include <LibWeb/Painting/PaintableFragment.h>
-#include <LibWeb/Painting/PaintableWithLines.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/DocumentPaintState.h>
+#include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 
 namespace Web::DOM {
 
 GC_DEFINE_ALLOCATOR(Range);
-
-HashTable<Range*>& Range::live_ranges()
-{
-    static NeverDestroyed<HashTable<Range*>> ranges;
-    return *ranges;
-}
 
 GC::Ref<Range> Range::create(Document& document)
 {
@@ -73,7 +66,7 @@ Range::Range(GC::Ref<Node> start_container, WebIDL::UnsignedLong start_offset, G
     VERIFY(start_offset <= start_container->length());
     VERIFY(end_offset <= end_container->length());
 
-    live_ranges().set(this);
+    update_owner_document();
 }
 
 Range::~Range() = default;
@@ -81,36 +74,63 @@ Range::~Range() = default;
 void Range::finalize()
 {
     Base::finalize();
-    live_ranges().remove(this);
+    if (m_owner_document)
+        m_owner_document->detach_range({}, *this);
 }
 
 void Range::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_associated_selection);
+    visitor.visit(m_owner_document);
+}
+
+void Range::update_owner_document()
+{
+    auto& document = m_start_container->document();
+    if (&document == m_owner_document.ptr())
+        return;
+    if (m_owner_document)
+        m_owner_document->detach_range({}, *this);
+    m_owner_document = document;
+    document.attach_range({}, *this);
 }
 
 void Range::set_associated_selection(Badge<Selection::Selection>, GC::Ptr<Selection::Selection> selection)
 {
+    auto had_selection = m_associated_selection != nullptr;
     m_associated_selection = selection;
-    update_associated_selection();
+    if (m_associated_selection) {
+        update_associated_selection();
+    } else if (had_selection) {
+        // The range this selection painted through is no longer its range; take the highlight back.
+        auto& document = m_start_container->document();
+        if (document.has_committed_viewport_box()) {
+            document.paint_state().reset_selection_states(document);
+            Painting::set_needs_repaint(*document.unsafe_layout_node());
+        }
+
+        // https://w3c.github.io/selection-api/#selectionchange-event
+        // When the selection is dissociated with its range, the user agent must schedule a selectionchange event on
+        // document. Association with a new range schedules it through that range's update.
+        schedule_a_selectionchange_event(document, document);
+    }
 }
 
 void Range::update_associated_selection()
 {
+    // A range no selection paints through must not touch the viewport's selection states:
+    // mutating a free-standing range would wipe the highlight the real selection owns.
+    if (!m_associated_selection)
+        return;
+
     auto& document = m_start_container->document();
 
     // NB: Called during selection update after range change.
-    if (auto viewport = document.unsafe_paintable()) {
-        if (m_associated_selection)
-            viewport->recompute_selection_states(*this);
-        else
-            viewport->reset_selection_states();
-        viewport->set_needs_repaint();
+    if (document.has_committed_viewport_box()) {
+        document.paint_state().recompute_selection_states(document, *this);
+        Painting::set_needs_repaint(*document.unsafe_layout_node());
     }
-
-    if (!m_associated_selection)
-        return;
 
     document.reset_cursor_blink_cycle();
     document.set_cursor_position_needs_repaint();
@@ -227,6 +247,7 @@ WebIDL::ExceptionOr<void> Range::set_start_or_end(GC::Ref<Node> node, u32 offset
         m_end_offset = offset;
     }
 
+    update_owner_document();
     update_associated_selection();
     return {};
 }
@@ -409,6 +430,7 @@ WebIDL::ExceptionOr<void> Range::select(GC::Ref<Node> node)
     m_end_container = *parent;
     m_end_offset = index + 1;
 
+    update_owner_document();
     update_associated_selection();
     return {};
 }
@@ -452,6 +474,7 @@ WebIDL::ExceptionOr<void> Range::select_node_contents(GC::Ref<Node> node)
     m_end_container = node;
     m_end_offset = length;
 
+    update_owner_document();
     update_associated_selection();
     return {};
 }
@@ -570,20 +593,49 @@ Utf16String Range::to_string() const
     if (start_text && start_container() == end_container())
         return MUST(start_text->substring_data(start_offset(), end_offset() - start_offset()));
 
+    auto next_after_subtree = [](GC::Ptr<Node> node) -> GC::Ptr<Node> {
+        while (node) {
+            if (auto* next_sibling = node->next_sibling())
+                return *next_sibling;
+            node = node->parent_node();
+        }
+        return nullptr;
+    };
+
+    GC::Ptr<Node> first_node = start_container();
+    if (!is<CharacterData>(*first_node)) {
+        if (auto* child = first_node->child_at_index(start_offset()))
+            first_node = *child;
+        else if (start_offset() != 0)
+            first_node = next_after_subtree(first_node);
+    }
+
+    GC::Ptr<Node> past_last_node = end_container();
+    if (is<CharacterData>(*past_last_node)) {
+        past_last_node = next_after_subtree(past_last_node);
+    } else if (auto* child = past_last_node->child_at_index(end_offset())) {
+        past_last_node = *child;
+    } else {
+        past_last_node = next_after_subtree(past_last_node);
+    }
+
     // 3. If this’s start node is a Text node, then append the substring of that node’s data from this’s start offset until the end to s.
-    if (start_text)
-        builder.append(MUST(start_text->substring_data(start_offset(), start_text->length_in_utf16_code_units() - start_offset())));
-
     // 4. Append the concatenation of the data of all Text nodes that are contained in this, in tree order, to s.
-    for_each_contained([&](GC::Ref<Node> node) {
-        if (auto* text_node = as_if<Text>(*node))
-            builder.append(text_node->data());
-        return IterationDecision::Continue;
-    });
-
     // 5. If this’s end node is a Text node, then append the substring of that node’s data from its start until this’s end offset to s.
-    if (auto* end_text = as_if<Text>(*end_container()))
-        builder.append(MUST(end_text->substring_data(0, end_offset())));
+    // OPTIMIZATION: Perform these steps in one tree-order traversal instead of testing every candidate node for
+    //               containment, which would repeatedly compare its boundaries with the range boundaries.
+    for (auto node = first_node; node != past_last_node; node = node->next_in_pre_order()) {
+        auto* text_node = as_if<Text>(*node);
+        if (!text_node)
+            continue;
+
+        if (node == start_container())
+            builder.append(MUST(text_node->substring_data(start_offset(), text_node->length_in_utf16_code_units() - start_offset())));
+        else if (node == end_container())
+            builder.append(MUST(text_node->substring_data(0, end_offset())));
+        else
+            builder.append(text_node->data());
+    }
 
     // 6. Return s.
     return builder.to_string();
@@ -1169,8 +1221,13 @@ GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
     if (!start_container()->document().navigable())
         return Geometry::DOMRectList::create({});
 
-    start_container()->document().update_layout(DOM::UpdateLayoutReason::RangeGetClientRects);
+    auto& document = start_container()->document();
+    document.update_layout(DOM::UpdateLayoutReason::RangeGetClientRects);
+
     Vector<GC::Root<Geometry::DOMRect>> rects;
+    Optional<Painting::AccumulatedVisualContextTree> visual_context_tree;
+    auto rect_to_viewport_transform = Painting::identity_rect_to_viewport_transform();
+
     // FIXME: take Range collapsed into consideration
     // 2. Iterate the node included in Range
     GC::Ptr<Node> start_node = start_container();
@@ -1203,16 +1260,16 @@ GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
             return Geometry::DOMRectList::create({});
     }
     for (GC::Ptr<Node> node = start_node; node && node.ptr() != end_node->next_in_pre_order(); node = node->next_in_pre_order()) {
-        auto selection_state = Painting::Paintable::SelectionState::Full;
+        auto selection_state = Painting::SelectionState::Full;
         if (node == start_node && node == end_node) {
             if (m_start_offset == m_end_offset)
-                selection_state = Painting::Paintable::SelectionState::None;
+                selection_state = Painting::SelectionState::None;
             else
-                selection_state = Painting::Paintable::SelectionState::StartAndEnd;
+                selection_state = Painting::SelectionState::StartAndEnd;
         } else if (node == start_node) {
-            selection_state = Painting::Paintable::SelectionState::Start;
+            selection_state = Painting::SelectionState::Start;
         } else if (node == end_node) {
-            selection_state = Painting::Paintable::SelectionState::End;
+            selection_state = Painting::SelectionState::End;
         }
 
         auto node_type = static_cast<NodeType>(node->node_type());
@@ -1230,36 +1287,46 @@ GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
             // 2. For each Text node selected or partially selected by the range (including when the boundary-points
             // are identical), include scaled DOMRect object (for the part that is selected, not the whole line box).
             auto const& text = static_cast<DOM::Text const&>(*node);
-            if (selection_state == Painting::Paintable::SelectionState::None)
+            if (selection_state == Painting::SelectionState::None)
                 continue;
 
-            Layout::TextOffsetMapping mapping { text };
-            if (!mapping.primary()) {
+            auto const* layout_node = text.unsafe_layout_node();
+            if (!layout_node) {
                 dbgln("FIXME: Failed to get client rects for node {}", node->debug_description());
                 continue;
             }
+
+            if (!visual_context_tree.has_value() && !document.can_compute_client_rects_without_accumulated_visual_contexts_update(*layout_node)) {
+                document.update_paint_and_hit_testing_properties_if_needed();
+                visual_context_tree = document.visual_context_tree();
+                rect_to_viewport_transform = Painting::rect_to_viewport_transform(document, *visual_context_tree);
+            }
+
             size_t filter_dom_start = 0;
             size_t filter_dom_end = NumericLimits<size_t>::max();
             switch (selection_state) {
-            case Painting::Paintable::SelectionState::Full:
+            case Painting::SelectionState::Full:
                 break;
-            case Painting::Paintable::SelectionState::StartAndEnd:
+            case Painting::SelectionState::StartAndEnd:
                 filter_dom_start = start_offset();
                 filter_dom_end = end_offset();
                 break;
-            case Painting::Paintable::SelectionState::Start:
+            case Painting::SelectionState::Start:
                 filter_dom_start = start_offset();
                 break;
-            case Painting::Paintable::SelectionState::End:
+            case Painting::SelectionState::End:
                 filter_dom_end = end_offset();
                 break;
-            case Painting::Paintable::SelectionState::None:
+            case Painting::SelectionState::None:
                 VERIFY_NOT_REACHED();
             }
-            mapping.for_each_paintable_fragment_in_dom_range(filter_dom_start, filter_dom_end, [&](Painting::PaintableFragment const& fragment) {
-                auto rect = fragment.range_rect(selection_state, start_offset(), end_offset());
-                rects.append(Geometry::DOMRect::create(rect.to_type<float>()));
-            });
+
+            Layout::RustFFI::layout_arena_text_range_rects(
+                layout_node->arena_handle(), Layout::Node::slot_id(layout_node),
+                to_underlying(selection_state), start_offset(), end_offset(), filter_dom_start, filter_dom_end,
+                rect_to_viewport_transform, &rects, [](void* context, CSSPixelRect rect) {
+                    static_cast<Vector<GC::Root<Geometry::DOMRect>>*>(context)->append(Geometry::DOMRect::create(rect.to_type<float>()));
+                });
         }
     }
     return Geometry::DOMRectList::create(move(rects));

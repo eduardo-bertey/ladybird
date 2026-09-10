@@ -68,6 +68,7 @@ private:
 
     virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions&) override;
     virtual Core::EventLoop& create_platform_event_loop() override;
+    virtual Optional<String> ui_font_family() const override;
 #if !defined(AK_OS_MACOS)
     virtual Optional<String> system_font_family() const override;
 #endif
@@ -81,6 +82,8 @@ private:
     virtual void open_urls_in_new_tabs(ReadonlySpan<URL::URL>) const override;
     virtual void open_url_in_new_window(URL::URL const&, WebView::IsPrivate) override;
 
+    virtual void resolve_external_url_handler(URL::URL const&, WebView::ExternalURLHandlerCallback) const override;
+
     virtual Optional<ByteString> ask_user_for_download_path(ByteString const& file) const override;
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const override;
     virtual void display_error_dialog(StringView error_message) const override;
@@ -91,7 +94,7 @@ private:
     virtual Utf16String clipboard_text(ClipboardType) const override;
     virtual void set_clipboard_text(String, ClipboardType = ClipboardType::Text) override;
 
-    virtual Vector<Web::Clipboard::SystemClipboardRepresentation> clipboard_entries() const override;
+    virtual Web::Clipboard::SystemClipboardItem clipboard_item() const override;
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem) override;
 
     virtual bool supports_vertical_tabs() const override { return true; }

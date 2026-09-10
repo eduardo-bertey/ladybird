@@ -8,9 +8,9 @@
  */
 
 #include <LibWeb/CSS/CSSStyleProperties.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/DOM/Document.h>
@@ -34,7 +34,6 @@
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
 
 namespace Web::HTML {
 
@@ -46,6 +45,17 @@ HTMLSelectElement::HTMLSelectElement(DOM::Document& document, DOM::QualifiedName
 }
 
 HTMLSelectElement::~HTMLSelectElement() = default;
+
+// `:user-valid` and `:user-invalid` turn on the first time the user has interacted with the
+// control, which no attribute and no value says. The style engine is told what the element now
+// holds rather than asking.
+void HTMLSelectElement::set_user_validity(bool flag)
+{
+    if (m_user_validity == flag)
+        return;
+    m_user_validity = flag;
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
+}
 
 void HTMLSelectElement::visit_edges(Cell::Visitor& visitor)
 {
@@ -186,13 +196,14 @@ GC::Ref<DOM::HTMLCollection> HTMLSelectElement::selected_options()
     // The selectedOptions IDL attribute must return an HTMLCollection rooted at the select node,
     // whose filter matches the elements in the list of options that have their selectedness set to true.
     if (!m_selected_options) {
-        m_selected_options = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, [this](Element const& element) {
+        auto filter = [this](Element const& element) {
             auto const* maybe_option = as_if<HTML::HTMLOptionElement>(element);
             if (maybe_option && maybe_option->nearest_select_element().ptr() == this) {
                 return maybe_option->selected();
             }
             return false;
-        });
+        };
+        m_selected_options = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, move(filter), DOM::HTMLCollection::AttributeInvalidationType::None, nullptr, DOM::HTMLCollection::Kind::SelectedOptions);
     }
     return *m_selected_options;
 }
@@ -495,7 +506,7 @@ void HTMLSelectElement::set_is_open(bool open)
         return;
 
     m_is_open = open;
-    CSS::Invalidation::invalidate_style_after_select_open_state_change(*this);
+    CSS::Invalidation::invalidate_style_after_select_open_state_change(*this, open);
 }
 
 bool HTMLSelectElement::has_activation_behavior() const
@@ -571,7 +582,7 @@ void HTMLSelectElement::show_the_picker_if_applicable()
     // Request select dropdown
     auto weak_element = GC::Weak<HTMLSelectElement> { *this };
     auto rect = get_bounding_client_rect();
-    auto position = document().navigable()->to_top_level_position(Web::CSSPixelPoint { rect.x(), rect.bottom() });
+    auto position = document().navigable()->to_page_position(Web::CSSPixelPoint { rect.x(), rect.bottom() });
     document().page().did_request_select_dropdown(weak_element, position, rect.width(), m_select_items);
     set_is_open(true);
 }
@@ -664,7 +675,9 @@ void HTMLSelectElement::computed_properties_changed()
 {
     // Hide chevron icon when appearance is none
     if (m_chevron_icon_element) {
-        auto appearance = computed_values()->appearance();
+        auto style = computed_style();
+        VERIFY(style);
+        auto appearance = style->appearance();
         if (appearance == CSS::Appearance::None) {
             MUST(m_chevron_icon_element->style()->set_property(CSS::PropertyID::Display, "none"_utf16));
             MUST(m_inner_text_element->style()->set_property(CSS::PropertyID::MarginInlineEnd, "0"_utf16));
@@ -696,6 +709,9 @@ void HTMLSelectElement::create_shadow_tree_if_needed()
     m_inner_text_element = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
     m_inner_text_element->set_attribute_value(HTML::AttributeNames::style, R"~~~(
         flex: 1;
+        min-width: 0;
+        overflow: clip;
+        text-overflow: inherit;
         margin-inline-end: 20px;
     )~~~"_utf16);
     MUST(border->append_child(*m_inner_text_element));
@@ -829,9 +845,12 @@ HTMLOptionElement* HTMLSelectElement::placeholder_label_option() const
         // and if the value of the first option element in the select element's list of options (if any) is the empty
         // string, and that option element's parent node is the select element (and not an optgroup element), then that
         // option is the select element's placeholder label option.
-        auto first_option_element = list_of_options()[0];
-        if (first_option_element->value().is_empty() && first_option_element->parent() == this)
-            return first_option_element;
+        auto options = list_of_options();
+        if (!options.is_empty()) {
+            auto first_option_element = options[0];
+            if (first_option_element->value().is_empty() && first_option_element->parent() == this)
+                return first_option_element;
+        }
     }
     return {};
 }

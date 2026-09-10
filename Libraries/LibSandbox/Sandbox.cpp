@@ -188,7 +188,7 @@ static ErrorOr<void> append_allowed_executables(StringBuilder& builder, Readonly
     if (executable_paths.is_empty())
         return {};
 
-    builder.append("(allow process-exec"sv);
+    builder.append("(allow process-fork)\n(allow process-exec"sv);
     for (auto const& path : executable_paths) {
         builder.append(" (literal "sv);
         append_sandbox_string_literal(builder, path);
@@ -325,6 +325,7 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
         SYS_openat
         SYS_os_fault_with_payload
         SYS_pathconf
+        SYS_persona
         SYS_pipe
         SYS_poll
         SYS_posix_spawn

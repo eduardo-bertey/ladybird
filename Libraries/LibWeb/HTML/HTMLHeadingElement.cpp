@@ -5,7 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/HTMLHeadingElement.h>
@@ -51,8 +51,8 @@ void HTMLHeadingElement::apply_presentational_hints(Vector<CSS::StyleProperty>& 
 WebIDL::UnsignedLong HTMLHeadingElement::heading_level() const
 {
     // h1–h6 elements have a heading level, which is given by getting the element's computed heading level.
-    if (m_dom_tree_version_for_cached_heading_level < document().dom_tree_version()) {
-        m_dom_tree_version_for_cached_heading_level = document().dom_tree_version();
+    if (m_dom_tree_version_for_cached_heading_level != dom_tree_version()) {
+        m_dom_tree_version_for_cached_heading_level = dom_tree_version();
         m_cached_heading_level = computed_heading_level();
     }
     return m_cached_heading_level;

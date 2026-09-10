@@ -8,16 +8,18 @@
 
 #include <AK/SourceLocation.h>
 #include <LibGC/Heap.h>
+#include <LibGC/HeapVector.h>
+#include <LibGfx/Bitmap.h>
+#include <LibGfx/PaintingSurface.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
+#include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/Clipboard/SystemClipboard.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Range.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
@@ -25,13 +27,19 @@
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
+#include <LibWeb/HTML/HTMLVideoElement.h>
+#include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/NavigationPopulationRequest.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SelectedFile.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Selection/Selection.h>
 
@@ -46,6 +54,7 @@ GC::Ref<Page> Page::create(GC::Ref<PageClient> page_client)
 
 Page::Page(GC::Ref<PageClient> client)
     : m_client(client)
+    , m_history_executor(GC::Heap::the().allocate<HTML::HistoryExecutor>(*this))
 {
 }
 
@@ -94,7 +103,10 @@ Compositor::CompositorHost const& Page::compositor_host() const
 void Page::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    visitor.visit(m_top_level_traversable);
+    if (m_context_menu_request.has_value())
+        visitor.visit(m_context_menu_request->target);
+    visitor.visit(m_local_root_navigable);
+    visitor.visit(m_history_executor);
     visitor.visit(m_client);
     visitor.visit(m_window_rect_observer);
     visitor.visit(m_on_pending_dialog_closed);
@@ -117,7 +129,7 @@ HTML::LocalNavigable& Page::focused_navigable()
 {
     if (m_focused_navigable)
         return *m_focused_navigable;
-    return top_level_traversable();
+    return local_root_navigable();
 }
 
 void Page::set_focused_navigable(HTML::LocalNavigable& navigable)
@@ -133,68 +145,80 @@ void Page::navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigab
         m_mouse_event_tracking_navigable = nullptr;
 }
 
-void Page::load(URL::URL const& url, Bindings::NavigationHistoryBehavior history_handling)
+void Page::load(URL::URL const& url, Bindings::NavigationHistoryBehavior history_handling, Utf16String navigation_id)
 {
-    (void)top_level_traversable()->navigate({ .url = url, .source_document = *top_level_traversable()->active_document(), .history_handling = history_handling, .user_involvement = HTML::UserNavigationInvolvement::BrowserUI });
+    (void)local_root_navigable()->navigate({ .url = url, .history_handling = history_handling, .user_involvement = HTML::UserNavigationInvolvement::BrowserUI, .navigation_id = move(navigation_id) });
 }
 
-void Page::load(URL::URL const& url, HTML::DocumentResource document_resource,
-    Bindings::NavigationHistoryBehavior history_handling, Optional<HTML::NavigationSourceSnapshot> source_snapshot)
-{
-    (void)top_level_traversable()->navigate({
-        .url = url,
-        .source_document = *top_level_traversable()->active_document(),
-        .document_resource = move(document_resource),
-        .history_handling = history_handling,
-        .user_involvement = HTML::UserNavigationInvolvement::BrowserUI,
-        .cross_process_source_snapshot = move(source_snapshot),
-    });
-}
-
-void Page::load_html(StringView html)
+void Page::load_html(StringView html, Utf16String navigation_id)
 {
     // FIXME: #23909 Figure out why GC threshold does not stay low when repeatedly loading html from the WebView
     heap().collect_garbage();
 
-    (void)top_level_traversable()->navigate({ .url = URL::about_srcdoc(),
-        .source_document = *top_level_traversable()->active_document(),
+    (void)local_root_navigable()->navigate({ .url = URL::about_srcdoc(),
         .document_resource = Utf16String::from_utf8(html),
-        .user_involvement = HTML::UserNavigationInvolvement::BrowserUI });
-}
-
-void Page::load_html(StringView html, URL::URL const& url)
-{
-    // FIXME: #23909 Figure out why GC threshold does not stay low when repeatedly loading html from the WebView
-    heap().collect_garbage();
-
-    auto document = top_level_traversable()->active_document();
-    auto& realm = document->relevant_settings_object().realm();
-    auto html_string = String::from_utf8(html).release_value_but_fixme_should_propagate_errors();
-
-    auto response = Fetch::Infrastructure::Response::create();
-    response->url_list().append(url);
-    response->header_list()->append({ "Content-Type"sv, "text/html"sv });
-    response->set_body(Fetch::Infrastructure::byte_sequence_as_body(realm, html_string.bytes()));
-
-    HTML::LocalNavigable::NavigateParams params { .url = url,
-        .source_document = *document,
-        .response = response,
-        .user_involvement = HTML::UserNavigationInvolvement::BrowserUI };
-
-    if (url == URL::about_srcdoc())
-        params.document_resource = Utf16String::from_utf8(html);
-
-    (void)top_level_traversable()->navigate(move(params));
+        .user_involvement = HTML::UserNavigationInvolvement::BrowserUI,
+        .navigation_id = move(navigation_id) });
 }
 
 void Page::reload()
 {
-    top_level_traversable()->reload();
+    local_root_navigable()->reload();
 }
 
-void Page::traverse_the_history_by_delta(int delta)
+void Page::queue_screenshot_task(Optional<UniqueNodeID> node_id)
 {
-    m_client->page_did_request_traverse_the_history_by_delta(delta, HistoryTraversalPrecheck::Needed);
+    m_screenshot_tasks.enqueue({ node_id });
+    local_root_navigable()->set_needs_repaint();
+    client().request_frame();
+}
+
+void Page::process_screenshot_requests()
+{
+    auto& client = this->client();
+    auto navigable = local_root_navigable();
+    while (!m_screenshot_tasks.is_empty()) {
+        auto task = m_screenshot_tasks.dequeue();
+        if (task.node_id.has_value()) {
+            auto* dom_node = DOM::Node::from_unique_id(*task.node_id);
+            if (dom_node)
+                dom_node->document().update_layout(DOM::UpdateLayoutReason::ProcessScreenshot);
+            auto const* layout_node = dom_node ? dom_node->layout_node() : nullptr;
+            if (!layout_node || !Painting::has_committed_box(*layout_node)) {
+                client.page_did_take_screenshot({});
+                continue;
+            }
+            auto rect = enclosing_device_rect(Painting::absolute_border_box_rect(*layout_node));
+            auto bitmap_or_error = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, rect.size().to_type<int>());
+            if (bitmap_or_error.is_error()) {
+                client.page_did_take_screenshot({});
+                continue;
+            }
+            auto bitmap = bitmap_or_error.release_value();
+            auto painting_surface = Gfx::PaintingSurface::wrap_bitmap(*bitmap);
+            HTML::PaintConfig paint_config { .canvas_fill_rect = rect.to_type<int>() };
+            navigable->render_screenshot(painting_surface, paint_config, [bitmap, &client] {
+                client.page_did_take_screenshot(bitmap->to_shareable_bitmap());
+            });
+        } else {
+            navigable->active_document()->update_layout(DOM::UpdateLayoutReason::ProcessScreenshot);
+            auto const* layout_node = navigable->active_document()->layout_node();
+            VERIFY(layout_node && Painting::has_committed_box(*layout_node));
+            auto scrollable_overflow_rect = Painting::scrollable_overflow_rect(*layout_node);
+            auto rect = enclosing_device_rect(scrollable_overflow_rect.value());
+            auto bitmap_or_error = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, rect.size().to_type<int>());
+            if (bitmap_or_error.is_error()) {
+                client.page_did_take_screenshot({});
+                continue;
+            }
+            auto bitmap = bitmap_or_error.release_value();
+            auto painting_surface = Gfx::PaintingSurface::wrap_bitmap(*bitmap);
+            HTML::PaintConfig paint_config { .paint_overlay = true, .canvas_fill_rect = rect.to_type<int>() };
+            navigable->render_screenshot(painting_surface, paint_config, [bitmap, &client] {
+                client.page_did_take_screenshot(bitmap->to_shareable_bitmap());
+            });
+        }
+    }
 }
 
 Gfx::Palette Page::palette() const
@@ -248,6 +272,12 @@ CSS::PreferredColorScheme Page::preferred_color_scheme() const
 {
     if (m_preferred_color_scheme_override_for_testing.has_value())
         return *m_preferred_color_scheme_override_for_testing;
+
+    // Force-dark presents a dark preference, the way Android WebView's force-dark does (Chrome itself leaves the
+    // preference alone and darkens per element): a page that can style itself dark does, the color-scheme opt-out keeps
+    // the filter away from it, and only pages with no dark support get filtered.
+    if (has_local_root_navigable() && local_root_navigable()->force_dark_enabled())
+        return CSS::PreferredColorScheme::Dark;
 
     auto preferred_color_scheme = m_client->preferred_color_scheme();
 
@@ -347,7 +377,7 @@ EventResult Page::handle_mouseup(DevicePixelPoint position, DevicePixelPoint scr
             navigable->event_handler().reset_mouse_input_tracking({});
         }
     };
-    return top_level_traversable()->event_handler().handle_mouseup(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers);
+    return local_root_navigable()->event_handler().handle_mouseup(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers);
 }
 
 EventResult Page::handle_mousedown(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count)
@@ -357,7 +387,7 @@ EventResult Page::handle_mousedown(DevicePixelPoint position, DevicePixelPoint s
             navigable->event_handler().reset_mouse_input_tracking({});
         m_mouse_event_tracking_navigable = nullptr;
     }
-    return top_level_traversable()->event_handler().handle_mousedown(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, click_count);
+    return local_root_navigable()->event_handler().handle_mousedown(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, click_count);
 }
 
 void Page::set_mouse_event_tracking_navigable(Badge<EventHandler>, HTML::LocalNavigable& navigable)
@@ -367,43 +397,43 @@ void Page::set_mouse_event_tracking_navigable(Badge<EventHandler>, HTML::LocalNa
 
 EventResult Page::handle_mousemove(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers)
 {
-    return top_level_traversable()->event_handler().handle_mousemove(device_to_css_point(position), device_to_css_point(screen_position), buttons, modifiers);
+    return local_root_navigable()->event_handler().handle_mousemove(device_to_css_point(position), device_to_css_point(screen_position), buttons, modifiers);
 }
 
 EventResult Page::handle_mouseleave()
 {
-    return top_level_traversable()->event_handler().handle_mouseleave();
+    return local_root_navigable()->event_handler().handle_mouseleave();
 }
 
 #if defined(AK_OS_MACOS)
 bool Page::select_word_for_dictionary_lookup(DevicePixelPoint position)
 {
-    return top_level_traversable()->event_handler().select_word_for_dictionary_lookup(device_to_css_point(position));
+    return local_root_navigable()->event_handler().select_word_for_dictionary_lookup(device_to_css_point(position));
 }
 #endif
 
 UniqueNodeID Page::node_id_at_position(DevicePixelPoint position)
 {
-    auto node = top_level_traversable()->event_handler().target_node_for_mouse_position(device_to_css_point(position));
+    auto node = local_root_navigable()->event_handler().target_node_for_mouse_position(device_to_css_point(position));
     if (!node)
         return 0;
 
     return node->unique_id();
 }
 
-EventResult Page::handle_mousewheel(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation)
+EventResult Page::handle_mousewheel(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, WheelDeltaPrecision wheel_delta_precision, ScrollGesturePhase scroll_gesture_phase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation)
 {
-    return top_level_traversable()->event_handler().handle_mousewheel(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, async_scroll_performed_default_action, async_scroll_operation);
+    return local_root_navigable()->event_handler().handle_mousewheel(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation);
 }
 
 EventResult Page::handle_drag_and_drop_event(DragEvent::Type type, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files)
 {
-    return top_level_traversable()->event_handler().handle_drag_and_drop_event(type, device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, move(files));
+    return local_root_navigable()->event_handler().handle_drag_and_drop_event(type, device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, move(files));
 }
 
 EventResult Page::handle_pinch_event(DevicePixelPoint position, unsigned modifiers, double scale)
 {
-    return top_level_traversable()->event_handler().handle_pinch_event(device_to_css_point(position), modifiers, scale);
+    return local_root_navigable()->event_handler().handle_pinch_event(device_to_css_point(position), modifiers, scale);
 }
 
 EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text)
@@ -418,30 +448,30 @@ EventResult Page::handle_keyup(UIEvents::KeyCode key, unsigned modifiers, u32 co
 
 void Page::handle_sdl_input_events()
 {
-    top_level_traversable()->event_handler().handle_sdl_input_events();
+    local_root_navigable()->event_handler().handle_sdl_input_events();
 }
 
 void Page::invalidate_compositor_wheel_event_listener_state()
 {
     ++m_wheel_event_listener_state_generation;
 
-    if (!m_async_scrolling_enabled || !top_level_traversable_is_initialized() || !top_level_traversable()->has_compositor_context())
+    if (!m_async_scrolling_enabled || !has_local_root_navigable() || !local_root_navigable()->has_compositor_context())
         return;
 
-    top_level_traversable()->compositor_context().invalidate_wheel_event_listener_state(m_wheel_event_listener_state_generation);
+    local_root_navigable()->compositor_context().invalidate_wheel_event_listener_state(m_wheel_event_listener_state_generation);
 }
 
 void Page::update_needs_beforeunload_check()
 {
     auto needs_beforeunload_check = [&] {
-        if (!top_level_traversable_is_initialized())
+        if (!has_local_root_navigable())
             return true;
 
-        auto top_level_traversable = this->top_level_traversable();
-        auto active_document = top_level_traversable->active_document();
+        auto local_root_navigable = this->local_root_navigable();
+        auto active_document = local_root_navigable->active_document();
         if (!active_document)
             return true;
-        if (active_document->navigable() != top_level_traversable)
+        if (active_document->navigable() != local_root_navigable)
             return true;
 
         for (auto const& navigable : active_document->inclusive_descendant_navigables()) {
@@ -460,38 +490,48 @@ void Page::update_needs_beforeunload_check()
     client().page_did_change_needs_beforeunload_check(m_needs_beforeunload_check);
 }
 
-void Page::set_top_level_traversable(GC::Ref<HTML::LocalTraversableNavigable> navigable)
+void Page::set_local_root_navigable(GC::Ref<HTML::LocalNavigable> navigable)
 {
-    VERIFY(!m_top_level_traversable); // Replacement is not allowed!
+    VERIFY(!m_local_root_navigable); // Replacement is not allowed!
     VERIFY(&navigable->page() == this);
-    m_top_level_traversable = navigable;
+    m_local_root_navigable = navigable;
     update_needs_beforeunload_check();
 }
 
-bool Page::top_level_traversable_is_initialized() const
+bool Page::has_local_root_navigable() const
 {
-    return !!m_top_level_traversable;
+    return m_local_root_navigable != nullptr;
 }
 
 HTML::BrowsingContext& Page::top_level_browsing_context()
 {
-    return *m_top_level_traversable->active_browsing_context();
+    return *as<HTML::LocalNavigable>(*top_level_traversable()).active_browsing_context();
 }
 
 HTML::BrowsingContext const& Page::top_level_browsing_context() const
 {
-    return *m_top_level_traversable->active_browsing_context();
+    return *as<HTML::LocalNavigable>(*top_level_traversable()).active_browsing_context();
 }
 
-GC::Ref<HTML::LocalTraversableNavigable> Page::top_level_traversable() const
+GC::Ref<HTML::LocalNavigable> Page::local_root_navigable() const
 {
-    return *m_top_level_traversable;
+    return *m_local_root_navigable;
 }
 
-void Page::did_update_window_rect()
+HTML::HistoryExecutor& Page::history_executor()
+{
+    return *m_history_executor;
+}
+
+GC::Ref<HTML::Navigable> Page::top_level_traversable() const
+{
+    return local_root_navigable()->top_level_traversable();
+}
+
+void Page::did_complete_window_rect_request(u64 completion_id)
 {
     if (m_window_rect_observer)
-        m_window_rect_observer->function()({ window_position(), window_size() });
+        m_window_rect_observer->function()({ window_position(), window_size() }, completion_id);
 }
 
 template<typename ResponseType>
@@ -798,6 +838,25 @@ void Page::for_each_media_element(Callback&& callback)
     }
 }
 
+bool Page::has_media_element_playing_audio(DOM::Document const& document) const
+{
+    for (auto media_id : m_media_elements) {
+        auto* node = DOM::Node::from_unique_id(media_id);
+        if (node && &node->document() == &document && as<HTML::HTMLMediaElement>(*node).is_playing_audio())
+            return true;
+    }
+    return false;
+}
+
+void Page::sync_media_element_video_sink_ticking()
+{
+    for_each_media_element([&](auto& media_element) {
+        media_element.sync_video_sink_ticking();
+        if (auto* video_element = as_if<HTML::HTMLVideoElement>(&media_element))
+            Painting::push_video_paint_facts(*video_element);
+    });
+}
+
 void Page::restore_all_media_element_video_sinks()
 {
     for_each_media_element([&](auto& media_element) {
@@ -808,7 +867,7 @@ void Page::restore_all_media_element_video_sinks()
 void Page::detach_all_media_element_video_sinks_after_compositor_lost()
 {
     for_each_media_element([&](auto& media_element) {
-        media_element.detach_video_sink_after_compositor_lost();
+        media_element.detach_video_sink_edge();
     });
 }
 
@@ -858,6 +917,18 @@ void Page::notify_all_webgl_contexts_lost()
     for_each_canvas_element([](auto& canvas_element) {
         canvas_element.notify_compositor_connection_lost();
     });
+}
+
+void Page::record_context_menu_request(Badge<EventHandler>, ContextMenuRequest request)
+{
+    m_context_menu_request = request;
+}
+
+Optional<Page::ContextMenuRequest> Page::take_context_menu_request()
+{
+    auto request = m_context_menu_request;
+    m_context_menu_request.clear();
+    return request;
 }
 
 void Page::did_request_media_context_menu(UniqueNodeID media_id, CSSPixelPoint position, ByteString const& target, unsigned modifiers, MediaContextMenu const& menu)
@@ -958,7 +1029,13 @@ GC::Ptr<HTML::HTMLMediaElement> Page::media_context_menu_element()
 
 void Page::set_user_style(Utf16String source)
 {
-    m_user_style_sheet_source = move(source);
+    // An empty user style is indistinguishable from having none, and shadow scopes only share style
+    // caches while no user style is present, so setting an empty source clears it outright. This
+    // matters across tests too: page state outlives the documents a test runner loads into it.
+    if (source.is_empty())
+        m_user_style_sheet_source = {};
+    else
+        m_user_style_sheet_source = move(source);
     invalidate_user_style();
 }
 
@@ -976,19 +1053,38 @@ void Page::set_content_blocking_enabled(bool enabled)
 
 void Page::invalidate_user_style()
 {
-    if (!top_level_traversable_is_initialized() || !top_level_traversable()->active_document())
+    if (!has_local_root_navigable() || !local_root_navigable()->active_document())
         return;
 
     auto invalidate_document = [](DOM::Document& document) {
         document.invalidate_content_blocker_style_sheet();
         document.style_scope().invalidate_user_style_sheet();
         document.for_each_shadow_root([](auto& shadow_root) {
-            shadow_root.invalidate_style(DOM::StyleInvalidationReason::StyleSheetReplace);
+            shadow_root.record_style_environment_change();
         });
-        document.invalidate_style(DOM::StyleInvalidationReason::StyleSheetReplace);
+        document.record_style_environment_change();
     };
 
-    auto& active_document = *top_level_traversable()->active_document();
+    auto& active_document = *local_root_navigable()->active_document();
+    invalidate_document(active_document);
+
+    for (auto& navigable : active_document.descendant_navigables()) {
+        if (auto document = navigable->active_document())
+            invalidate_document(*document);
+    }
+}
+
+void Page::invalidate_style_for_preference_change()
+{
+    if (!has_local_root_navigable() || !local_root_navigable()->active_document())
+        return;
+
+    auto invalidate_document = [](DOM::Document& document) {
+        document.record_style_environment_change();
+        document.set_needs_media_query_evaluation();
+    };
+
+    auto& active_document = *local_root_navigable()->active_document();
     invalidate_document(active_document);
 
     for (auto& navigable : active_document.descendant_navigables()) {
@@ -999,11 +1095,11 @@ void Page::invalidate_user_style()
 
 Vector<GC::Root<DOM::Document>> Page::documents_in_active_window() const
 {
-    if (!top_level_traversable_is_initialized())
+    if (!has_local_root_navigable())
         return {};
 
     auto documents = HTML::main_thread_event_loop().documents_in_this_event_loop_matching([&](auto& document) {
-        return document.window() == top_level_traversable()->active_window();
+        return document.window() == local_root_navigable()->active_window();
     });
 
     return documents;
@@ -1022,7 +1118,7 @@ void Page::clear_selection()
 
 Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& query, Optional<SearchDirection> direction)
 {
-    VERIFY(top_level_traversable_is_initialized());
+    VERIFY(has_local_root_navigable());
 
     Vector<GC::Root<DOM::Range>> all_matches;
 
@@ -1051,7 +1147,7 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
     auto should_update_match_index = false;
     for (auto const& document : documents_in_active_window()) {
         auto matches = document->find_matching_text(query.string, query.case_sensitivity);
-        if (GC::Ptr { document.ptr() } == top_level_traversable()->active_document()) {
+        if (GC::Ptr { document.ptr() } == local_root_navigable()->active_document()) {
             if (auto range = active_range(*document)) {
                 auto new_match_index = find_current_match_index(*range, matches);
                 should_update_match_index = true;
@@ -1064,9 +1160,9 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
         all_matches.extend(move(matches));
     }
 
-    if (auto active_document = top_level_traversable()->active_document()) {
+    if (auto active_document = local_root_navigable()->active_document()) {
         if (m_last_find_in_page_url.serialize(URL::ExcludeFragment::Yes) != active_document->url().serialize(URL::ExcludeFragment::Yes)) {
-            m_last_find_in_page_url = top_level_traversable()->active_document()->url();
+            m_last_find_in_page_url = local_root_navigable()->active_document()->url();
             m_find_in_page_match_index = 0;
         }
     }
@@ -1101,7 +1197,7 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
 
 Page::FindInPageResult Page::find_in_page(FindInPageQuery const& query)
 {
-    if (!top_level_traversable_is_initialized())
+    if (!has_local_root_navigable())
         return {};
 
     if (query.string.is_empty()) {
@@ -1113,14 +1209,14 @@ Page::FindInPageResult Page::find_in_page(FindInPageQuery const& query)
     auto result = perform_find_in_page_query(query);
 
     m_last_find_in_page_query = query;
-    m_last_find_in_page_url = top_level_traversable()->active_document()->url();
+    m_last_find_in_page_url = local_root_navigable()->active_document()->url();
 
     return result;
 }
 
 Page::FindInPageResult Page::find_in_page_next_match()
 {
-    if (!(m_last_find_in_page_query.has_value() && top_level_traversable_is_initialized()))
+    if (!(m_last_find_in_page_query.has_value() && has_local_root_navigable()))
         return {};
 
     auto result = perform_find_in_page_query(*m_last_find_in_page_query, SearchDirection::Forward);
@@ -1129,7 +1225,7 @@ Page::FindInPageResult Page::find_in_page_next_match()
 
 Page::FindInPageResult Page::find_in_page_previous_match()
 {
-    if (!(m_last_find_in_page_query.has_value() && top_level_traversable_is_initialized()))
+    if (!(m_last_find_in_page_query.has_value() && has_local_root_navigable()))
         return {};
 
     auto result = perform_find_in_page_query(*m_last_find_in_page_query, SearchDirection::Backward);
@@ -1167,9 +1263,9 @@ void Page::update_find_in_page_selection(Vector<GC::Root<DOM::Range>> matches, C
     }
 }
 
-void Page::enqueue_fullscreen_enter(GC::Ref<DOM::Element> element, GC::Ref<DOM::Document> pending_doc, DOM::RequestFullscreenError error, GC::Ptr<WebIDL::Promise> promise)
+void Page::enqueue_fullscreen_enter(GC::Ref<DOM::Element> element, GC::Ref<DOM::Document> pending_doc, DOM::RequestFullscreenError error, GC::Ptr<WebIDL::Promise> promise, Fullscreen::RequestType request_type)
 {
-    m_pending_fullscreen_operations.enqueue(PendingFullscreenEnter { element, pending_doc, error, promise });
+    m_pending_fullscreen_operations.enqueue(PendingFullscreenEnter { element, pending_doc, error, promise, request_type });
     // NOTE: Processing is deferred because the spec says "run the remaining steps in parallel",
     //       meaning the caller's synchronous JS should complete before we process the operation.
     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this]() {
@@ -1237,7 +1333,7 @@ void Page::process_pending_fullscreen_operations()
                 // 10. If error is true:
                 if (enter.error != DOM::RequestFullscreenError::False) {
                     // 1. Append (fullscreenerror, this) to pendingDoc's list of pending fullscreen events.
-                    enter.pending_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Error, enter.element);
+                    enter.pending_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Error, enter.element, enter.request_type);
 
                     // 2. Reject promise with a TypeError exception and terminate these steps.
                     if (enter.promise)
@@ -1279,10 +1375,10 @@ void Page::process_pending_fullscreen_operations()
                         as<HTML::HTMLIFrameElement>(*element).set_iframe_fullscreen_flag(true);
 
                     // 4. Fullscreen element within doc.
-                    doc.fullscreen_element_within_doc(element);
+                    doc.fullscreen_element_within_doc(element, enter.request_type);
 
                     // 5. Append (fullscreenchange, element) to doc's list of pending fullscreen events.
-                    doc.append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, element);
+                    doc.append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, element, enter.request_type);
                 }
 
                 // 14. Resolve promise with undefined
@@ -1330,9 +1426,11 @@ void Page::process_pending_fullscreen_operations()
 
                 // 14. For each exitDoc in exitDocs:
                 for (auto& exit_doc : exit_docs->elements()) {
+                    auto fullscreen_element = exit_doc->fullscreen_element();
+
                     // 1. Append (fullscreenchange, exitDoc's fullscreen element) to exitDoc's list of pending
                     //    fullscreen events.
-                    exit_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, *exit_doc->fullscreen_element());
+                    exit_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, *fullscreen_element, fullscreen_element->fullscreen_request_type());
 
                     // 2. If resize is true, unfullscreen exitDoc.
                     if (exit.resize)
@@ -1344,9 +1442,11 @@ void Page::process_pending_fullscreen_operations()
 
                 // 15. For each descendantDoc in descendantDocs:
                 for (auto& descendant_doc : descendant_docs->elements()) {
+                    auto fullscreen_element = descendant_doc->fullscreen_element();
+
                     // 1. Append (fullscreenchange, descendantDoc's fullscreen element) to descendantDoc's list of
                     //    pending fullscreen events.
-                    descendant_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, *descendant_doc->fullscreen_element());
+                    descendant_doc->append_pending_fullscreen_change(DOM::PendingFullscreenEvent::Type::Change, *fullscreen_element, fullscreen_element->fullscreen_request_type());
 
                     // 2. Unfullscreen descendantDoc.
                     descendant_doc->unfullscreen();
@@ -1372,6 +1472,39 @@ void Page::set_viewport_is_fullscreen(ViewportIsFullscreen is_fullscreen)
     m_viewport_is_fullscreen = is_fullscreen;
     m_fullscreen_ipc_sent_to_ui = false;
     process_pending_fullscreen_operations();
+}
+
+void PageClient::history_navigation_params_creation_finished(HTML::CrossProcessId operation_id, HTML::HistoryNavigationPopulation population)
+{
+    page().history_executor().resume_history_navigation_population(operation_id, move(population));
+}
+
+void PageClient::request_navigation_start(HTML::LocalNavigable& navigable, NavigationTarget target, URL::URL const&, Utf16String navigation_id, Optional<HTML::NavigationStartRequest> start_request)
+{
+    // A javascript: navigation runs synchronously in this process and never populates an entry; there is nothing
+    // for the embedder to retain.
+    if (!start_request.has_value())
+        return;
+
+    navigable.run_navigation_unload_check(navigation_id, GC::create_function(navigable.heap(), [client = GC::Ref { *this }, navigable = GC::Ref { navigable }, target, navigation_id, start_request = start_request.release_value()](bool should_continue) mutable {
+        if (!should_continue) {
+            navigable->resume_navigation_params_creation(navigation_id, {});
+            return;
+        }
+        auto population_request = HTML::create_navigation_population_request(move(start_request), client->allocate_cross_process_id());
+        client->request_navigation_population(navigable, target, move(population_request));
+    }));
+}
+
+void PageClient::request_navigation_population(HTML::LocalNavigable& navigable, NavigationTarget, HTML::NavigationPopulationRequest request)
+{
+    navigable.resume_navigation_params_creation(request.navigation_id, move(request));
+}
+
+void PageClient::navigation_params_creation_finished(HTML::LocalNavigable& navigable, HTML::NavigationPopulationRequest request, HTML::NavigationPopulationResult result)
+{
+    HTML::apply_navigation_population_result(request, result);
+    navigable.continue_navigation_at_population(move(request), move(result));
 }
 
 }

@@ -7,6 +7,7 @@
 #include <AK/Utf16StringBuilder.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Color.h>
+#include <LibWeb/Bindings/Document.h>
 #include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
@@ -709,17 +710,21 @@ Vector<GC::Ref<DOM::Node>> clear_the_value(Utf16FlyString const& command, GC::Re
 
     // 5. If command is "strikethrough", and element has a style attribute that sets "text-decoration" to some value
     //    containing "line-through", delete "line-through" from the value.
+    // AD-HOC: The style attribute stores expanded longhands, so the line keywords live in the
+    //         `text-decoration-line` longhand rather than in a shorthand value list.
     auto remove_text_decoration_value = [&element](CSS::Keyword keyword_to_delete) {
         auto inline_style = element->inline_style();
         if (!inline_style)
             return;
 
-        auto style_value = inline_style->get_property_style_value(CSS::PropertyID::TextDecoration);
+        auto style_value = inline_style->get_property_style_value(CSS::PropertyID::TextDecorationLine);
         if (!style_value)
             return;
-        VERIFY(style_value->is_value_list());
-        auto const& value_list = style_value->as_value_list();
-        CSS::StyleValueVector new_values { value_list.values() };
+        CSS::StyleValueVector new_values;
+        if (style_value->is_value_list())
+            new_values = style_value->as_value_list().values();
+        else
+            new_values.append(*style_value);
         auto was_removed = new_values.remove_all_matching([&](ValueComparingNonnullRefPtr<CSS::StyleValue const> const& value) {
             return value->is_keyword() && value->as_keyword().keyword() == keyword_to_delete;
         });
@@ -731,9 +736,9 @@ Vector<GC::Ref<DOM::Node>> clear_the_value(Utf16FlyString const& command, GC::Re
             return;
         }
 
-        auto new_style_value = CSS::StyleValueList::create(move(new_values), value_list.separator());
+        auto new_style_value = CSS::StyleValueList::create(move(new_values), CSS::StyleValueList::Separator::Space);
         MUST(inline_style->set_property(
-            CSS::PropertyID::TextDecoration,
+            CSS::PropertyID::TextDecorationLine,
             new_style_value->to_utf16_string(CSS::SerializationMode::Normal),
             {}));
     };
@@ -1291,9 +1296,9 @@ Optional<Utf16String> effective_command_value(GC::Ptr<DOM::Node> node, Utf16FlyS
     // 6. If command is "strikethrough", and the "text-decoration" property of node or any of its ancestors has resolved
     //    value containing "line-through", return "line-through". Otherwise, return null.
     if (command == CommandNames::strikethrough) {
-        auto inclusive_ancestor = node;
+        GC::Ptr<DOM::Node> inclusive_ancestor = node;
         do {
-            auto text_decoration_line = resolved_value(*node, CSS::PropertyID::TextDecorationLine);
+            auto text_decoration_line = resolved_value(*inclusive_ancestor, CSS::PropertyID::TextDecorationLine);
             if (text_decoration_line && value_contains_keyword(*text_decoration_line, CSS::Keyword::LineThrough))
                 return "line-through"_utf16;
             inclusive_ancestor = inclusive_ancestor->parent();
@@ -1305,9 +1310,9 @@ Optional<Utf16String> effective_command_value(GC::Ptr<DOM::Node> node, Utf16FlyS
     // 7. If command is "underline", and the "text-decoration" property of node or any of its ancestors has resolved
     //    value containing "underline", return "underline". Otherwise, return null.
     if (command == CommandNames::underline) {
-        auto inclusive_ancestor = node;
+        GC::Ptr<DOM::Node> inclusive_ancestor = node;
         do {
-            auto text_decoration_line = resolved_value(*node, CSS::PropertyID::TextDecorationLine);
+            auto text_decoration_line = resolved_value(*inclusive_ancestor, CSS::PropertyID::TextDecorationLine);
             if (text_decoration_line && value_contains_keyword(*text_decoration_line, CSS::Keyword::Underline))
                 return "underline"_utf16;
             inclusive_ancestor = inclusive_ancestor->parent();
@@ -1964,8 +1969,19 @@ bool is_block_end_point(DOM::BoundaryPoint boundary_point)
         return true;
 
     // or node has a child with index offset, and that child is a visible block node.
+    // AD-HOC: Test block-ness first. Both conditions are side-effect free, and is_visible_node() resolves style for
+    //         every inclusive ancestor, while is_block_node() rejects a non-Element outright.
     auto offset_child = boundary_point.node->child_at_index(boundary_point.offset);
-    return offset_child && is_visible_node(*offset_child) && is_block_node(*offset_child);
+    return offset_child && is_block_node(*offset_child) && is_visible_node(*offset_child);
+}
+
+// Whether a resolved display qualifies an Element as a block node; see is_block_node() below.
+static bool is_block_display(Optional<CSS::Display> const& display)
+{
+    if (!display.has_value())
+        return true;
+    return !(display->is_inline_outside() && (display->is_flow_inside() || display->is_flow_root_inside() || display->is_table_inside()))
+        && !display->is_none();
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#block-node
@@ -1979,11 +1995,7 @@ bool is_block_node(GC::Ref<DOM::Node> node)
     if (!is<DOM::Element>(*node))
         return false;
 
-    auto display = resolved_display(node);
-    if (!display.has_value())
-        return true;
-    return !(display->is_inline_outside() && (display->is_flow_inside() || display->is_flow_root_inside() || display->is_table_inside()))
-        && !display->is_none();
+    return is_block_display(resolved_display(node));
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#block-start-point
@@ -1994,9 +2006,11 @@ bool is_block_start_point(DOM::BoundaryPoint boundary_point)
         return true;
 
     // or node has a child with index offset − 1, and that child is either a visible block node or a visible br.
+    // AD-HOC: Test block-ness first, as in is_block_end_point().
     auto offset_minus_one_child = boundary_point.node->child_at_index(boundary_point.offset - 1);
-    return offset_minus_one_child && is_visible_node(*offset_minus_one_child)
-        && (is_block_node(*offset_minus_one_child) || is<HTML::HTMLBRElement>(*offset_minus_one_child));
+    return offset_minus_one_child
+        && (is_block_node(*offset_minus_one_child) || is<HTML::HTMLBRElement>(*offset_minus_one_child))
+        && is_visible_node(*offset_minus_one_child);
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#collapsed-block-prop
@@ -2645,9 +2659,18 @@ bool is_visible_node(GC::Ref<DOM::Node> node)
 {
     // excluding any node with an inclusive ancestor Element whose "display" property has resolved
     // value "none".
+    // NB: Only Elements have a display of their own; on any other node, resolved_display() answers
+    //     with the nearest inclusive ancestor Element's display. So, walking the ancestor Elements
+    //     covers every node in between. The display of node itself also feeds the block-node check
+    //     below. So, it's resolved once here — rather than a second time there.
+    Optional<CSS::Display> node_display;
     bool has_display_none = false;
-    node->for_each_inclusive_ancestor([&has_display_none](GC::Ref<DOM::Node> ancestor) {
+    node->for_each_inclusive_ancestor([&](GC::Ref<DOM::Node> ancestor) {
+        if (!is<DOM::Element>(*ancestor))
+            return IterationDecision::Continue;
         auto display = resolved_display(ancestor);
+        if (ancestor.ptr() == node.ptr())
+            node_display = display;
         if (display.has_value() && display->is_none()) {
             has_display_none = true;
             return IterationDecision::Break;
@@ -2658,7 +2681,7 @@ bool is_visible_node(GC::Ref<DOM::Node> node)
         return false;
 
     // Something is visible if it is a node that either is a block node,
-    if (is_block_node(node))
+    if (is<DOM::Element>(*node) ? is_block_display(node_display) : is_block_node(node))
         return true;
 
     // or a Text node that is not a collapsed whitespace node,
@@ -3043,7 +3066,7 @@ void normalize_sublists_in_node(GC::Ref<DOM::Node> item)
 
             // 2. Insert child into the parent of item immediately following item, preserving
             //    ranges.
-            move_node_preserving_ranges(child, *item->parent(), item->index());
+            move_node_preserving_ranges(child, *item->parent(), item->index() + 1);
         }
 
         // 3. Otherwise:
@@ -3939,8 +3962,7 @@ GC::Ref<DOM::Element> set_the_tag_name(GC::Ref<DOM::Element> element, Utf16FlySt
         return element;
 
     // 3. Let replacement element be the result of calling createElement(new name) on the ownerDocument of element.
-    auto replacement_name = Utf16String::from_utf16(new_name.view());
-    auto replacement_element = MUST(element->owner_document()->create_element(replacement_name, DOM::Document::ElementCreationOptions {}));
+    auto replacement_element = MUST(element->owner_document()->create_element(new_name, DOM::Document::ElementCreationOptions {}));
 
     // 4. Insert replacement element into element's parent immediately before element.
     insert_node_before(replacement_element, *element->parent(), element);
@@ -3999,8 +4021,10 @@ Optional<Utf16String> specified_command_value(GC::Ref<DOM::Element> element, Utf
 
     // 4. If command is "strikethrough", and element has a style attribute set, and that attribute sets
     //    "text-decoration":
+    // AD-HOC: The style attribute stores expanded longhands, and a reconstructed `text-decoration` shorthand is not
+    //         a value list, so read the `text-decoration-line` longhand the attribute sets.
     if (command == CommandNames::strikethrough) {
-        auto text_decoration_style = property_in_style_attribute(element, CSS::PropertyID::TextDecoration);
+        auto text_decoration_style = property_in_style_attribute(element, CSS::PropertyID::TextDecorationLine);
         if (text_decoration_style) {
             // 1. If element's style attribute sets "text-decoration" to a value containing "line-through", return
             //    "line-through".
@@ -4017,8 +4041,9 @@ Optional<Utf16String> specified_command_value(GC::Ref<DOM::Element> element, Utf
         return "line-through"_utf16;
 
     // 6. If command is "underline", and element has a style attribute set, and that attribute sets "text-decoration":
+    // AD-HOC: Read the `text-decoration-line` longhand, as above.
     if (command == CommandNames::underline) {
-        auto text_decoration_style = property_in_style_attribute(element, CSS::PropertyID::TextDecoration);
+        auto text_decoration_style = property_in_style_attribute(element, CSS::PropertyID::TextDecorationLine);
         if (text_decoration_style) {
             // 1. If element's style attribute sets "text-decoration" to a value containing "underline", return "underline".
             if (value_contains_keyword(*text_decoration_style, CSS::Keyword::Underline))
@@ -4930,9 +4955,15 @@ RefPtr<CSS::StyleValue const> resolved_value(GC::Ref<DOM::Node> node, CSS::Prope
         element = element->parent();
     if (!element)
         return {};
+    DOM::AbstractElement abstract_element { static_cast<DOM::Element&>(*element) };
+
+    // OPTIMIZATION: For properties whose resolved value is the plain computed value, read it straight off the element's
+    // computed style — instead of materializing a whole resolved-style declaration just to extract a single property.
+    if (auto fast_value = CSS::CSSStyleProperties::resolved_value_read_from_computed_style(abstract_element, property_id); fast_value.has_value())
+        return fast_value.release_value();
 
     // Retrieve resolved style value
-    auto resolved_css_style_declaration = CSS::CSSStyleProperties::create_resolved_style(DOM::AbstractElement { static_cast<DOM::Element&>(*element) });
+    auto resolved_css_style_declaration = CSS::CSSStyleProperties::create_resolved_style(abstract_element);
     auto optional_style_property = resolved_css_style_declaration->get_property(property_id);
     if (!optional_style_property.has_value())
         return {};

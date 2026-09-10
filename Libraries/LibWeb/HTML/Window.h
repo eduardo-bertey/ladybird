@@ -10,6 +10,7 @@
 #include <AK/Badge.h>
 #include <AK/FlyString.h>
 #include <AK/Function.h>
+#include <AK/HashMap.h>
 #include <AK/IterationDecision.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
@@ -28,7 +29,6 @@
 #include <LibWeb/HTML/MimeType.h>
 #include <LibWeb/HTML/Plugin.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
-#include <LibWeb/HTML/UniversalGlobalScope.h>
 #include <LibWeb/HTML/WindowEventHandlers.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HTML/WindowType.h>
@@ -94,8 +94,7 @@ class WEB_API Window final
     : public DOM::EventTarget
     , public GlobalEventHandlers
     , public WindowEventHandlers
-    , public WindowOrWorkerGlobalScopeMixin
-    , public UniversalGlobalScopeMixin {
+    , public WindowOrWorkerGlobalScopeMixin {
     WEB_WRAPPABLE(Window, DOM::EventTarget);
     GC_DECLARE_ALLOCATOR(Window);
 
@@ -112,16 +111,6 @@ public:
     JS::Realm& principal_realm() const;
     EnvironmentSettingsObject& relevant_settings_object() const;
     void set_environment_settings_object(Badge<WindowEnvironmentSettingsObject>, WindowEnvironmentSettingsObject&);
-
-    using UniversalGlobalScopeMixin::atob;
-    using UniversalGlobalScopeMixin::btoa;
-    using UniversalGlobalScopeMixin::queue_microtask;
-    using WindowOrWorkerGlobalScopeMixin::clear_interval;
-    using WindowOrWorkerGlobalScopeMixin::clear_timeout;
-    using WindowOrWorkerGlobalScopeMixin::create_image_bitmap;
-    using WindowOrWorkerGlobalScopeMixin::report_error;
-    using WindowOrWorkerGlobalScopeMixin::set_interval;
-    using WindowOrWorkerGlobalScopeMixin::set_timeout;
 
     // ^DOM::EventTarget
     virtual bool dispatch_event(DOM::Event&) override;
@@ -152,7 +141,7 @@ public:
     WebIDL::ExceptionOr<GC::Ptr<WindowProxy>> window_open_steps(Utf16View url, Utf16View target, Utf16View features);
 
     struct OpenedWindow {
-        GC::Ptr<LocalNavigable> navigable;
+        GC::Ptr<Navigable> navigable;
         TokenizedFeature::NoOpener no_opener { TokenizedFeature::NoOpener::No };
         WindowType window_type { WindowType::ExistingOrNone };
     };
@@ -162,7 +151,7 @@ public:
     DOM::Event const* current_event() const { return m_current_event.ptr(); }
     void set_current_event(DOM::Event* event);
 
-    Optional<CSS::FeatureValue> query_media_feature(CSS::MediaFeatureID) const;
+    CSS::Parser::ValueParserFFI::FfiMediaFeatureValue query_media_feature(CSS::MediaFeatureID) const;
 
     void fire_a_page_transition_event(Utf16FlyString const& event_name, bool persisted);
 
@@ -170,6 +159,7 @@ public:
     WebIDL::ExceptionOr<GC::Ref<Storage>> session_storage();
 
     void start_an_idle_period();
+    bool has_idle_callbacks() const { return !m_idle_request_callbacks.is_empty() || !m_runnable_idle_callbacks.is_empty(); }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#sticky-activation
     bool has_sticky_activation() const;
@@ -233,6 +223,14 @@ public:
         Utf16String target_origin;
     };
     WebIDL::ExceptionOr<void> post_message(JS::Realm&, JS::Value message, PostMessageOptions const&);
+    struct PreparedPostMessage {
+        SerializedTransferRecord serialize_with_transfer_result;
+        Variant<Utf16String, URL::Origin> target_origin;
+        URL::Origin source_origin;
+        GC::Ref<WindowProxy> source;
+    };
+    static WebIDL::ExceptionOr<PreparedPostMessage> prepare_post_message(JS::Realm&, JS::Value message, PostMessageOptions const&);
+    void deliver_posted_message(SerializedTransferRecord, Variant<Utf16String, URL::Origin> const& target_origin, URL::Origin const& source_origin, GC::Ref<WindowProxy> source);
 
     Variant<GC::Ref<DOM::Event>, Empty> event() const;
 
@@ -253,8 +251,8 @@ public:
     double scroll_x() const;
     double scroll_y() const;
     using ScrollToOptions = Bindings::ScrollToOptions;
-    void scroll(ScrollToOptions const&, GC::Ptr<WebIDL::Promise>);
-    void scroll(double x, double y, GC::Ptr<WebIDL::Promise>);
+    void scroll(ScrollToOptions const&, GC::Ptr<WebIDL::Promise>, Optional<CSSPixelPoint> relative_displacement = {});
+    void scroll(double x, double y, GC::Ptr<WebIDL::Promise>, Optional<CSSPixelPoint> relative_displacement = {});
     void scroll_by(ScrollToOptions, GC::Ptr<WebIDL::Promise>);
     void scroll_by(double x, double y, GC::Ptr<WebIDL::Promise>);
 
@@ -302,6 +300,7 @@ public:
 
     [[nodiscard]] Variant<Empty, GC::Ref<WindowProxy>, GC::Ref<DOM::Element>, GC::Ref<DOM::HTMLCollection>> named_item(Utf16FlyString const&) const;
     [[nodiscard]] Vector<Utf16FlyString> supported_property_names() const override;
+    [[nodiscard]] virtual bool is_supported_property_name(Utf16FlyString const&) const override;
 
     bool find(Utf16View string);
 
@@ -309,8 +308,6 @@ public:
 
 private:
     Window();
-
-    virtual bool is_universal_global_scope_mixin() const final { return true; }
 
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void finalize() override;
@@ -322,6 +319,7 @@ private:
     virtual GC::Ptr<DOM::EventTarget> window_event_handlers_to_event_target() override { return *this; }
 
     void invoke_idle_callbacks();
+    void invoke_idle_callback_timeout(u32 handle);
 
     struct [[nodiscard]] NamedObjects {
         Vector<GC::Ref<LocalNavigable>> navigables;
@@ -358,10 +356,12 @@ private:
 
     GC::Ptr<AnimationFrameCallbackDriver> m_animation_frame_callback_driver;
 
+    // NB: Both lists are keyed by handle — so a timeout or cancelIdleCallback() finds its callback without walking past
+    //     every other pending one — and ordered, so an idle period still runs them first-in first-out.
     // https://w3c.github.io/requestidlecallback/#dfn-list-of-idle-request-callbacks
-    Vector<NonnullRefPtr<IdleCallback>> m_idle_request_callbacks;
+    OrderedHashMap<u32, NonnullRefPtr<IdleCallback>> m_idle_request_callbacks;
     // https://w3c.github.io/requestidlecallback/#dfn-list-of-runnable-idle-callbacks
-    Vector<NonnullRefPtr<IdleCallback>> m_runnable_idle_callbacks;
+    OrderedHashMap<u32, NonnullRefPtr<IdleCallback>> m_runnable_idle_callbacks;
     // https://w3c.github.io/requestidlecallback/#dfn-idle-callback-identifier
     u32 m_idle_callback_identifier = 0;
 

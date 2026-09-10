@@ -52,10 +52,12 @@ struct CacheableGetPropertyMetadata {
         NotCacheable,
         GetOwnProperty,
         GetPropertyInPrototypeChain,
+        GetMissingProperty,
     };
     Type type { Type::NotCacheable };
     Optional<u32> property_offset;
     GC::Ptr<Object const> prototype;
+    bool property_absence_is_cacheable { true };
 };
 
 struct CacheableSetPropertyMetadata {
@@ -133,7 +135,7 @@ public:
     // 7.3 Operations on Objects, https://tc39.es/ecma262/#sec-operations-on-objects
 
     ThrowCompletionOr<Value> get(PropertyKey const&) const;
-    ThrowCompletionOr<Value> get(PropertyKey const&, Bytecode::PropertyLookupCache&) const;
+    ThrowCompletionOr<Value> get(PropertyKey const&, Bytecode::StaticPropertyLookupCache&) const;
     ThrowCompletionOr<void> set(PropertyKey const&, Value, ShouldThrowExceptions);
     ThrowCompletionOr<void> set(PropertyKey const&, Value, Bytecode::PropertyLookupCache&);
     ThrowCompletionOr<bool> create_data_property(PropertyKey const&, Value, Optional<u32>* new_property_offset = nullptr);
@@ -172,6 +174,8 @@ public:
         PrototypeChain,
     };
     virtual ThrowCompletionOr<Value> internal_get(PropertyKey const&, Value receiver, CacheableGetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty) const;
+    virtual bool is_cacheable_for_property_absence() const { return true; }
+    virtual bool is_cacheable_for_inherited_property() const { return true; }
     virtual ThrowCompletionOr<bool> internal_set(PropertyKey const&, Value value, Value receiver, CacheableSetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty);
     virtual ThrowCompletionOr<bool> internal_delete(PropertyKey const&);
     virtual ThrowCompletionOr<GC::RootVector<Value>> internal_own_property_keys() const;
@@ -204,6 +208,9 @@ public:
     void set_requires_slow_add_own_property() { m_flags |= Flag::RequiresSlowAddOwnProperty; }
     void clear_requires_slow_add_own_property() { m_flags &= ~Flag::RequiresSlowAddOwnProperty; }
 
+    [[nodiscard]] bool is_platform_object() const { return m_flags & Flag::IsPlatformObject; }
+    void set_is_platform_object() { m_flags |= Flag::IsPlatformObject; }
+
     ThrowCompletionOr<bool> ordinary_set_with_own_descriptor(PropertyKey const&, Value, Value, Optional<PropertyDescriptor>, CacheableSetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty);
 
     // 10.4.7 Immutable Prototype Exotic Objects, https://tc39.es/ecma262/#sec-immutable-prototype-exotic-objects
@@ -233,7 +240,14 @@ public:
     Value get_without_side_effects(PropertyKey const&) const;
 
     void define_direct_property(PropertyKey const& property_key, Value value, PropertyAttributes attributes) { (void)storage_set(property_key, { value, attributes }); }
+    void define_unimplemented_property(Utf16FlyString const& property_name);
+    Optional<ValueAndAttributes> get_engine_private_property(GC::Ref<Symbol>) const;
+    void set_engine_private_property(GC::Ref<Symbol>, Value);
+    void delete_engine_private_property(GC::Ref<Symbol>);
     void define_direct_accessor(PropertyKey const&, GC::Ptr<FunctionObject> getter, GC::Ptr<FunctionObject> setter, PropertyAttributes attributes);
+    // Cache the getter's result in an engine-private property on this object.
+    void define_direct_cached_accessor(PropertyKey const&, GC::Ptr<FunctionObject> getter, GC::Ptr<FunctionObject> setter, PropertyAttributes attributes);
+    void clear_cached_accessor_value(PropertyKey const&);
 
     using IntrinsicAccessor = Value (*)(Realm&);
     void define_intrinsic_accessor(PropertyKey const&, PropertyAttributes attributes, IntrinsicAccessor accessor);
@@ -270,10 +284,14 @@ public:
     virtual bool is_proxy_object() const { return false; }
     virtual bool is_native_function() const { return false; }
     [[nodiscard]] bool is_raw_native_function() const { return m_flags & Flag::IsRawNativeFunction; }
+    [[nodiscard]] bool is_direct_getter_function() const { return m_flags & Flag::IsDirectGetterFunction; }
+    [[nodiscard]] bool has_global_object_flag() const { return m_flags & Flag::IsGlobalObject; }
     [[nodiscard]] bool is_ecmascript_function_object() const { return m_flags & Flag::IsECMAScriptFunctionObject; }
     void set_is_ecmascript_function_object() { m_flags |= Flag::IsECMAScriptFunctionObject; }
     void set_is_function() { m_flags |= Flag::IsFunction; }
     void set_is_raw_native_function() { m_flags |= Flag::IsRawNativeFunction; }
+    void set_is_direct_getter_function() { m_flags |= Flag::IsDirectGetterFunction; }
+    void set_global_object_flag() { m_flags |= Flag::IsGlobalObject; }
     void clear_is_function() { m_flags &= ~Flag::IsFunction; }
     virtual bool is_array_iterator() const { return false; }
     virtual bool is_raw_json_object() const { return false; }
@@ -318,11 +336,12 @@ public:
     u32 indexed_array_like_size() const { return m_indexed_array_like_size; }
     bool set_indexed_array_like_size(size_t new_size);
     void indexed_append(Value value, PropertyAttributes attributes = default_attributes);
+    void indexed_append(ReadonlySpan<Value> values);
     ValueAndAttributes indexed_take_first();
     ValueAndAttributes indexed_take_last();
     size_t indexed_real_size() const;
     Vector<u32> indexed_indices() const;
-    void set_indexed_property_elements(Vector<Value>&& values);
+    void set_indexed_property_elements(ReadonlySpan<Value> values);
     IndexedStorageKind indexed_storage_kind() const { return m_indexed_storage_kind; }
 
     template<typename Callback>
@@ -356,6 +375,7 @@ public:
     void unsafe_set_shape(Shape&);
 
     void convert_to_prototype_if_needed();
+    void invalidate_property_lookup_caches();
 
     template<typename T>
     bool fast_is() const = delete;
@@ -430,6 +450,10 @@ private:
         static constexpr u16 IsECMAScriptFunctionObject = 1 << 6;
         static constexpr u16 IsFunction = 1 << 7;
         static constexpr u16 RequiresSlowAddOwnProperty = 1 << 8;
+        static constexpr u16 IsPlatformObject = 1 << 9;
+        static constexpr u16 IsDirectGetterFunction = 1 << 10;
+        static constexpr u16 IsGlobalObject = 1 << 11;
+        static constexpr u16 HasUnimplementedProperties = 1 << 12;
     };
 
     u16 m_flags { Flag::IsExtensible };
@@ -445,11 +469,16 @@ private:
     void ensure_indexed_elements(u32 needed_capacity);
     void grow_indexed_elements(u32 needed_capacity);
     void transition_to_dictionary();
+    NEVER_INLINE COLD void transition_to_packed();
+    NEVER_INLINE COLD void indexed_put_into_dictionary(u32, Value, PropertyAttributes);
     void free_indexed_elements();
     void ensure_named_storage_capacity(u32 needed);
     bool named_storage_is_inline() const { return m_named_properties == m_inline_named_storage; }
     size_t named_storage_external_memory_size() const;
     size_t indexed_storage_external_memory_size() const;
+
+    [[nodiscard]] bool has_unimplemented_properties() const { return m_flags & Flag::HasUnimplementedProperties; }
+    [[nodiscard]] bool is_unimplemented_property(PropertyKey const&) const;
 
 public:
     static constexpr u32 INLINE_NAMED_PROPERTY_CAPACITY = 2;

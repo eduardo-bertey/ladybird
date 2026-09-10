@@ -51,16 +51,6 @@ void VideoPresentationClientConnection::release_edge(VideoSinkHandle handle)
     async_release_video_edge(*edge_id_to_release);
 }
 
-void VideoPresentationClientConnection::set_sink_ticking(VideoSinkHandle handle, bool ticking)
-{
-    for (auto& entry : m_edge_states) {
-        if (entry.value.handle == handle) {
-            async_set_sink_ticking(entry.key, ticking);
-            return;
-        }
-    }
-}
-
 void VideoPresentationClientConnection::video_edge_ready(u64 edge_id, VideoEdgeQueue edge, PresentedFramePage presented_frame_page, MediaTimeReader time_reader)
 {
     auto edge_state = m_edge_states.get(edge_id);
@@ -127,10 +117,10 @@ void VideoPresentationClientConnection::update_edge_time_reader(u64 edge_id, Med
         edge_state->sink->set_time_reader(move(time_reader));
 }
 
-void VideoPresentationClientConnection::announce_video_frame_slot(u64 edge_id, VideoFramePoolID pool_id, u32 slot_index, Core::AnonymousBuffer slot_buffer)
+void VideoPresentationClientConnection::announce_video_frame_slot(u64 edge_id, VideoFramePoolID pool_id, u32 slot_index, Core::AnonymousBuffer slot_buffer, RefPtr<VideoSurface> surface)
 {
     if (auto edge_state = m_edge_states.get(edge_id); edge_state.has_value())
-        edge_state->slot_directory->notify_slot_announced(pool_id, slot_index, move(slot_buffer));
+        edge_state->slot_directory->notify_slot_announced(pool_id, slot_index, move(slot_buffer), move(surface));
 }
 
 void VideoPresentationClientConnection::retire_video_frame_pool(u64 edge_id, VideoFramePoolID pool_id)

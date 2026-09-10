@@ -76,6 +76,8 @@ public:
     GC::Ref<WebIDL::Promise> decode() const;
     void decode(GC::Ref<WebIDL::Promise>) const;
 
+    GC::Ptr<HTMLMapElement> associated_map_element();
+
     virtual Optional<ARIA::Role> default_role() const override;
 
     // https://html.spec.whatwg.org/multipage/images.html#img-environment-changes
@@ -135,7 +137,8 @@ private:
     // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attributes
     virtual bool supports_dimension_attributes() const override { return true; }
 
-    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
+    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+
     virtual void did_set_viewport_rect(CSSPixelRect const&) override;
 
     void handle_failed_fetch();
@@ -146,7 +149,8 @@ private:
     void update_alt_text_shadow_tree();
     void set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason);
 
-    virtual void decoded_image_data_did_update() override { set_needs_repaint(); }
+    virtual void decoded_image_data_did_update() override { image_provider_contents_changed(); }
+    virtual Layout::Node const* image_provider_layout_node() const override;
 
     Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
 
@@ -175,6 +179,9 @@ private:
     GC::Ptr<DOM::Element const> m_dimension_attribute_source;
 
     u64 m_update_the_image_data_count { 0 };
+
+    GC::Ptr<HTMLMapElement> m_cached_associated_map_element;
+    Optional<u64> m_cached_associated_map_element_dom_tree_version;
 };
 
 }

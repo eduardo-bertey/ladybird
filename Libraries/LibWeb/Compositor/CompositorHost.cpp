@@ -40,9 +40,9 @@ void CompositorContextHandle::update_display_list(NonnullRefPtr<Painting::Displa
     m_host.update_display_list(m_context_id, move(display_list), move(visual_context_tree), move(resource_transaction), move(scroll_state_snapshot));
 }
 
-void CompositorContextHandle::update_visual_context_tree(Painting::AccumulatedVisualContextTree visual_context_tree)
+void CompositorContextHandle::update_visual_context_tree(Painting::AccumulatedVisualContextTree visual_context_tree, Painting::DisplayListResourceTransaction&& resource_transaction)
 {
-    m_host.update_visual_context_tree(m_context_id, move(visual_context_tree));
+    m_host.update_visual_context_tree(m_context_id, move(visual_context_tree), move(resource_transaction));
 }
 
 void CompositorContextHandle::add_video_sink(Media::VideoSinkHandle video_sink_handle)
@@ -55,9 +55,9 @@ void CompositorContextHandle::remove_video_sink(Media::VideoSinkHandle video_sin
     m_host.remove_video_sink(video_sink_handle);
 }
 
-void CompositorContextHandle::set_video_update_flags(Media::VideoSinkHandle video_sink_handle, VideoUpdateFlags flags)
+void CompositorContextHandle::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
 {
-    m_host.set_video_update_flags(video_sink_handle, flags);
+    m_host.set_video_sink_ticking(video_sink_handle, should_tick);
 }
 
 void CompositorContextHandle::update_scroll_state(Painting::ScrollStateSnapshot&& scroll_state_snapshot)
@@ -71,14 +71,14 @@ void CompositorContextHandle::invalidate_wheel_event_listener_state(u64 generati
 }
 
 AsyncScrollEnqueueResult CompositorContextHandle::async_scroll_by(UniqueNodeID expected_document_id, Gfx::FloatPoint position,
-    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, AsyncScrollOperationTracking operation_tracking)
+    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, SnapContainerHandling snap_container_handling, AsyncScrollOperationTracking operation_tracking)
 {
-    return m_host.async_scroll_by(m_context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, operation_tracking);
+    return m_host.async_scroll_by(m_context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, snap_container_handling, operation_tracking);
 }
 
-AsyncScrollEnqueueResult CompositorContextHandle::smooth_scroll_to(AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel)
+AsyncScrollEnqueueResult CompositorContextHandle::smooth_scroll_to(AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::FloatPoint main_thread_offset_in_device_pixels, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel, ScrollAnimationKind animation_kind)
 {
-    return m_host.smooth_scroll_to(m_context_id, stable_node_id, offset_in_device_pixels, viewport_rect, device_pixels_per_css_pixel);
+    return m_host.smooth_scroll_to(m_context_id, stable_node_id, offset_in_device_pixels, main_thread_offset_in_device_pixels, viewport_rect, device_pixels_per_css_pixel, animation_kind);
 }
 
 void CompositorContextHandle::cancel_smooth_scroll(AsyncScrollNodeStableID stable_node_id)
@@ -86,9 +86,9 @@ void CompositorContextHandle::cancel_smooth_scroll(AsyncScrollNodeStableID stabl
     m_host.cancel_smooth_scroll(m_context_id, stable_node_id);
 }
 
-PendingAsyncScrollUpdates CompositorContextHandle::take_pending_async_scroll_updates()
+PendingAsyncScrollUpdates CompositorContextHandle::take_pending_async_scroll_updates(AsyncScrollUpdateFreshness freshness)
 {
-    return m_host.take_pending_async_scroll_updates(m_context_id);
+    return m_host.take_pending_async_scroll_updates(m_context_id, freshness);
 }
 
 void CompositorContextHandle::viewport_size_updated(Gfx::IntSize viewport_size, WindowResizingInProgress window_resize_in_progress)
@@ -96,10 +96,20 @@ void CompositorContextHandle::viewport_size_updated(Gfx::IntSize viewport_size, 
     m_host.viewport_size_updated(m_context_id, viewport_size, window_resize_in_progress);
 }
 
-void CompositorContextHandle::present_frame(Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
+bool CompositorContextHandle::request_rendering_opportunity(double maximum_frames_per_second)
+{
+    return m_host.request_rendering_opportunity(m_context_id, maximum_frames_per_second);
+}
+
+void CompositorContextHandle::hurry_rendering_opportunity()
+{
+    m_host.hurry_rendering_opportunity(m_context_id);
+}
+
+void CompositorContextHandle::present_frame(Gfx::IntRect viewport_rect)
 {
     m_host.flush_canvas_2d_stream();
-    m_host.present_frame(m_context_id, viewport_rect, damage_rect);
+    m_host.present_frame(m_context_id, viewport_rect);
 }
 
 void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)

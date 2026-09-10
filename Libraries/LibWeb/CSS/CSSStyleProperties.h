@@ -7,11 +7,12 @@
 
 #pragma once
 
+#include <AK/OwnPtr.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
 #include <LibWeb/CSS/GeneratedCSSStyleProperties.h>
-#include <LibWeb/DOM/StyleInvalidationReason.h>
+#include <LibWeb/CSS/RustDeclarationBlock.h>
 #include <LibWeb/Export.h>
 
 namespace Web::CSS {
@@ -24,9 +25,10 @@ class WEB_API CSSStyleProperties
 
 public:
     [[nodiscard]] static GC::Ref<CSSStyleProperties> create(Vector<StyleProperty>, OrderedHashMap<Utf16FlyString, StyleProperty> custom_properties);
+    [[nodiscard]] static GC::Ref<CSSStyleProperties> create(RustDeclarationBlock);
 
     [[nodiscard]] static GC::Ref<CSSStyleProperties> create_resolved_style(Optional<DOM::AbstractElement>);
-    [[nodiscard]] static GC::Ref<CSSStyleProperties> create_element_inline_style(DOM::AbstractElement, Vector<StyleProperty>, OrderedHashMap<Utf16FlyString, StyleProperty> custom_properties);
+    [[nodiscard]] static GC::Ref<CSSStyleProperties> create_element_inline_style(DOM::AbstractElement);
 
     virtual ~CSSStyleProperties() override = default;
 
@@ -34,6 +36,8 @@ public:
     virtual Utf16String item(size_t index) const override;
 
     Optional<StyleProperty> get_property(PropertyID) const;
+
+    [[nodiscard]] static Optional<RefPtr<StyleValue const>> resolved_value_read_from_computed_style(DOM::AbstractElement, PropertyID);
     Optional<StyleProperty const&> custom_property(Utf16FlyString const& custom_property_name) const;
 
     WebIDL::ExceptionOr<void> set_property(PropertyID, Utf16View css_text, Utf16View priority = u""sv);
@@ -45,8 +49,20 @@ public:
     virtual Utf16String get_property_value(Utf16FlyString const& property_name) const override;
     virtual Utf16String get_property_priority(Utf16FlyString const& property_name) const override;
 
-    Vector<StyleProperty> const& properties() const { return m_properties; }
-    OrderedHashMap<Utf16FlyString, StyleProperty> const& custom_properties() const { return m_custom_properties; }
+    Vector<StyleProperty> const& properties() const { return m_declarations.properties(); }
+    OrderedHashMap<Utf16FlyString, StyleProperty> const& custom_properties() const { return m_declarations.custom_properties(); }
+    RustDeclarationBlock const& declaration_block() const { return m_declarations; }
+    u64 identity() const { return m_declarations.identity(); }
+    u64 revision() const { return m_declarations.revision(); }
+
+    // Every custom property a var() in this block's values refers to, and whether each reference
+    // names its property with a plain identifier. A reference that substitutes its name can read
+    // anything, so no list of names stands for it.
+    struct CustomPropertyReferences {
+        Vector<Utf16FlyString> names;
+        bool all_references_visible { true };
+    };
+    CustomPropertyReferences const& custom_property_references() const;
 
     virtual bool has_property(PropertyNameAndID const&) const override;
     bool has_property(PropertyID) const;
@@ -66,24 +82,23 @@ public:
     void set_declarations_from_text(Utf16View);
 
 private:
-    CSSStyleProperties(Computed, Readonly, Vector<StyleProperty> properties, OrderedHashMap<Utf16FlyString, StyleProperty> custom_properties, Optional<DOM::AbstractElement>);
-    static Vector<StyleProperty> convert_declarations_to_specified_order(Vector<StyleProperty>&);
+    CSSStyleProperties(Computed, Readonly, RustDeclarationBlock, Optional<DOM::AbstractElement>);
 
     virtual size_t external_memory_size() const override;
 
     RefPtr<StyleValue const> style_value_for_computed_property(Layout::NodeWithStyle const&, PropertyID) const;
+    Optional<Utf16String> serialized_computed_value_from_stored_handle(PropertyID) const;
     Optional<StyleProperty> get_property_internal(PropertyNameAndID const&) const;
     Optional<StyleProperty> get_direct_property(PropertyNameAndID const&) const;
     WebIDL::ExceptionOr<void> set_property_internal(PropertyNameAndID const&, Utf16View css_text, Utf16View priority);
     WebIDL::ExceptionOr<Utf16String> remove_property_internal(Optional<PropertyNameAndID> const&);
     bool set_a_css_declaration(PropertyID, NonnullRefPtr<StyleValue const>, Important);
-    void empty_the_declarations();
-    void set_the_declarations(Vector<StyleProperty> properties, OrderedHashMap<Utf16FlyString, StyleProperty> custom_properties);
 
-    void invalidate_owners(DOM::StyleInvalidationReason);
+    void invalidate_owners();
 
-    Vector<StyleProperty> m_properties;
-    OrderedHashMap<Utf16FlyString, StyleProperty> m_custom_properties;
+    RustDeclarationBlock m_declarations;
+    mutable OwnPtr<CustomPropertyReferences> m_custom_property_references;
+    mutable u64 m_custom_property_references_revision { 0 };
 };
 
 #undef ENUMERATE_GENERATED_CSS_STYLE_PROPERTIES

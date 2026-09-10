@@ -6,21 +6,17 @@
 
 #pragma once
 
+#include <AK/HashMap.h>
 #include <AK/Optional.h>
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
-#include <LibGC/ConservativeHashMap.h>
 #include <LibGC/ConservativeVector.h>
 #include <LibWeb/Animations/TimeValue.h>
 #include <LibWeb/Bindings/AnimationEffect.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/CSS/EasingFunction.h>
-
-namespace Web::CSS {
-
-class AnimatedProperties;
-
-}
+#include <LibWeb/CSS/PropertyNameAndID.h>
+#include <LibWeb/CSS/StyleRecordID.h>
 
 namespace Web::Animations {
 
@@ -44,13 +40,13 @@ Bindings::OptionalEffectTiming to_optional_effect_timing(Bindings::EffectTiming 
 struct AnimationUpdateContext {
     struct ElementData {
         ElementData();
-        ElementData(RefPtr<CSS::AnimatedProperties const>, RefPtr<CSS::ComputedProperties>);
+        ElementData(CSS::StyleRecordID, RefPtr<CSS::ComputedStyleWorkingSet>);
         ElementData(ElementData&&);
         ElementData& operator=(ElementData&&);
         ~ElementData();
 
-        RefPtr<CSS::AnimatedProperties const> animated_properties_before_update;
-        RefPtr<CSS::ComputedProperties> target_style;
+        CSS::StyleRecordID style_record_before_update;
+        RefPtr<CSS::ComputedStyleWorkingSet> target_style;
         GC::ConservativeVector<GC::Ref<KeyframeEffect>> effects;
     };
 
@@ -58,7 +54,7 @@ struct AnimationUpdateContext {
     ~AnimationUpdateContext();
 
     // NOTE: This is lazily populated by KeyframeEffects as their respective animations are applied to an element.
-    GC::ConservativeHashMap<DOM::AbstractElement, ElementData> elements;
+    HashMap<DOM::AbstractElement, ElementData> elements;
 };
 
 // https://www.w3.org/TR/web-animations-1/#the-animationeffect-interface
@@ -143,7 +139,7 @@ public:
 
     void normalize_specified_timing();
 
-    HashTable<CSS::PropertyID> const& target_properties() const { return m_target_properties; }
+    HashTable<CSS::PropertyNameAndID> const& target_properties() const { return m_target_properties; }
 
     virtual GC::Ptr<DOM::Element> target() const { return {}; }
     virtual bool is_keyframe_effect() const { return false; }
@@ -205,13 +201,16 @@ protected:
     // https://www.w3.org/TR/web-animations-1/#time-transformations
     CSS::EasingFunction m_timing_function { CSS::EasingFunction::linear() };
 
+    mutable bool m_has_local_time_override_for_observation { false };
+    mutable Optional<TimeValue> m_local_time_override_for_observation;
+
     // Used for calculating transitions in StyleComputer
     Phase m_previous_phase { Phase::Idle };
     double m_previous_current_iteration { 0.0 };
 
     // https://www.w3.org/TR/web-animations-1/#target-property
     // Note: Only modified by child classes
-    HashTable<CSS::PropertyID> m_target_properties;
+    HashTable<CSS::PropertyNameAndID> m_target_properties;
 };
 
 }

@@ -7,9 +7,10 @@
 #include <AK/Debug.h>
 #include <LibCore/EventLoop.h>
 #include <LibMedia/Audio/SampleSpecification.h>
+#include <LibMedia/CodecParameters.h>
+#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/FFmpeg/FFmpegAudioConverter.h>
-#include <LibMedia/FFmpeg/FFmpegAudioDecoder.h>
 #include <LibMedia/Sinks/AudioSink.h>
 #include <LibSync/Mutex.h>
 #include <LibThreading/Thread.h>
@@ -24,7 +25,6 @@ DecoderErrorOr<NonnullRefPtr<DecodedAudioProducer>> DecodedAudioProducer::try_cr
 
     TRY(demuxer->create_context_for_track(track));
     auto thread_data = DECODER_TRY_ALLOC(try_make_ref_counted<DecodedAudioProducer::ThreadData>(main_thread_event_loop, demuxer, track, auto_suspend_idle_timeout, move(converter)));
-    TRY(thread_data->create_decoder());
     auto producer = DECODER_TRY_ALLOC(try_make_ref_counted<DecodedAudioProducer>(thread_data));
 
     auto thread = DECODER_TRY_ALLOC(Threading::Thread::try_create("Audio Decoder"sv, [thread_data]() -> int {
@@ -193,13 +193,79 @@ void DecodedAudioProducer::ThreadData::wait_for_queue_space_or_auto_suspend_whil
     m_auto_suspend_requested = true;
 }
 
-DecoderErrorOr<void> DecodedAudioProducer::ThreadData::create_decoder()
+AudioDecoderSelection DecodedAudioProducer::ThreadData::select_decoder_for_frame(CodedFrame const& frame, AudioDecoderSelection after) const
 {
-    auto codec_id = TRY(m_demuxer->get_codec_id_for_track(m_track));
+    return select_audio_decoder(parsed_codec_for_coded_frame(frame, m_track.parsed_codec()), after);
+}
+
+void DecodedAudioProducer::ThreadData::replace_decoder_once_drained(CodedFrame const& frame)
+{
+    m_frame_awaiting_decoder_replacement = frame;
+    m_decoder->signal_end_of_stream();
+}
+
+DecoderErrorOr<void> DecodedAudioProducer::ThreadData::receive_into_decoder(CodedFrame const& frame)
+{
+    auto receive_result = m_decoder->receive_coded_data(frame);
+
+    if (receive_result.is_error() && receive_result.error().category() == DecoderErrorCategory::NotImplemented) {
+        m_decoder_that_failed_due_to_missing_features = m_decoder_selection;
+        replace_decoder_once_drained(frame);
+        return {};
+    }
+
+    return receive_result;
+}
+
+DecoderErrorOr<void> DecodedAudioProducer::ThreadData::create_decoder_for_frame(CodedFrame const& frame)
+{
     auto const& sample_specification = m_track.audio_data().sample_specification;
-    auto codec_initialization_data = TRY(m_demuxer->get_codec_initialization_data_for_track(m_track));
-    m_decoder = TRY(FFmpeg::FFmpegAudioDecoder::try_create(codec_id, sample_specification, codec_initialization_data));
+    auto codec_initialization_data = frame.new_codec_configuration();
+    if (!codec_initialization_data.has_value())
+        return DecoderError::with_description(DecoderErrorCategory::Corrupted, "Coded frame starting a decode sequence carries no codec configuration"sv);
+
+    auto selection = select_decoder_for_frame(frame, m_decoder_that_failed_due_to_missing_features);
+    m_decoder_that_failed_due_to_missing_features = {};
+    if (!selection.has_value())
+        return DecoderError::format(DecoderErrorCategory::NotImplemented, "Could not find an audio decoder for codec {}", frame.codec_id());
+
+    m_decoder = TRY(create_audio_decoder(selection, frame.codec_id(), sample_specification, *codec_initialization_data));
+    m_decoder_selection = selection;
+    m_decoder_codec_id = frame.codec_id();
     return {};
+}
+
+DecoderErrorOr<void> DecodedAudioProducer::ThreadData::receive_coded_frame(CodedFrame const& frame)
+{
+    VERIFY(!m_frame_awaiting_decoder_replacement.has_value());
+    if (m_decoder == nullptr) [[unlikely]] {
+        TRY(create_decoder_for_frame(frame));
+    } else {
+        auto frame_carries_new_config = frame.new_codec_configuration().has_value();
+        auto decoder_needs_replacement = m_decoder_codec_id != frame.codec_id();
+        if (!decoder_needs_replacement && frame_carries_new_config)
+            decoder_needs_replacement = select_decoder_for_frame(frame) != m_decoder_selection;
+        if (decoder_needs_replacement) [[unlikely]] {
+            replace_decoder_once_drained(frame);
+            return {};
+        }
+    }
+    return receive_into_decoder(frame);
+}
+
+DecoderErrorOr<bool> DecodedAudioProducer::ThreadData::replace_drained_decoder()
+{
+    if (!m_frame_awaiting_decoder_replacement.has_value())
+        return false;
+    auto frame = m_frame_awaiting_decoder_replacement.release_value();
+    m_converter->flush();
+    if (!frame.new_codec_configuration().has_value()) {
+        TRY(m_demuxer->seek_to_most_recent_keyframe(m_track, frame.presentation_timestamp(), DemuxerSeekOptions::Force | DemuxerSeekOptions::NeedCodecConfiguration));
+        frame = TRY(m_demuxer->get_next_sample_for_track(m_track));
+    }
+    TRY(create_decoder_for_frame(frame));
+    TRY(receive_into_decoder(frame));
+    return true;
 }
 
 void DecodedAudioProducer::ThreadData::release_decoder()
@@ -242,15 +308,13 @@ void DecodedAudioProducer::ThreadData::consume()
     note_consumer_activity_while_locked();
     if (m_queue.is_empty())
         return;
-    m_earliest_available_timestamp = m_queue.head().block.media_time_end();
     m_queue.dequeue();
     wake();
 }
 
 void DecodedAudioProducer::ThreadData::enter_halting_state(PipelineStatus status, Optional<DecoderError> error)
 {
-    if (error.has_value() && error->category() == DecoderErrorCategory::Aborted)
-        return;
+    VERIFY(!error.has_value() || error->category() != DecoderErrorCategory::Aborted);
 
     VERIFY(status == PipelineStatus::EndOfStream || status == PipelineStatus::Error);
     m_current_halting_status = status;
@@ -308,9 +372,9 @@ bool DecodedAudioProducer::ThreadData::handle_auto_suspension()
     VERIFY(!m_auto_suspended);
 
     m_queue.clear();
-    m_latest_available_timestamp = m_earliest_available_timestamp;
     m_decoder.clear();
     m_decoder_needs_keyframe_next_seek = true;
+    m_decoder_needs_codec_configuration_next_seek = true;
     m_auto_suspended = true;
     m_auto_suspend_requested = false;
     m_current_halting_status = PipelineStatus::Suspended;
@@ -327,12 +391,6 @@ bool DecodedAudioProducer::ThreadData::handle_auto_suspension()
     }
     m_auto_suspended = false;
     m_current_halting_status = PipelineStatus::Pending;
-
-    auto result = create_decoder();
-    if (result.is_error()) {
-        enter_halting_state(PipelineStatus::Error, result.release_error());
-        return true;
-    }
 
     return true;
 }
@@ -352,9 +410,6 @@ void DecodedAudioProducer::ThreadData::queue_block(AudioBlock const& block)
     // FIXME: Specify trailing samples in the demuxer, and drop them here or in the audio decoder implementation.
 
     VERIFY(!block.is_empty());
-    if (m_seek_id.load() != m_last_processed_seek_id)
-        return;
-    m_latest_available_timestamp = block.media_time_end();
     m_queue.enqueue({ block });
     VERIFY(!m_queue.tail().block.is_empty());
     dispatch_wake_if_needed_while_locked();
@@ -362,21 +417,22 @@ void DecodedAudioProducer::ThreadData::queue_block(AudioBlock const& block)
 
 void DecodedAudioProducer::ThreadData::dispatch_error(DecoderError&& error)
 {
-    if (error.category() == DecoderErrorCategory::Aborted)
-        return;
     if (m_error_handler)
         m_error_handler(move(error));
 }
 
 void DecodedAudioProducer::ThreadData::flush_decoder()
 {
-    m_decoder->flush();
+    if (m_decoder != nullptr)
+        m_decoder->flush();
     m_converter->flush();
     m_last_output_frame = NumericLimits<i64>::min();
 }
 
 DecoderErrorOr<void> DecodedAudioProducer::ThreadData::retrieve_next_block(AudioBlock& block)
 {
+    VERIFY(m_decoder);
+
     while (true) {
         auto retrieve_result = m_converter->retrieve_block(block);
         if (!retrieve_result.is_error()) {
@@ -402,31 +458,26 @@ DecoderErrorOr<void> DecodedAudioProducer::ThreadData::retrieve_next_block(Audio
     }
 }
 
-void DecodedAudioProducer::ThreadData::resolve_seek(u32 seek_id, bool moved_position)
+void DecodedAudioProducer::ThreadData::resolve_seek(u32 seek_id)
 {
     m_last_processed_seek_id = seek_id;
-    if (moved_position)
-        m_current_halting_status = PipelineStatus::Pending;
 }
 
 bool DecodedAudioProducer::ThreadData::handle_seek()
 {
     VERIFY(m_decode_thread_id.is_current_thread());
-    VERIFY(m_decoder);
 
     auto seek_id = m_seek_id.load();
     if (m_last_processed_seek_id == seek_id)
         return false;
 
     AK::Duration timestamp;
-    bool moved_position = false;
+    AudioBlock last_block;
 
     auto handle_error = [&](DecoderError&& error) {
         auto locker = take_lock();
-        if (moved_position)
-            m_current_halting_status = PipelineStatus::Pending;
         enter_halting_state(PipelineStatus::Error, move(error));
-        m_last_processed_seek_id = seek_id;
+        resolve_seek(seek_id);
     };
 
     while (true) {
@@ -436,53 +487,79 @@ bool DecodedAudioProducer::ThreadData::handle_seek()
             timestamp = m_seek_timestamp;
             m_demuxer->reset_blocking_reads_aborted_for_track(m_track);
             m_queue.clear();
+            m_current_halting_status = PipelineStatus::Pending;
+            m_frame_awaiting_decoder_replacement.clear();
         }
 
         auto seek_options = DemuxerSeekOptions::None;
-        if (m_decoder_needs_keyframe_next_seek) {
+        if (m_decoder_needs_codec_configuration_next_seek)
+            seek_options |= DemuxerSeekOptions::NeedCodecConfiguration;
+        if (m_decoder_needs_keyframe_next_seek)
             seek_options |= DemuxerSeekOptions::Force;
-            m_decoder_needs_keyframe_next_seek = false;
-        }
         auto demuxer_seek_result_or_error = m_demuxer->seek_to_most_recent_keyframe(m_track, timestamp, seek_options);
         if (demuxer_seek_result_or_error.is_error() && demuxer_seek_result_or_error.error().category() != DecoderErrorCategory::EndOfStream) {
+            if (demuxer_seek_result_or_error.error().category() == DecoderErrorCategory::Aborted)
+                continue;
             handle_error(demuxer_seek_result_or_error.release_error());
             return true;
         }
+
+        m_decoder_needs_codec_configuration_next_seek = false;
+        m_decoder_needs_keyframe_next_seek = false;
+
         auto demuxer_seek_result = demuxer_seek_result_or_error.value_or(DemuxerSeekResult::MovedPosition);
 
         if (demuxer_seek_result == DemuxerSeekResult::MovedPosition) {
             flush_decoder();
-            moved_position = true;
+            last_block.clear();
         }
 
-        auto new_seek_id = seek_id;
-        AudioBlock last_block;
+        auto new_seek_id = m_seek_id.load();
 
         while (new_seek_id == seek_id) {
             auto coded_frame_result = m_demuxer->get_next_sample_for_track(m_track);
             if (coded_frame_result.is_error()) {
                 if (coded_frame_result.error().category() == DecoderErrorCategory::EndOfStream) {
+                    if (m_decoder == nullptr) {
+                        auto locker = take_lock();
+                        resolve_seek(seek_id);
+                        return true;
+                    }
                     m_decoder->signal_end_of_stream();
+                } else if (coded_frame_result.error().category() == DecoderErrorCategory::Aborted) {
+                    break;
                 } else {
                     handle_error(coded_frame_result.release_error());
                     return true;
                 }
             } else {
                 auto coded_frame = coded_frame_result.release_value();
-                auto decode_result = m_decoder->receive_coded_data(coded_frame.timestamp(), coded_frame.data());
+                auto decode_result = receive_coded_frame(coded_frame);
                 if (decode_result.is_error()) {
                     handle_error(decode_result.release_error());
                     return true;
                 }
             }
 
+            VERIFY(m_decoder);
+
             while (new_seek_id == seek_id) {
                 AudioBlock current_block;
                 auto block_result = retrieve_next_block(current_block);
                 if (block_result.is_error()) {
                     if (block_result.error().category() == DecoderErrorCategory::EndOfStream) {
+                        auto error_or_decoder_was_replaced = replace_drained_decoder();
+                        if (error_or_decoder_was_replaced.is_error()) {
+                            handle_error(error_or_decoder_was_replaced.release_error());
+                            return true;
+                        }
+                        if (error_or_decoder_was_replaced.value())
+                            continue;
+
                         auto locker = take_lock();
-                        resolve_seek(seek_id, moved_position);
+                        resolve_seek(seek_id);
+                        if (!last_block.is_empty())
+                            queue_block(last_block);
                         return true;
                     }
 
@@ -493,9 +570,16 @@ bool DecodedAudioProducer::ThreadData::handle_seek()
                     return true;
                 }
 
+                if (current_block.contains_media_time(timestamp)) {
+                    auto locker = take_lock();
+                    resolve_seek(seek_id);
+                    queue_block(current_block);
+                    return true;
+                }
+
                 if (current_block.media_time_start() > timestamp) {
                     auto locker = take_lock();
-                    resolve_seek(seek_id, moved_position);
+                    resolve_seek(seek_id);
 
                     if (!last_block.is_empty())
                         queue_block(last_block);
@@ -515,7 +599,6 @@ bool DecodedAudioProducer::ThreadData::handle_seek()
 void DecodedAudioProducer::ThreadData::push_data_and_decode_a_block()
 {
     VERIFY(m_decode_thread_id.is_current_thread());
-    VERIFY(m_decoder);
 
     auto set_halting_status_and_wait_for_seek = [this](PipelineStatus status, Optional<DecoderError> error) {
         auto locker = take_lock();
@@ -540,19 +623,27 @@ void DecodedAudioProducer::ThreadData::push_data_and_decode_a_block()
     auto sample_result = m_demuxer->get_next_sample_for_track(m_track);
     if (sample_result.is_error()) {
         if (sample_result.error().category() == DecoderErrorCategory::EndOfStream) {
+            if (m_decoder == nullptr) {
+                set_halting_status_and_wait_for_seek(PipelineStatus::EndOfStream, {});
+                return;
+            }
             m_decoder->signal_end_of_stream();
+        } else if (sample_result.error().category() == DecoderErrorCategory::Aborted) {
+            return;
         } else {
             set_halting_status_and_wait_for_seek(PipelineStatus::Error, sample_result.release_error());
             return;
         }
     } else {
-        auto sample = sample_result.release_value();
-        auto decode_result = m_decoder->receive_coded_data(sample.timestamp(), sample.data());
+        auto coded_frame = sample_result.release_value();
+        auto decode_result = receive_coded_frame(coded_frame);
         if (decode_result.is_error()) {
             set_halting_status_and_wait_for_seek(PipelineStatus::Error, decode_result.release_error());
             return;
         }
     }
+
+    VERIFY(m_decoder);
 
     while (true) {
         auto queue_size = [&] {
@@ -584,9 +675,16 @@ void DecodedAudioProducer::ThreadData::push_data_and_decode_a_block()
         if (block_result.is_error()) {
             if (block_result.error().category() == DecoderErrorCategory::NeedsMoreInput)
                 break;
-            if (block_result.error().category() == DecoderErrorCategory::EndOfStream)
+            if (block_result.error().category() == DecoderErrorCategory::EndOfStream) {
+                auto replaced_result = replace_drained_decoder();
+                if (replaced_result.is_error()) {
+                    set_halting_status_and_wait_for_seek(PipelineStatus::Error, replaced_result.release_error());
+                    break;
+                }
+                if (replaced_result.value())
+                    continue;
                 set_halting_status_and_wait_for_seek(PipelineStatus::EndOfStream, {});
-            else
+            } else
                 set_halting_status_and_wait_for_seek(PipelineStatus::Error, block_result.release_error());
             break;
         }

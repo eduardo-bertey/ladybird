@@ -6,7 +6,7 @@
 
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/SVGSwitchElement.h>
-#include <LibWeb/Layout/SVGGraphicsBox.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/SVG/SVGSwitchElement.h>
 
 namespace Web::SVG {
@@ -20,9 +20,9 @@ SVGSwitchElement::SVGSwitchElement(DOM::Document& document, DOM::QualifiedName q
 
 SVGSwitchElement::~SVGSwitchElement() = default;
 
-RefPtr<Layout::Node> SVGSwitchElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+Layout::Node* SVGSwitchElement::create_layout_node(CSS::LayoutStyle style)
 {
-    return make_ref_counted<Layout::SVGGraphicsBox>(document(), *this, style);
+    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGGraphicsBox);
 }
 
 }

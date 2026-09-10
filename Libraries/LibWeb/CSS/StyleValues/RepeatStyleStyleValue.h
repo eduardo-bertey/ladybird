@@ -15,18 +15,10 @@ namespace Web::CSS {
 
 class RepeatStyleStyleValue final : public StyleValueWithDefaultOperators<RepeatStyleStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<RepeatStyleStyleValue const> create(Repetition repeat_x, Repetition repeat_y)
-    {
-        return adopt_ref(*new (nothrow) RepeatStyleStyleValue(repeat_x, repeat_y));
-    }
-    virtual ~RepeatStyleStyleValue() override;
+    virtual ~RepeatStyleStyleValue() override = default;
 
     Repetition repeat_x() const { return static_cast<Repetition>(m_value->repeat_style.repeat_x); }
     Repetition repeat_y() const { return static_cast<Repetition>(m_value->repeat_style.repeat_y); }
-
-    void serialize(StringBuilder&, SerializationMode) const;
-
-    bool properties_equal(RepeatStyleStyleValue const& other) const { return repeat_x() == other.repeat_x() && repeat_y() == other.repeat_y(); }
 
 private:
     friend class StyleValue;
@@ -35,8 +27,6 @@ private:
         : StyleValueWithDefaultOperators(Type::RepeatStyle, data)
     {
     }
-
-    RepeatStyleStyleValue(Repetition repeat_x, Repetition repeat_y);
 };
 
 }

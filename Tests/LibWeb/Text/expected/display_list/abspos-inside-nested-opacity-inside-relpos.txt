@@ -1,17 +1,14 @@
 AccumulatedVisualContext Tree:
-  [0] transform=[1,0,0,1,0,0] origin=(0,0) (ViewportPaintable(Viewport<#document>))
-    [1] scroll (PaintableWithLines(BlockContainer<PRE>#out))
-      [2] clip=[8,8 200x200] (PaintableWithLines(BlockContainer(anonymous)))
-        [4] effects=[opacity=0.5]
-          [7] effects=[opacity=0.3] (PaintableWithLines(BlockContainer<DIV>.abspos))
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+      [s1] scroll (Viewport<#document>)
+  clips:
+    [c0 in s1] clip=[8,8 200x200] (BlockContainer<DIV>.relpos)
+  effects:
+    [e0 in s0] effects=[]
+      [e1 in s1 out=c0] effects=[opacity=0.5] (BlockContainer<DIV>.outer-opacity)
+        [e2 in s1 out=c0] effects=[opacity=0.3] (BlockContainer<DIV>.inner-opacity)
 
 DisplayList:
-SaveLayer@0
-  CompositorWheelHitTestTarget@0 target_scroll_node_index=0 rect=[0,0 800x600]
-  CompositorWheelHitTestTarget@1 target_scroll_node_index=0 rect=[0,0 800x221]
-  CompositorWheelHitTestTarget@1 target_scroll_node_index=0 rect=[8,8 784x200]
-  CompositorWheelHitTestTarget@1 target_scroll_node_index=0 rect=[8,8 200x200]
-  CompositorWheelHitTestTarget@7 target_scroll_node_index=0 rect=[8,8 100x100]
-  FillRect@7 rect=[8,8 100x100] color=rgb(0, 0, 0)
-Restore@0
+FillRect@s1/c0/e2 rect=[8,8 100x100] color=rgb(0, 0, 0)
 

@@ -5,66 +5,117 @@
  */
 
 #include <LibWeb/CSS/Invalidation/LanguageInvalidator.h>
+#include <LibWeb/CSS/PseudoClass.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleScope.h>
-#include <LibWeb/DOM/CharacterData.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/DOM/PseudoElement.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/HTML/HTMLSlotElement.h>
+#include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/TraversalDecision.h>
 
 namespace Web::CSS::Invalidation {
 
-static void invalidate_descendants_affected_by_language_or_directionality(DOM::Element& element, bool is_directionality_change)
+static void enroll_language_dependent_text(Layout::Node& root)
 {
-    // dir and lang both inherit, so all descendants' :dir() / :lang() matches and direction-dependent layout/text
-    // need to be recomputed.
-    element.for_each_shadow_including_inclusive_descendant([is_directionality_change](auto& node) {
-        if (auto* element = as_if<DOM::Element>(node)) {
-            if (!is_directionality_change)
-                element->invalidate_lang_value();
-            element->set_needs_style_update(true);
-        }
-        return TraversalDecision::Continue;
-    });
+    if (Layout::RustFFI::layout_arena_enroll_text_after_language_change(root.arena_handle(), Layout::Node::slot_id(&root)))
+        root.set_needs_layout_update(DOM::SetNeedsLayoutReason::LanguageChangeUnderCasingTextTransform);
+}
 
-    // :has(:dir(...)) and :has(:lang(...)) on ancestors aren't keyed on any property the regular invalidation
-    // plan tracks, so explicitly schedule the :has() ancestor walk here.
-    element.for_each_style_scope_which_may_observe_the_node([&](CSS::StyleScope& scope) {
-        auto pseudo_class = is_directionality_change ? CSS::PseudoClass::Dir : CSS::PseudoClass::Lang;
-        Vector<CSS::InvalidationSet::Property> properties {
-            { CSS::InvalidationSet::Property::Type::PseudoClass, pseudo_class },
-        };
-        scope.record_pending_has_invalidation_mutation_features(element, properties);
-        scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(element);
+// `lang` and `dir` both inherit, so a change on one element changes what every element under it
+// resolves to. Each of them publishes the value it now has, and the rules that name a language or a
+// direction reach their subjects from that rather than from the walk.
+static void publish_language_and_directionality(DOM::Element& element, bool is_directionality_change)
+{
+    element.for_each_shadow_including_inclusive_descendant([is_directionality_change](auto& node) {
+        if (auto* descendant = as_if<DOM::Element>(node)) {
+            if (is_directionality_change) {
+                record_element_directionality(*descendant);
+            } else {
+                descendant->invalidate_lang_value();
+                record_element_language_and_directionality(*descendant);
+                descendant->for_each_synthetic_pseudo_element([](CSS::PseudoElement, DOM::SyntheticPseudoElement const& pseudo) {
+                    if (auto* layout_node = pseudo.unsafe_layout_node())
+                        enroll_language_dependent_text(*layout_node);
+                });
+            }
+            return TraversalDecision::Continue;
+        }
+        if (is_directionality_change)
+            return TraversalDecision::Continue;
+        // Language is a DOM input outside the computed style groups. Rust checks
+        // the styles of every slice and refreshes their text without rebuilding
+        // the source ranges, which depend on the untransformed text.
+        auto* text_layout_node = as_if<Layout::TextNode>(node.unsafe_layout_node());
+        if (text_layout_node)
+            enroll_language_dependent_text(*text_layout_node);
+        return TraversalDecision::Continue;
     });
 }
 
 void invalidate_style_after_language_change(DOM::Element& element)
 {
-    invalidate_descendants_affected_by_language_or_directionality(element, false);
+    publish_language_and_directionality(element, false);
+}
+
+static void publish_directionality_dependent_ancestors(DOM::Element& element, HashTable<DOM::Element*>& visited)
+{
+    for (auto ancestor = GC::Ptr<DOM::Element> { element }; ancestor; ancestor = ancestor->parent_element()) {
+        if (visited.set(ancestor.ptr()) != AK::HashSetResult::InsertedNewEntry)
+            continue;
+        if (ancestor->has_auto_directionality())
+            publish_language_and_directionality(*ancestor, true);
+
+        if (auto assigned_slot = ancestor->assigned_slot_internal())
+            publish_directionality_dependent_ancestors(*assigned_slot, visited);
+    }
 }
 
 void invalidate_style_after_directionality_change(DOM::Element& element)
 {
-    invalidate_descendants_affected_by_language_or_directionality(element, true);
+    publish_language_and_directionality(element, true);
+    HashTable<DOM::Element*> visited;
+    visited.set(&element);
+    if (auto parent = element.parent_element())
+        publish_directionality_dependent_ancestors(*parent, visited);
+    if (auto assigned_slot = element.assigned_slot_internal())
+        publish_directionality_dependent_ancestors(*assigned_slot, visited);
 }
 
-void invalidate_style_after_text_directionality_change(DOM::CharacterData& character_data)
+void invalidate_style_after_slot_assignment_change(HTML::HTMLSlotElement& slot)
 {
-    // dir=auto resolves an element's effective directionality from its text content, so any ancestor with dir=auto
-    // can flip its :dir() match when this text changes. Recompute style on each such ancestor's subtree and propagate
-    // :has(:dir(...)) invalidation up its ancestor chain.
-    for (auto ancestor = character_data.parent_element(); ancestor; ancestor = ancestor->parent_element()) {
-        if (ancestor->dir() != DOM::Element::Dir::Auto)
-            continue;
-        Vector<CSS::InvalidationSet::Property> properties {
-            { CSS::InvalidationSet::Property::Type::PseudoClass, CSS::PseudoClass::Dir },
-            { CSS::InvalidationSet::Property::Type::PseudoClass, CSS::PseudoClass::Empty },
-        };
-        ancestor->for_each_style_scope_which_may_observe_the_node([&](CSS::StyleScope& scope) {
-            scope.record_pending_has_invalidation_mutation_features(*ancestor, properties);
-        });
-        invalidate_descendants_affected_by_language_or_directionality(*ancestor, true);
+    HashTable<DOM::Element*> visited;
+    publish_directionality_dependent_ancestors(slot, visited);
+}
+
+// dir=auto resolves an element's effective directionality from the text under it, so text arriving,
+// leaving, or changing its data can flip it. Every ancestor holding dir=auto republishes what it now
+// resolves to, for its whole subtree, because a directionality inherits.
+void invalidate_style_after_text_change_under(DOM::Element& parent_of_text)
+{
+    if (!parent_of_text.document().has_element_with_auto_directionality())
+        return;
+
+    bool ancestor_chain_has_assigned_slot = false;
+    for (auto ancestor = GC::Ptr<DOM::Element> { parent_of_text }; ancestor; ancestor = ancestor->parent_element()) {
+        if (ancestor->assigned_slot_internal()) {
+            ancestor_chain_has_assigned_slot = true;
+            break;
+        }
     }
+
+    if (!ancestor_chain_has_assigned_slot) {
+        for (auto ancestor = GC::Ptr<DOM::Element> { parent_of_text }; ancestor; ancestor = ancestor->parent_element()) {
+            if (ancestor->has_auto_directionality())
+                publish_language_and_directionality(*ancestor, true);
+        }
+        return;
+    }
+
+    HashTable<DOM::Element*> visited;
+    publish_directionality_dependent_ancestors(parent_of_text, visited);
 }
 
 }

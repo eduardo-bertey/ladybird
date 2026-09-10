@@ -75,6 +75,11 @@ enum class DisableSandbox {
     Yes,
 };
 
+enum class ProfileTool {
+    Callgrind,
+    CPU,
+};
+
 struct BrowserOptions {
     Vector<URL::URL> urls;
     Vector<ByteString> raw_urls;
@@ -89,7 +94,9 @@ struct BrowserOptions {
     DisableSQLDatabase disable_sql_database { DisableSQLDatabase::No };
     Vector<ProcessType> debug_helper_processes {};
     Optional<ProcessType> profile_helper_process {};
-    Optional<ByteString> webdriver_endpoint {};
+    ProfileTool profile_tool { ProfileTool::Callgrind };
+    Optional<ByteString> profile_output {};
+    Optional<ByteString> webdriver_browser_endpoint {};
     Optional<DNSSettings> dns_settings {};
     Optional<u16> devtools_port;
     EnableContentBlocker enable_content_blocker { EnableContentBlocker::Yes };
@@ -116,11 +123,6 @@ enum class IsTestMode {
 };
 
 enum class LogAllJSExceptions {
-    No,
-    Yes,
-};
-
-enum class EnableIDLTracing {
     No,
     Yes,
 };
@@ -177,7 +179,6 @@ struct WebContentOptions {
     IsTestMode is_test_mode { IsTestMode::No };
     LogAllJSExceptions log_all_js_exceptions { LogAllJSExceptions::No };
     SiteIsolationMode site_isolation_mode { SiteIsolationMode::TopLevel };
-    EnableIDLTracing enable_idl_tracing { EnableIDLTracing::No };
     EnableMemoryHTTPCache enable_http_memory_cache { EnableMemoryHTTPCache::No };
     ExposeExperimentalInterfaces expose_experimental_interfaces { ExposeExperimentalInterfaces::No };
     ExposeInternalsObject expose_internals_object { ExposeInternalsObject::No };
@@ -190,7 +191,6 @@ struct WebContentOptions {
     EnableAsyncScrolling enable_async_scrolling { EnableAsyncScrolling::Yes };
     FileSchemeUrlsHaveTupleOrigins file_scheme_urls_have_tuple_origins { FileSchemeUrlsHaveTupleOrigins::No };
     Optional<StringView> default_time_zone {};
-    Optional<u64> style_invalidation_counter_dump_interval {};
 };
 
 }

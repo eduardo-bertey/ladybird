@@ -21,6 +21,12 @@ class PannerNode final : public AudioNode {
     GC_DECLARE_ALLOCATOR(PannerNode);
 
 public:
+    static constexpr size_t position_x_offset() { return offsetof(PannerNode, m_position_x); }
+    static constexpr size_t position_y_offset() { return offsetof(PannerNode, m_position_y); }
+    static constexpr size_t position_z_offset() { return offsetof(PannerNode, m_position_z); }
+    static constexpr size_t orientation_x_offset() { return offsetof(PannerNode, m_orientation_x); }
+    static constexpr size_t orientation_y_offset() { return offsetof(PannerNode, m_orientation_y); }
+    static constexpr size_t orientation_z_offset() { return offsetof(PannerNode, m_orientation_z); }
     virtual ~PannerNode() override;
 
     static WebIDL::ExceptionOr<GC::Ref<PannerNode>> create(GC::Ref<BaseAudioContext>, PannerOptions const& = {});
@@ -38,10 +44,10 @@ public:
     GC::Ref<AudioParam const> orientation_z() const { return m_orientation_z; }
 
     PanningModelType panning_model() const { return m_panning_model; }
-    void set_panning_model(PanningModelType value) { m_panning_model = value; }
+    void set_panning_model(PanningModelType);
 
     DistanceModelType distance_model() const { return m_distance_model; }
-    void set_distance_model(DistanceModelType value) { m_distance_model = value; }
+    void set_distance_model(DistanceModelType);
 
     double ref_distance() const { return m_ref_distance; }
     WebIDL::ExceptionOr<void> set_ref_distance(double);

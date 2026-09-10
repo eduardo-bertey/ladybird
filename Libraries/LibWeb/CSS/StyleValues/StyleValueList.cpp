@@ -11,7 +11,6 @@
 #include <LibGC/RootVector.h>
 #include <LibWeb/CSS/CSSTransformComponent.h>
 #include <LibWeb/CSS/CSSTransformValue.h>
-#include <LibWeb/CSS/Parser/ComponentValue.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
 
@@ -36,68 +35,10 @@ ValueComparingNonnullRefPtr<StyleValue const> StyleValueList::absolutized(Comput
     return *this;
 }
 
-void StyleValueList::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    auto values = this->values();
-    if (values.is_empty())
-        return;
-
-    auto separator_string = ""sv;
-    switch (separator()) {
-    case Separator::Space:
-        separator_string = " "sv;
-        break;
-    case Separator::Comma:
-        separator_string = ", "sv;
-        break;
-    default:
-        VERIFY_NOT_REACHED();
-    }
-
-    auto first_value = values.first();
-    if (all_of(values, [&](auto const& property) { return property == first_value; }) && separator() != Separator::Comma && collapsible() == Collapsible::Yes && !first_value->is_empty_optional()) {
-        first_value->serialize(builder, mode);
-        return;
-    }
-
-    bool first = true;
-
-    for (size_t i = 0; i < values.size(); ++i) {
-        if (values[i]->is_empty_optional())
-            continue;
-
-        if (!first)
-            builder.append(separator_string);
-
-        first = false;
-        values[i]->serialize(builder, mode);
-    }
-}
-
-void StyleValueList::set_style_sheet(GC::Ptr<CSSStyleSheet> style_sheet)
+void StyleValueList::set_style_sheet(StyleSheetState* style_sheet)
 {
     for (auto& value : values())
         const_cast<StyleValue&>(*value).set_style_sheet(style_sheet);
-}
-
-Vector<Parser::ComponentValue> StyleValueList::tokenize() const
-{
-    Vector<Parser::ComponentValue> component_values;
-    bool first = true;
-    for (auto const& value : values()) {
-        if (value->is_empty_optional())
-            continue;
-        if (first) {
-            first = false;
-        } else {
-            if (separator() == Separator::Comma)
-                component_values.empend(Parser::Token::create(Parser::Token::Type::Comma));
-            component_values.empend(Parser::Token::create_whitespace(" "_string));
-        }
-        component_values.extend(value->tokenize());
-    }
-
-    return component_values;
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#reify-a-transform-list

@@ -20,9 +20,12 @@ AudioDestinationNode
 AudioListener
 AudioNode
 AudioParam
+AudioParamMap
 AudioScheduledSourceNode
 AudioTrack
 AudioTrackList
+AudioWorklet
+AudioWorkletNode
 BarProp
 BaseAudioContext
 BeforeUnloadEvent
@@ -312,6 +315,8 @@ MediaQueryListEvent
 MediaSource
 MediaSourceHandle
 MediaStream
+MediaStreamAudioDestinationNode
+MediaStreamAudioSourceNode
 MediaStreamTrack
 MediaStreamTrackEvent
 MessageChannel
@@ -355,6 +360,7 @@ PerformanceEventTiming
 PerformanceMark
 PerformanceMeasure
 PerformanceNavigation
+PerformanceNavigationTiming
 PerformanceObserver
 PerformanceObserverEntryList
 PerformanceResourceTiming
@@ -574,6 +580,7 @@ WebSocket
 WheelEvent
 Window
 Worker
+Worklet
 WritableStream
 WritableStreamDefaultController
 WritableStreamDefaultWriter
@@ -600,6 +607,7 @@ printElement
 println
 promiseTest
 removeTestErrorHandler
+scrollendEvent
 spoofCurrentURL
 test
 timeout

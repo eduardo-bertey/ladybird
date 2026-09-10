@@ -6,12 +6,14 @@
 
 #pragma once
 
+#include <AK/RefPtr.h>
 #include <AK/Utf16String.h>
 #include <AK/WeakPtr.h>
 #include <LibCore/File.h>
 #include <LibCore/Process.h>
 #include <LibIPC/Connection.h>
 #include <LibIPC/Transport.h>
+#include <LibWebView/CrashReport.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/ProcessType.h>
 
@@ -42,12 +44,15 @@ public:
     void set_title(Optional<Utf16String> title) { m_title = move(title); }
 
     template<typename ConnectionFromClient>
-    Optional<ConnectionFromClient&> client()
+    RefPtr<ConnectionFromClient> client()
     {
         if (auto strong_connection = m_connection.strong_ref())
             return as<ConnectionFromClient>(*strong_connection);
         return {};
     }
+
+    void set_crash_report(NonnullOwnPtr<CrashReport> report) { m_crash_report = move(report); }
+    void save_crash_report(Optional<int> exit_status);
 
     pid_t pid() const { return m_process.pid(); }
 
@@ -70,6 +75,7 @@ private:
     };
     static ErrorOr<ProcessAndIPCTransport> spawn_and_connect_to_process(Core::ProcessSpawnOptions const& options, bool capture_output);
 
+    OwnPtr<CrashReport> m_crash_report;
     Core::Process m_process;
     ProcessType m_type;
     Optional<Utf16String> m_title;

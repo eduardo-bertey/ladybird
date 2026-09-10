@@ -33,8 +33,11 @@ public:
     virtual Optional<CSSPixels> intrinsic_width() const override;
     virtual Optional<CSSPixels> intrinsic_height() const override;
     virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override;
+    u64 vector_content_identity() const { return m_vector_content_identity; }
 
     virtual Optional<Painting::DisplayListResource> record_display_list(Gfx::IntSize, CSS::PreferredColorScheme, Painting::DisplayListResourceStorage&) const override;
+    // Lays the inner document out at the CSS size and records at css × raster_scale resolution.
+    Optional<Painting::DisplayListResource> record_display_list_at_scale(CSSPixelSize css_size, float raster_scale, CSS::PreferredColorScheme, Painting::DisplayListResourceStorage&) const;
 
     // FIXME: Support SVG animations. :^)
     DOM::Document const& svg_document() const { return *m_document; }
@@ -43,7 +46,8 @@ public:
     virtual void finalize() override;
     virtual size_t external_memory_size() const override;
 
-    virtual void paint(DisplayListRecordingContext&, Gfx::IntRect dst_rect, CSS::ImageRendering, CSS::PreferredColorScheme) const override;
+    virtual Optional<Painting::ImagePaint> image_paint(Painting::ImagePaintRequest const&) const override;
+    bool has_active_view_box() const;
 
     // The scheme the SVG document currently answers `prefers-color-scheme` with. Held on the image
     // rather than on the page, because the page is shared with every other image.
@@ -58,6 +62,7 @@ private:
     void append_paint_command_cache_source_resources(Painting::DisplayListResourceSet&) const;
     void did_request_frame();
     void invalidate_cached_rendering();
+    static u64 next_vector_content_identity();
 
     // FIXME: Remove this once everything is using surfaces instead.
     mutable HashMap<Gfx::IntSize, Gfx::DecodedImageFrame> m_cached_rendered_frames;
@@ -75,14 +80,16 @@ private:
     // element referencing it, so one image can render two ways on one page and the recording is
     // keyed by both.
     struct RenderKey {
-        Gfx::IntSize size;
+        CSSPixelSize css_size;
+        float raster_scale { 1 };
         CSS::PreferredColorScheme color_scheme;
         bool operator==(RenderKey const&) const = default;
     };
     struct RenderKeyTraits : public Traits<RenderKey> {
         static unsigned hash(RenderKey const& key)
         {
-            return pair_int_hash(Traits<Gfx::IntSize>::hash(key.size), to_underlying(key.color_scheme));
+            auto size_hash = pair_int_hash(key.css_size.width().raw_value(), key.css_size.height().raw_value());
+            return pair_int_hash(pair_int_hash(size_hash, bit_cast<u32>(key.raster_scale)), to_underlying(key.color_scheme));
         }
         static bool equals(RenderKey const& a, RenderKey const& b) { return a == b; }
     };
@@ -93,6 +100,7 @@ private:
 
     GC::Ref<DOM::Document> m_document;
     GC::Ref<SVG::SVGSVGElement> m_root_element;
+    u64 m_vector_content_identity { 0 };
 
     mutable bool m_is_recording_display_list { false };
     bool m_has_pending_client_notification { false };
@@ -123,7 +131,8 @@ public:
     virtual DevicePixelRect screen_rect() const override { return {}; }
     virtual double zoom_level() const override { return 1.0; }
     virtual double device_pixel_ratio() const override { return 1.0; }
-    virtual double device_pixels_per_css_pixel() const override { return 1.0; }
+    virtual double device_pixels_per_css_pixel() const override { return m_device_pixels_per_css_pixel; }
+    void set_device_pixels_per_css_pixel(double value) { m_device_pixels_per_css_pixel = value; }
     virtual CSS::PreferredColorScheme preferred_color_scheme() const override { return m_host_page->client().preferred_color_scheme(); }
     virtual CSS::PreferredContrast preferred_contrast() const override { return m_host_page->client().preferred_contrast(); }
     virtual CSS::PreferredMotion preferred_motion() const override { return m_host_page->client().preferred_motion(); }
@@ -161,6 +170,7 @@ private:
     virtual void visit_edges(Visitor&) override;
     void prune_cached_display_list_resources_now() const;
 
+    double m_device_pixels_per_css_pixel { 1.0 };
     GC::WeakHashSet<SVGDecodedImageData> m_svg_image_data;
     GC::Weak<SVGDecodedImageData> m_current_svg_image_data;
     size_t m_frame_request_suppression_count { 0 };

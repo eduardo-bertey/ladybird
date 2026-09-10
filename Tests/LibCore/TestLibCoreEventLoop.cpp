@@ -9,8 +9,15 @@
 #include <AK/Vector.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Timer.h>
+#include <LibSync/ConditionVariable.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
+
+#if !defined(AK_OS_WINDOWS)
+#    include <LibCore/System.h>
+#    include <pthread.h>
+#    include <signal.h>
+#endif
 
 TEST_CASE(test_poll_for_events)
 {
@@ -44,6 +51,50 @@ TEST_CASE(wake_after_thread_exit)
     }
 
     worker_loop.clear();
+}
+
+TEST_CASE(quit_event_loop_from_another_thread)
+{
+    Core::EventLoop main_loop;
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Sync::Mutex mutex;
+    IGNORE_USE_IN_ESCAPING_LAMBDA Sync::ConditionVariable condition { mutex };
+    IGNORE_USE_IN_ESCAPING_LAMBDA RefPtr<Core::WeakEventLoopReference> weak_ref;
+    IGNORE_USE_IN_ESCAPING_LAMBDA bool exec_started { false };
+
+    auto thread = Threading::Thread::construct("Worker"sv, [&] {
+        Core::EventLoop event_loop;
+        {
+            Sync::MutexLocker locker { mutex };
+            weak_ref = Core::EventLoop::current_weak();
+        }
+        event_loop.deferred_invoke([&] {
+            Sync::MutexLocker locker { mutex };
+            exec_started = true;
+            condition.broadcast();
+        });
+        return event_loop.exec();
+    });
+    thread->start();
+
+    RefPtr<Core::WeakEventLoopReference> event_loop;
+    {
+        Sync::MutexLocker locker { mutex };
+        condition.wait_while([&] { return !exec_started; });
+        event_loop = weak_ref;
+    }
+
+    {
+        auto strong_event_loop = event_loop->take();
+        VERIFY(strong_event_loop);
+        EXPECT(!strong_event_loop->was_exit_requested());
+        strong_event_loop->quit(42);
+        EXPECT(strong_event_loop->was_exit_requested());
+        strong_event_loop->wake();
+    }
+
+    auto exit_code = MUST(thread->join<void*>());
+    EXPECT_EQ(reinterpret_cast<intptr_t>(exit_code), 42);
 }
 
 TEST_CASE(single_shot_timer_fires_once)
@@ -125,3 +176,89 @@ TEST_CASE(stopped_timer_does_not_fire)
     loop.exec();
     EXPECT_EQ(stopped_count, 0);
 }
+
+// A timer fires no earlier than its interval, on the monotonic clock the rest of the process reads. The loop is kept
+// busy for a moment after each start: a clock that moves once per scheduler tick counts up to a tick more across that
+// moment than really passed, so a loop timing its wait by that clock wakes early by the difference and fires the timer
+// before the interval is up on the precise clock. The rounds drift through the tick, so a fair share of them hit that.
+TEST_CASE(timer_does_not_fire_before_its_interval)
+{
+    Core::EventLoop loop;
+    static constexpr int interval_ms = 10;
+    static constexpr int rounds = 50;
+    int round = 0;
+    auto started_at = MonotonicTime::now();
+    RefPtr<Core::Timer> timer;
+    auto start_timer = [&] {
+        started_at = MonotonicTime::now();
+        timer->start();
+        auto busy_until = started_at + AK::Duration::from_microseconds(2500);
+        while (MonotonicTime::now() < busy_until)
+            ;
+    };
+    timer = Core::Timer::create_single_shot(interval_ms, [&] {
+        auto elapsed = MonotonicTime::now() - started_at;
+        auto interval = AK::Duration::from_milliseconds(interval_ms);
+        if (elapsed < interval)
+            warnln("Round {}: the timer fired {} us early", round, (interval - elapsed).to_microseconds());
+        EXPECT(elapsed >= interval);
+        if (++round == rounds)
+            loop.quit(0);
+        else
+            start_timer();
+    });
+    start_timer();
+    loop.exec();
+    EXPECT_EQ(round, rounds);
+}
+
+#if !defined(AK_OS_WINDOWS)
+// Signals delivered to threads without event-loop state must wake the registering event loop.
+TEST_CASE(signal_delivered_on_thread_without_event_loop)
+{
+    Core::EventLoop event_loop;
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA bool handled = false;
+    auto handler_id = Core::EventLoop::register_signal(SIGUSR1, [&](int) { handled = true; });
+
+    auto thread = Threading::Thread::construct("SignalRaiser"sv, []() -> intptr_t {
+        VERIFY(pthread_kill(pthread_self(), SIGUSR1) == 0);
+        return 0;
+    });
+    thread->start();
+    (void)thread->join();
+
+    for (int i = 0; i < 400 && !handled; ++i) {
+        (void)event_loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        MUST(Core::System::sleep_ms(5));
+    }
+
+    EXPECT(handled);
+    Core::EventLoop::unregister_signal(handler_id);
+}
+
+TEST_CASE(repeated_signal_deliveries_are_preserved)
+{
+    Core::EventLoop event_loop;
+
+    static constexpr int signal_count = 4;
+    IGNORE_USE_IN_ESCAPING_LAMBDA int handled_count = 0;
+    auto handler_id = Core::EventLoop::register_signal(SIGUSR2, [&](int) { ++handled_count; });
+
+    auto thread = Threading::Thread::construct("SignalRaiser"sv, []() -> intptr_t {
+        for (int i = 0; i < signal_count; ++i)
+            VERIFY(pthread_kill(pthread_self(), SIGUSR2) == 0);
+        return 0;
+    });
+    thread->start();
+    MUST(thread->join());
+
+    for (int i = 0; i < 400 && handled_count < signal_count; ++i) {
+        (void)event_loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        MUST(Core::System::sleep_ms(5));
+    }
+
+    EXPECT_EQ(handled_count, signal_count);
+    Core::EventLoop::unregister_signal(handler_id);
+}
+#endif

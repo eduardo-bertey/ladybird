@@ -1,14 +1,33 @@
 [Exposed=Nobody]
 interface Internals {
 
-    undefined signalTestIsDone(Utf16DOMString text);
+    // These members deliberately remain unimplemented to test [FIXME] binding generation.
+    [FIXME] undefined unimplementedOperationForTesting();
+    [FIXME] readonly attribute boolean unimplementedAttributeForTesting;
+
+    undefined signalTestIsDone(DOMString text);
     undefined setTestTimeout(double milliseconds);
     undefined forceIncompatibleVisualContextTreeRebuild();
+    undefined setForceDarkEnabled(boolean enabled);
+    undefined setShowLineBoxBorders(boolean enabled);
+    undefined setForceDarkThresholds(long foreground, long background);
     unsigned long long visualContextTreeNodeCount();
+    unsigned long long visualContextPendingDirtyBoxCount();
+    unsigned long long accumulatedVisualContextIncrementalUpdateCount();
+    unsigned long long visualContextTreeNodeCapacity();
+    unsigned long long visualContextTreeDeadNodeCount();
+    unsigned long long visualContextTreeStructuralEpoch();
+    object visualContextNodeIndices(Element element);
     undefined sendMismatchedVisualContextTreeUpdateToCompositor();
+    unsigned long long layoutTreePreOrderLabelViolationCount();
+    unsigned long long layoutTreePreOrderRelabelCount();
     undefined loadReferenceTestMetadata();
 
-    Utf16DOMString setTimeZone(Utf16DOMString timeZone);
+    readonly attribute boolean hasCompletedInitialPaint;
+    readonly attribute boolean initialPaintHadPendingFonts;
+    // Freezes the font display clock at the given elapsed time, without starting a font load.
+    undefined setFontDisplayTime(FontFace fontFace, unsigned long milliseconds);
+    DOMString setTimeZone(DOMString timeZone);
 
     undefined gc();
     [CreatesPromise] Promise<undefined> gcAsync();
@@ -17,8 +36,13 @@ interface Internals {
     undefined markAsGarbage(DOMString variableName);
     boolean wrapperIsPreserved(object object);
     boolean hasActivityRoot(object object);
+    unsigned long long messagePortPendingOutgoingMessageCount(MessagePort port);
+    unsigned long long htmlCollectionCacheGeneration(HTMLCollection collection);
+    undefined failNextMessagePortTransfer(MessagePort port);
+    boolean messagePortsAreDirectlyEntangled(MessagePort first, MessagePort second);
     XMLHttpRequest createXMLHttpRequestForDocument(Document document);
     [ImplementedAs=hit_test_result] object hitTest(double x, double y);
+    object? takeContextMenuRequest();
 
     const unsigned short MOD_NONE = 0;
     const unsigned short MOD_ALT = 1;
@@ -27,13 +51,16 @@ interface Internals {
     const unsigned short MOD_SUPER = 8;
     const unsigned short MOD_KEYPAD = 16;
 
+    const unsigned short MOD_PLATFORM_CTRL = 10; // MOD_CTRL | MOD_SUPER
+
     const unsigned short BUTTON_LEFT = 0;
     const unsigned short BUTTON_MIDDLE = 1;
     const unsigned short BUTTON_RIGHT = 2;
 
-    undefined sendText(HTMLElement target, Utf16DOMString text, optional unsigned short modifiers = 0);
-    undefined sendKey(HTMLElement target, Utf16DOMString keyName, optional unsigned short modifiers = 0);
-    undefined paste(HTMLElement target, Utf16DOMString text);
+    undefined sendText(HTMLElement target, DOMString text, optional unsigned short modifiers = 0);
+    undefined sendKey(HTMLElement target, DOMString keyName, optional unsigned short modifiers = 0, optional unsigned long repeatCount = 1);
+    undefined paste(HTMLElement target, DOMString text);
+    undefined pasteFromClipboard();
     undefined commitText();
 
     // Low-level mouse primitives
@@ -45,22 +72,24 @@ interface Internals {
     // High-level mouse conveniences
     undefined click(double x, double y, optional unsigned short clickCount = 1, optional unsigned short button = 0, optional unsigned short modifiers = 0);
     undefined clickAndHold(double x, double y, optional unsigned short clickCount = 1, optional unsigned short button = 0, optional unsigned short modifiers = 0);
-    [CreatesPromise] Promise<undefined> wheel(double x, double y, double deltaX, double deltaY);
+    [CreatesPromise] Promise<undefined> wheel(double x, double y, double deltaX, double deltaY, optional boolean precise = false, optional ScrollGesturePhase scrollGesturePhase = "none");
     undefined pinch(double x, double y, double scaleDelta, optional unsigned short modifiers = 0);
     undefined resetZoom();
 
-    Utf16DOMString currentCursor();
+    DOMString currentCursor();
 
     // Returns the text that would be placed on the clipboard if the user copied the current selection now.
     // Excludes nodes whose used value of user-select is 'none' — mirroring what browsers actually copy.
-    Utf16DOMString selectedTextForClipboard();
+    DOMString selectedTextForClipboard();
+
+    undefined setClipboardFile(DOMString name, DOMString mimeType, DOMString data);
 
     // Drive marked/preedit-text composition via the same path platform input methods use. setMarkedTextFromInputMethod
     // updates the inline preedit — replacing any previous preedit. commitText finalizes the composition with the given
     // text. unmarkText finalizes the composition — leaving the current preedit in place. Each fires an InputEvent with
     // inputType = "insertText" on the focused editable. All are no-ops if nothing editable is focused.
-    undefined setMarkedTextFromInputMethod(Utf16DOMString text);
-    undefined commitTextFromInputMethod(Utf16DOMString text, optional long replacementStart = 0, optional long replacementLength = 0);
+    undefined setMarkedTextFromInputMethod(DOMString text);
+    undefined commitTextFromInputMethod(DOMString text, optional long replacementStart = 0, optional long replacementLength = 0);
     undefined unmarkTextFromInputMethod();
 
     // Returns the bounds of the current text caret in viewport-relative CSS pixels — or null if no editable element is
@@ -68,38 +97,50 @@ interface Internals {
     DOMRect? currentCaretRect();
 
     boolean dispatchUserActivatedEvent(EventTarget target, Event event);
-    undefined spoofCurrentURL(Utf16USVString url);
+    undefined spoofCurrentURL(USVString url);
 
     // Loads a URL in the top-level traversable — deferred so it starts outside the calling task and can land between
     // session-history traversal-queue steps, as can one requested by ConnectionFromClient::load_url in the UI process.
-    undefined loadURL(Utf16USVString url);
+    undefined loadURL(USVString url);
 
     InternalAnimationTimeline createInternalAnimationTimeline();
 
-    undefined simulateDragStart(double x, double y, Utf16DOMString mimeType, Utf16DOMString contents);
+    undefined simulateDragStart(double x, double y, DOMString mimeType, DOMString contents);
     undefined simulateDragMove(double x, double y);
     undefined simulateDrop(double x, double y);
 
     undefined expireCookiesWithTimeOffset(long long seconds);
     Promise<undefined> deleteAllCookies();
+    boolean hasCookieForURL(DOMString url, ByteString name, ByteString value);
 
     boolean setHttpMemoryCacheEnabled(boolean enabled);
     undefined simulateRequestServerConnectionLoss();
-    undefined setContentBlockers(Utf16DOMString patterns);
+    undefined simulateWorkerRequestServerConnectionLoss();
+    undefined setContentBlockers(DOMString patterns);
+    undefined setSiteCompatibilityData(DOMString source);
+    undefined setExperimentalInterfacesExposed(boolean exposed);
     undefined setContentBlockingEnabled(boolean enabled);
     unsigned long long partialLayoutCount();
     unsigned long long fullLayoutCount();
+    unsigned long long layoutRunCacheHitCount();
+    unsigned long long tableCellMeasurementCacheMissCount();
+    unsigned long long intrinsicMeasurementCount();
     unsigned long long accumulatedVisualContextTreeBuildCount();
-    undefined setAutoplayPolicy(Utf16DOMString policy);
+    undefined beginDisplayListTrace();
+    DOMString takeDisplayListTrace();
+    [ImplementedAs=recorded_async_scrolling_state_object] object recordedAsyncScrollingState();
+    boolean recordedDisplayListBlocksWheelEventAt(double x, double y);
+    undefined recordDisplayListForTesting(optional boolean paintOverlay = false, optional boolean cold = false);
+    undefined setAutoplayPolicy(DOMString policy);
 
-    Utf16DOMString getComputedRole(Element element);
-    Utf16DOMString getComputedLabel(Element element);
-    Utf16DOMString getComputedAriaLevel(Element element);
+    DOMString getComputedRole(Element element);
+    DOMString getComputedLabel(Element element);
+    DOMString getComputedAriaLevel(Element element);
     unsigned short getEchoServerPort();
 
-    undefined setHSTSPolicy(Utf16DOMString domain, unsigned long long maxAge, boolean includeSubDomains);
-    undefined ingestHSTSHeader(Utf16USVString url, Utf16DOMString headerValue);
-    boolean isKnownHSTSHost(Utf16DOMString domain);
+    undefined setHSTSPolicy(DOMString domain, unsigned long long maxAge, boolean includeSubDomains);
+    undefined ingestHSTSHeader(USVString url, DOMString headerValue);
+    boolean isKnownHSTSHost(DOMString domain);
 
     undefined setBrowserZoom(double factor);
     undefined setDevicePixelRatio(double ratio);
@@ -110,20 +151,26 @@ interface Internals {
     readonly attribute boolean needsRepaint;
     readonly attribute boolean needsDisplayListRecord;
 
-    Utf16DOMString dumpDisplayList();
-    Utf16DOMString dumpAccessibilityTree();
-    Utf16DOMString dumpLayoutTree(Node node);
-    Utf16DOMString dumpPaintableTree(Node node);
-    Utf16DOMString dumpStackingContextTree();
-    Utf16DOMString dumpGCGraph();
-    Utf16DOMString dumpSessionHistory();
-    Utf16DOMString dumpUIProcessSessionHistory();
-    Utf16DOMString dumpSiteIsolationProcessTree();
+    DOMString dumpDisplayList();
+    DOMString dumpAccessibilityTree();
+    DOMString dumpLayoutTree(Node node);
+    DOMString dumpStackingContextTree();
+    DOMString stackingContextStructureVerificationReport();
+    DOMString dumpGCGraph();
+    DOMString dumpSessionHistory();
+    DOMString dumpUIProcessSessionHistory();
+    DOMString dumpUIProcessSessionHistoryWithoutUpdate();
+    boolean captureSessionHistorySnapshot();
+    boolean restoreCapturedSessionHistorySnapshot();
+    boolean registerSessionStoreTab();
+    DOMString dumpSessionStoreTabState();
+    DOMString dumpSiteIsolationProcessTree();
+    undefined crashRemoteFrameProcesses();
     Promise<undefined> flushSessionHistoryTraversalQueue();
 
-    // Test-only: deterministically reproduce the navigation-vs-traversal race in Navigable::begin_navigation by
-    // re-stamping the next navigation's ongoing navigation with a traversal during its unload check.
-    undefined clobberNextNavigationWithATraversal();
+    boolean hasHTMLParserEndState(Document document);
+
+    boolean hasShadowRoot(Element element);
 
     // Returns the shadow root of the element, if it has one, even if it's not normally accessible to JS.
     ShadowRoot? getShadowRoot(Element element);
@@ -139,47 +186,91 @@ interface Internals {
 
     undefined clearElement(HTMLElement element);
 
-    // Returns a snapshot of the style-invalidation and recomputation counters for the current document.
-    // Keys include hasAncestorWalkInvocations, hasInvalidationRuleCacheBuilds,
-    // styleInvalidations, elementStyleRecomputations, and elementStyleNoopRecomputations.
+    // Returns the number of insertions that computed an explicit child offset instead of using the append sentinel.
+    unsigned long long parserNonAppendInsertions();
+
+    // Returns a snapshot of the style engine counters exposed to LibWeb tests.
+    // Keys include styleEngineReactionBatchRuns, styleEnginePublishedReactions,
+    // elementStyleRecomputations, and styleEnvironmentVersion.
     [ImplementedAs=style_invalidation_counters_object] object getStyleInvalidationCounters();
     undefined resetStyleInvalidationCounters();
+    object getRenderingSchedulerCounters();
+    undefined resetRenderingSchedulerCounters();
+    undefined setManualRenderingOpportunities(boolean enabled);
+    undefined injectRenderingOpportunity(double frameTimeMs);
+    undefined updateCompositorAnimations();
+    boolean runEmptyAnimationStyleUpdateForTesting();
+    undefined armCompositorAnimationTimersForTesting();
+    undefined fireCompositorAnimationWakeupForTesting(double frameTimeMs);
+    undefined forceVisualContextTreeRebuildOnNextCompositorAnimationUpdateForTesting();
+    undefined requestReentrantAnimationStyleFlushForTesting(Node node);
     // Returns the confinement report of the most recent layout tree build for the current
     // document. Keys: builds (cumulative build count), lastBuildRebuiltSubtreeRoots (number of
     // subtrees rebuilt in place), lastBuildEscapedRebuildRoots (whether any tree mutation
     // escaped the rebuilt subtrees, disqualifying the build from partial relayout).
     object layoutTreeBuildStats();
-    // Returns process-wide ComputedValues instance statistics.
-    // Keys: liveComputedValues, totalComputedValuesCreated.
+    // Snapshots the current, incrementally-updated layout tree, rebuilds it from scratch, and
+    // returns { matches }, plus { incremental, full } on mismatch. This is a test oracle for
+    // incremental tree builds.
+    object compareLayoutTreeWithFullRebuild();
+    // Returns process-wide ComputedValues instance and retained representation statistics.
+    // Keys: liveComputedValues, totalComputedValuesCreated,
+    // retainedLegacyComputedPropertyArrayHolders, retainedLegacyComputedPropertyArrayBytes.
     object computedValuesStats();
     // Returns a snapshot of the process-wide style FFI boundary counters: one key per boundary
     // operation, counting calls into the Rust style core and callbacks it makes into C++.
     object styleFfiCounters();
+    object styleEngineCounters();
+    unsigned long long styleRecordIdentity(Element element);
+    unsigned long long layoutStyleRecordIdentity(Element element);
+    unsigned long long beforeStyleRecordIdentity(Element element);
+    unsigned long long beforeLayoutStyleRecordIdentity(Element element);
+    unsigned long long paintStyleRecordIdentity(Element element);
+    // Stable for the lifetime of a layout node, and zero when the DOM node has no principal
+    // layout node. Useful for asserting that incremental tree builds preserve unaffected nodes.
+    unsigned long long layoutNodeIdentity(Node node);
+    unsigned long long layoutArenaLiveSlotCount();
+    unsigned long long layoutArenaShellCount();
+    double styleEngineMatchDocument();
+    // Reports a snapshot of StyleEngine's matched rules for the whole document.
+    DOMString styleEngineMatchedRules();
+    object styleEngineTransactionReactions();
     undefined resetStyleFfiCounters();
     // Returns, for each ComputedValues style value group of the given element, whether the
     // group payload is shared with the parent element and whether it is the default payload.
     object styleGroupSharingInfo(Element element);
     // Flushes pending style work without forcing layout.
     undefined updateStyle();
-    undefined setPreferredColorScheme(Utf16DOMString colorScheme);
+    undefined setUserStyle(DOMString source);
+    undefined setPreferredColorScheme(DOMString colorScheme);
     // Simulates the window gaining or losing focus (e.g. browser chrome or another window taking focus).
     undefined setPageFocus(boolean hasFocus);
     // Simulates the page being shown or hidden (e.g. switching to another tab). Accepts "visible" or "hidden".
-    undefined setSystemVisibilityState(Utf16DOMString state);
-    Utf16DOMString canvasColorScheme();
+    undefined setSystemVisibilityState(DOMString state);
+    // Overrides the interval between the wake-ups a hidden document holds its delayed timers back to (1000 ms by default).
+    undefined setHiddenDocumentTimerWakeUpInterval(double milliseconds);
+    // Overrides the interval between the wake-ups a hidden document holds its chained timers back to once it has been
+    // hidden for the grace period, and that grace period, both in milliseconds (60000 ms and 300000 ms by default).
+    undefined setHiddenDocumentIntensiveTimerThrottling(double wakeUpInterval, double gracePeriodOnceLoaded, double gracePeriodWhileLoading);
+    DOMString canvasColorScheme();
     // Returns the selector-insight cache state for stylesheet invalidation tests.
-    boolean styleSheetMayHaveHasSelectors(CSSStyleSheet sheet);
-    object imageAnimationStateForURL(Utf16USVString url);
+    object imageAnimationStateForURL(USVString url);
     boolean mediaElementIsFetching(HTMLMediaElement element);
     boolean mediaElementIsPlayingAudio(HTMLMediaElement element);
+    boolean mediaElementVideoSinkIsTicking(HTMLMediaElement element);
+    undefined setMediaElementReadyState(HTMLMediaElement element, unsigned short readyState);
+    undefined setMediaElementPaused(HTMLMediaElement element, boolean paused);
+    undefined setMediaElementSeeking(HTMLMediaElement element, boolean seeking);
     undefined setPageMuted(boolean muted);
 
     [ImplementedAs=async_scrolling_state_object] object asyncScrollingState();
     boolean asyncScrollingStateBlocksWheelEventAt(double x, double y);
-    boolean asyncScrollingStateCanWheelScrollAt(double x, double y, double deltaX, double deltaY, optional boolean forceStaleWheelEventRegions = false);
-    Utf16DOMString asyncScrollingStateWheelRoutingAdmission();
-    Utf16DOMString asyncScrollingStateWheelScrollAdmissionAt(double x, double y, double deltaX, double deltaY, optional boolean forceStaleWheelEventRegions = false);
-    Utf16DOMString asyncScrollingStateWheelTargetAt(double x, double y, double deltaX, double deltaY);
+    boolean asyncScrollingStateCanWheelScrollAt(double x, double y, double deltaX, double deltaY, optional boolean precise = false, optional boolean forceStaleWheelEventRegions = false);
+    DOMString asyncScrollingStateWheelRoutingAdmission();
+    DOMString asyncScrollingStateWheelScrollAdmissionAt(double x, double y, double deltaX, double deltaY, optional boolean precise = false, optional boolean forceStaleWheelEventRegions = false);
+    DOMString asyncScrollingStateWheelTargetAt(double x, double y, double deltaX, double deltaY, optional boolean precise = false, optional ScrollGesturePhase scrollGesturePhase = "none");
     DOMString viewportOverflowX();
 
 };
+
+enum ScrollGesturePhase { "none", "ongoing", "momentum", "ended" };

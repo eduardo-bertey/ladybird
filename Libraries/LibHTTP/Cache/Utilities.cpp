@@ -5,6 +5,7 @@
  */
 
 #include <AK/GenericLexer.h>
+#include <AK/NumericLimits.h>
 #include <AK/QuickSort.h>
 #include <AK/StringBuilder.h>
 #include <AK/StringConversions.h>
@@ -25,7 +26,7 @@ static Optional<UnixDateTime> parse_http_date(Optional<ByteString const&> date)
     return {};
 }
 
-u64 compute_maximum_disk_cache_size(u64 free_bytes, u64 limit_maximum_disk_cache_size)
+i64 compute_maximum_disk_cache_size(u64 free_bytes, u64 limit_maximum_disk_cache_size)
 {
     auto cache_size = [&]() {
         if (free_bytes <= 100 * MiB)
@@ -39,12 +40,17 @@ u64 compute_maximum_disk_cache_size(u64 free_bytes, u64 limit_maximum_disk_cache
         return limit_maximum_disk_cache_size;
     }();
 
-    return min(cache_size, limit_maximum_disk_cache_size);
+    // The index accounts for sizes in SQLite's signed integer domain, so the limit lives there too.
+    static constexpr u64 MAXIMUM_REPRESENTABLE_DISK_CACHE_SIZE = NumericLimits<i64>::max();
+
+    cache_size = min(cache_size, limit_maximum_disk_cache_size);
+    cache_size = min(cache_size, MAXIMUM_REPRESENTABLE_DISK_CACHE_SIZE);
+    return static_cast<i64>(cache_size);
 }
 
-u64 compute_maximum_disk_cache_entry_size(u64 maximum_disk_cache_size)
+i64 compute_maximum_disk_cache_entry_size(i64 maximum_disk_cache_size)
 {
-    static constexpr u64 MAXIMUM_DISK_CACHE_ENTRY_SIZE = 256 * MiB;
+    static constexpr i64 MAXIMUM_DISK_CACHE_ENTRY_SIZE = 256 * MiB;
 
     return min(maximum_disk_cache_size / 8, MAXIMUM_DISK_CACHE_ENTRY_SIZE);
 }
@@ -425,8 +431,15 @@ AK::Duration calculate_freshness_lifetime(u32 status_code, HeaderList const& hea
         heuristics_allowed = true;
     }
 
-    if (heuristics_allowed)
+    if (heuristics_allowed) {
+        // INTEROP: Chromium treats 301 and 308 responses without explicit freshness as indefinitely fresh, while
+        //          WebKit assigns 301 responses a one-year lifetime. Use the more conservative one-year lifetime for
+        //          both permanent redirect status codes.
+        if (status_code == 301 || status_code == 308)
+            return AK::Duration::from_seconds(365 * 24 * 60 * 60);
+
         return calculate_heuristic_freshness_lifetime(headers, current_time_offset_for_testing);
+    }
 
     // No explicit expiration time, and heuristics not allowed or not applicable.
     return {};

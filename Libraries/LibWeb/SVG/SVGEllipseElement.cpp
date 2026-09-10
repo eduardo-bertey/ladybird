@@ -7,7 +7,7 @@
 #include <LibGfx/Path.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/SVG/AttributeNames.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGEllipseElement.h>
 
 namespace Web::SVG {
@@ -19,12 +19,10 @@ SVGEllipseElement::SVGEllipseElement(DOM::Document& document, DOM::QualifiedName
 {
 }
 
-Gfx::Path SVGEllipseElement::get_path(CSSPixelSize viewport_size)
+Gfx::Path SVGEllipseElement::get_path(CSSPixelSize viewport_size, CSS::ComputedValues const& computed_values)
 {
-    auto const& computed_values = this->computed_values();
-
-    auto computed_rx = computed_values->rx();
-    auto computed_ry = computed_values->ry();
+    auto computed_rx = computed_values.rx();
+    auto computed_ry = computed_values.ry();
 
     float rx = computed_rx.to_px_or_zero(viewport_size.width()).to_float();
     float ry = computed_ry.to_px_or_zero(viewport_size.height()).to_float();
@@ -40,8 +38,8 @@ Gfx::Path SVGEllipseElement::get_path(CSSPixelSize viewport_size)
     if (computed_ry.is_auto())
         ry = computed_rx.to_px_or_zero(viewport_size.width()).to_float();
 
-    float cx = computed_values->cx().to_px(viewport_size.width()).to_float();
-    float cy = computed_values->cy().to_px(viewport_size.height()).to_float();
+    float cx = computed_values.cx().to_px(viewport_size.width()).to_float();
+    float cy = computed_values.cy().to_px(viewport_size.height()).to_float();
     Gfx::Path path;
 
     // A negative radius is invalid. If only one radius is invalid, SVG uses

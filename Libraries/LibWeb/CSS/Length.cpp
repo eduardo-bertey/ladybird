@@ -21,7 +21,7 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
 
 namespace Web::CSS {
 
@@ -51,7 +51,7 @@ static ContainerRelativeAxis logical_axis_to_physical_axis(bool inline_axis_is_h
 
 static bool query_container_is_eligible_for_axis(DOM::Element const& container, ContainerRelativeAxis axis)
 {
-    auto style = container.computed_values();
+    auto style = container.computed_style();
     if (!style)
         return false;
 
@@ -158,8 +158,8 @@ double Length::container_relative_length_to_px_without_rounding(ResolutionContex
             return viewport_length.to_double();
         }
 
-        auto paintable_box = query_container->unsafe_paintable_box();
-        if (!paintable_box) {
+        auto const* layout_node = query_container->unsafe_layout_node();
+        if (!layout_node || !Painting::has_committed_box(*layout_node)) {
             // A running partial relayout pass reports layout as up to date, but a container
             // with no paintable yet still needs the post-layout evaluation, which routes the
             // follow-up pass to the full layout path that resolves the container's size.
@@ -168,7 +168,7 @@ double Length::container_relative_length_to_px_without_rounding(ResolutionContex
             return 0.0;
         }
 
-        auto container_length = physical_axis == ContainerRelativeAxis::Width ? paintable_box->content_width() : paintable_box->content_height();
+        auto container_length = physical_axis == ContainerRelativeAxis::Width ? Painting::content_width(*layout_node) : Painting::content_height(*layout_node);
         return container_length.to_double();
     };
 
@@ -204,21 +204,26 @@ double Length::container_relative_length_to_px_without_rounding(ResolutionContex
 
 Length::ResolutionContext Length::ResolutionContext::for_element(DOM::AbstractElement const& element)
 {
+    auto computed_values = element.computed_style();
+    VERIFY(computed_values);
+    return for_element(element, *computed_values);
+}
+
+Length::ResolutionContext Length::ResolutionContext::for_element(DOM::AbstractElement const& element, ComputedValues const& computed_values)
+{
     auto const* root_element = element.element().document().document_element();
 
-    auto const* computed_values = element.computed_values();
-    VERIFY(computed_values);
     VERIFY(root_element);
-    auto root_computed_values = root_element->computed_values();
+    auto root_computed_values = root_element->computed_style();
     VERIFY(root_computed_values);
 
     return Length::ResolutionContext {
         .viewport_rect = element.element().navigable()->viewport_rect(),
-        .font_metrics = { computed_values->font_size(), computed_values->font_list().font_for_code_point(' ').pixel_metrics(), computed_values->line_height() },
-        .root_font_metrics = { root_computed_values->font_size(), root_computed_values->font_list().font_for_code_point(' ').pixel_metrics(), root_computed_values->line_height() },
-        .font_metrics_depend_on_viewport_metrics = computed_values->font_metrics_depend_on_viewport_metrics(),
+        .font_metrics = { computed_values.font_size(), computed_values.font_list().first_available_font().pixel_metrics(), computed_values.line_height() },
+        .root_font_metrics = { root_computed_values->font_size(), root_computed_values->font_list().first_available_font().pixel_metrics(), root_computed_values->line_height() },
+        .font_metrics_depend_on_viewport_metrics = computed_values.font_metrics_depend_on_viewport_metrics(),
         .root_font_metrics_depend_on_viewport_metrics = root_computed_values->font_metrics_depend_on_viewport_metrics(),
-        .subject_inline_axis_is_horizontal = inline_axis_is_horizontal(computed_values->writing_mode()),
+        .subject_inline_axis_is_horizontal = inline_axis_is_horizontal(computed_values.writing_mode()),
         .subject_element = &element.element(),
     };
 }
@@ -261,9 +266,9 @@ Length::ResolutionContext Length::ResolutionContext::for_layout_node(Layout::Nod
 
     return Length::ResolutionContext {
         .viewport_rect = node.navigable()->viewport_rect(),
-        .font_metrics = { node.computed_values().font_size(), node.first_available_font().pixel_metrics(), node.computed_values().line_height() },
-        .root_font_metrics = { root_layout_node->computed_values().font_size(), root_layout_node->first_available_font().pixel_metrics(), node.computed_values().line_height() },
-        .subject_inline_axis_is_horizontal = inline_axis_is_horizontal(node.computed_values().writing_mode()),
+        .font_metrics = { node.font_size(), node.first_available_font().pixel_metrics(), node.line_height() },
+        .root_font_metrics = { root_layout_node->font_size(), root_layout_node->first_available_font().pixel_metrics(), node.line_height() },
+        .subject_inline_axis_is_horizontal = inline_axis_is_horizontal(node.writing_mode()),
         .subject_element = subject_element,
     };
 }

@@ -11,6 +11,7 @@
 #include <LibURL/Parser.h>
 #include <LibWeb/HTML/AutoplayPolicy.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/CrashReport.h>
 #include <LibWebView/SearchEngine.h>
 #include <LibWebView/WebUI/SettingsUI.h>
 
@@ -45,6 +46,14 @@ static bool should_show_config_variable(ConfigVariableID id)
 
 void SettingsUI::register_interfaces()
 {
+    register_interface("showCrashReports"sv, [this](auto const&) {
+        if (!CrashReport::is_supported()) {
+            async_send_message("crashReportsStatus"sv, "Crash reporting is not available on this platform yet."_string);
+            return;
+        }
+        auto result = CrashReport::show_directory();
+        async_send_message("crashReportsStatus"sv, result.is_error() ? "Could not open the crash reports folder."_string : String {});
+    });
     register_interface("loadFeatures"sv, [this](auto const&) {
         load_features();
     });
@@ -122,6 +131,10 @@ void SettingsUI::register_interfaces()
 
     register_interface("setGeolocationEnabled"sv, [this](auto const& data) {
         set_geolocation_enabled(data);
+    });
+
+    register_interface("setForceDarkEnabled"sv, [this](auto const& data) {
+        set_force_dark_enabled(data);
     });
 }
 
@@ -399,7 +412,6 @@ void SettingsUI::estimate_browsing_data_sizes(JsonValue const& options)
         return;
 
     auto& application = Application::the();
-    auto weak_this = static_cast<Core::EventReceiver&>(*this).make_weak_ptr();
 
     auto since = [&]() {
         if (auto since = options.as_object().get_integer<i64>("since"sv); since.has_value())
@@ -408,14 +420,7 @@ void SettingsUI::estimate_browsing_data_sizes(JsonValue const& options)
     }();
 
     application.estimate_browsing_data_size_accessed_since(since)
-        ->when_resolved([weak_this](Application::BrowsingDataSizes const& sizes) {
-            if (!weak_this)
-                return;
-
-            auto& settings_ui = static_cast<SettingsUI&>(*weak_this.ptr());
-            if (!settings_ui.is_open())
-                return;
-
+        ->when_resolved([weak_this = make_weak_ptr<SettingsUI>()](Application::BrowsingDataSizes const& sizes) {
             JsonObject result;
 
             result.set("cacheSizeSinceRequestedTime"sv, sizes.cache_size_since_requested_time);
@@ -424,7 +429,8 @@ void SettingsUI::estimate_browsing_data_sizes(JsonValue const& options)
             result.set("siteDataSizeSinceRequestedTime"sv, sizes.site_data_size_since_requested_time);
             result.set("totalSiteDataSize"sv, sizes.total_site_data_size);
 
-            settings_ui.async_send_message("estimatedBrowsingDataSizes"sv, move(result));
+            if (auto self = weak_this.strong_ref())
+                self->async_send_message("estimatedBrowsingDataSizes"sv, move(result));
         })
         .when_rejected([](Error const& error) {
             dbgln("Failed to estimate browsing data sizes: {}", error);
@@ -463,7 +469,16 @@ void SettingsUI::clear_browsing_data(JsonValue const& options)
         ? Application::ClearBrowsingDataOptions::Delete::Yes
         : Application::ClearBrowsingDataOptions::Delete::No;
 
-    Application::the().clear_browsing_data(clear_browsing_data_options);
+    auto& application = Application::the();
+
+    application.clear_browsing_data(clear_browsing_data_options)
+        ->when_resolved([weak_this = make_weak_ptr<SettingsUI>()](Empty) {
+            if (auto self = weak_this.strong_ref())
+                self->async_send_message("clearedBrowsingData"sv, {});
+        })
+        .when_rejected([](Error const& error) {
+            dbgln("Failed to clear browser data: {}", error);
+        });
 }
 
 void SettingsUI::set_global_privacy_control(JsonValue const& global_privacy_control)
@@ -478,6 +493,14 @@ void SettingsUI::set_dns_settings(JsonValue const& dns_settings)
 {
     Application::settings().set_dns_settings(Settings::parse_dns_settings(dns_settings));
     load_current_settings();
+}
+
+void SettingsUI::set_force_dark_enabled(JsonValue const& enabled)
+{
+    if (!enabled.is_bool())
+        return;
+
+    Application::settings().set_force_dark_enabled(enabled.as_bool());
 }
 
 void SettingsUI::set_geolocation_enabled(JsonValue const& enabled)

@@ -336,15 +336,17 @@ impl MachineProgram {
         use KnownLayoutConstant::*;
 
         let architecture_constants: &[KnownLayoutConstant] = match self.target.architecture {
-            Architecture::X86_64 => &[Int32TagShifted],
-            Architecture::Aarch64 => &[Int32Tag, BooleanTag, NanBaseTag],
+            Architecture::X86_64 => &[],
+            Architecture::Aarch64 => &[Int32Tag, BooleanTag],
         };
         architecture_constants
             .iter()
             .chain(
                 [
+                    SlowPathContinuationBit,
                     VmRunningExecutionContext,
                     VmBreakpointController,
+                    VmHeapRegionBase,
                     ExecutionContextExecutable,
                     ExecutionContextProgramCounter,
                     ExecutableBytecodeData,

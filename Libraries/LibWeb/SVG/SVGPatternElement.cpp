@@ -5,19 +5,13 @@
  */
 
 #include <LibGfx/Matrix4x4.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Layout/Box.h>
+#include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/Layout/SVGPatternBox.h>
-#include <LibWeb/Layout/SVGSVGBox.h>
-#include <LibWeb/Painting/DisplayList.h>
-#include <LibWeb/Painting/DisplayListRecorder.h>
-#include <LibWeb/Painting/DisplayListRecordingContext.h>
-#include <LibWeb/Painting/PaintStyle.h>
-#include <LibWeb/Painting/SVGGraphicsPaintable.h>
-#include <LibWeb/Painting/StackingContext.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/SVG/AttributeNames.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/FragmentIdentifier.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
 #include <LibWeb/SVG/SVGPatternElement.h>
@@ -49,23 +43,23 @@ void SVGPatternElement::attribute_changed(Utf16FlyString const& name, Optional<U
     SVGFitToViewBox::attribute_changed(*this, name, value);
 
     if (name == AttributeNames::patternUnits) {
-        m_pattern_units = AttributeParser::parse_units(value.value_or({}));
+        m_pattern_units = parse_units(value.value_or({}));
     } else if (name == AttributeNames::patternContentUnits) {
-        m_pattern_content_units = AttributeParser::parse_units(value.value_or({}));
+        m_pattern_content_units = parse_units(value.value_or({}));
     } else if (name == AttributeNames::patternTransform) {
-        if (auto transform_list = AttributeParser::parse_transform(value.value_or({})); transform_list.has_value()) {
+        if (auto transform_list = parse_transform(value.value_or({})); transform_list.has_value()) {
             m_pattern_transform = transform_from_transform_list(*transform_list);
         } else {
             m_pattern_transform = {};
         }
     } else if (name == AttributeNames::x) {
-        m_x = AttributeParser::parse_number_percentage(value.value_or({}));
+        m_x = parse_number_percentage(value.value_or({}));
     } else if (name == AttributeNames::y) {
-        m_y = AttributeParser::parse_number_percentage(value.value_or({}));
+        m_y = parse_number_percentage(value.value_or({}));
     } else if (name == AttributeNames::width) {
-        m_width = AttributeParser::parse_number_percentage(value.value_or({}));
+        m_width = parse_number_percentage(value.value_or({}));
     } else if (name == AttributeNames::height) {
-        m_height = AttributeParser::parse_number_percentage(value.value_or({}));
+        m_height = parse_number_percentage(value.value_or({}));
     }
 }
 
@@ -230,102 +224,37 @@ NumberPercentage SVGPatternElement::pattern_height_impl(GC::RootHashTable<SVGPat
     return NumberPercentage::create_number(0);
 }
 
-Optional<Painting::PaintStyle> SVGPatternElement::to_gfx_paint_style(SVGPaintContext const& paint_context, DisplayListRecordingContext& recording_context, Layout::Node const& target_layout_node) const
+void SVGPatternElement::push_paint_server_description(void* sink, Layout::Node const& target_layout_node) const
 {
     auto content_element = pattern_content_element();
     if (!content_element)
-        return {};
+        return;
 
-    Layout::SVGPatternBox const* pattern_box = nullptr;
-    target_layout_node.for_each_child_of_type<Layout::SVGPatternBox>([&](auto const& candidate) {
-        if (&candidate.dom_node() == content_element.ptr()) {
+    Layout::Box const* pattern_box = nullptr;
+    target_layout_node.for_each_child_of_type<Layout::Box>([&](auto const& candidate) {
+        if (candidate.is_svg_pattern_box() && candidate.dom_node() == content_element.ptr()) {
             pattern_box = &candidate;
             return IterationDecision::Break;
         }
         return IterationDecision::Continue;
     });
     if (!pattern_box)
-        return {};
+        return;
 
-    auto pattern_paintable = pattern_box->paintable_box();
-    if (!pattern_paintable)
-        return {};
-
-    float tile_x = 0;
-    float tile_y = 0;
-    float tile_width = 0;
-    float tile_height = 0;
-    if (pattern_units() == SVGUnits::ObjectBoundingBox) {
-        // For objectBoundingBox, values are fractions of the bounding box.
-        // NumberPercentage::value() already normalizes percentages to 0-1 range.
-        auto const& bbox = paint_context.path_bounding_box;
-        tile_x = pattern_x().value() * bbox.width() + bbox.x();
-        tile_y = pattern_y().value() * bbox.height() + bbox.y();
-        tile_width = pattern_width().value() * bbox.width();
-        tile_height = pattern_height().value() * bbox.height();
-    } else {
-        // For userSpaceOnUse, resolve percentages relative to the viewport.
-        auto const& viewport = paint_context.viewport;
-        tile_x = pattern_x().resolve_relative_to(viewport.width());
-        tile_y = pattern_y().resolve_relative_to(viewport.height());
-        tile_width = pattern_width().resolve_relative_to(viewport.width());
-        tile_height = pattern_height().resolve_relative_to(viewport.height());
-    }
-
-    if (tile_width <= 0 || tile_height <= 0)
-        return {};
-
-    auto tile_rect = paint_context.paint_transform.map(Gfx::FloatRect { tile_x, tile_y, tile_width, tile_height });
-
-    if (tile_rect.is_empty())
-        return {};
-
-    auto const* svg_node = target_layout_node.first_ancestor_of_type<Layout::SVGSVGBox>();
-    if (!svg_node || !svg_node->paintable_box())
-        return {};
-    auto svg_element_rect = svg_node->paintable_box()->absolute_rect();
-    auto svg_offset = recording_context.rounded_device_point(svg_element_rect.location()).to_type<int>().to_type<float>();
-    tile_rect.translate_by(svg_offset);
-
-    auto content_origin = paint_context.paint_transform.map(Gfx::FloatPoint { 0, 0 }) + svg_offset;
-    auto visual_context_tree = Painting::AccumulatedVisualContextTree::create_with_content_offset(-Gfx::IntPoint(content_origin.to_type<int>()));
-    auto display_list = Painting::DisplayList::create(visual_context_tree);
-    Painting::DisplayListRecorder display_list_recorder(*display_list, visual_context_tree, recording_context.display_list_recorder().resource_storage());
-    auto paint_context_copy = recording_context.clone(display_list_recorder);
-
-    Gfx::AffineTransform target_svg_transform;
-    auto paintable = target_layout_node.paintable();
-    if (auto const* svg_graphics_paintable = as_if<Painting::SVGGraphicsPaintable>(paintable.ptr()))
-        target_svg_transform = svg_graphics_paintable->computed_transforms().svg_transform();
-    paint_context_copy.set_svg_transform(target_svg_transform);
-
-    Painting::StackingContext::paint_svg(paint_context_copy, *pattern_paintable, Painting::PaintPhase::Foreground);
-
-    Optional<Gfx::AffineTransform> user_space_pattern_transform;
-    auto const& css_transformations = computed_values()->transformations();
-    if (!css_transformations.is_empty()) {
-        auto matrix = Gfx::FloatMatrix4x4::identity();
-        for (auto const& css_transform : css_transformations)
-            matrix = matrix * css_transform->to_matrix(*pattern_paintable);
-
-        user_space_pattern_transform = extract_2d_affine_transform(matrix);
-    } else {
-        user_space_pattern_transform = pattern_transform();
-    }
-
-    Optional<Gfx::AffineTransform> device_pattern_transform;
-    if (user_space_pattern_transform.has_value()) {
-        if (!user_space_pattern_transform->inverse().has_value())
-            return {};
-        // patternTransform is defined in user space, but the tile rect and shader operate in device pixel space.
-        // Convert by conjugating with paint_transform.
-        if (auto inv = paint_context.paint_transform.inverse(); inv.has_value()) {
-            auto transform = paint_context.paint_transform;
-            device_pattern_transform = transform.multiply(*user_space_pattern_transform).multiply(*inv);
-        }
-    }
-
-    return Painting::PaintStyle { Painting::PatternPaintStyle { { *display_list, move(visual_context_tree) }, tile_rect, device_pattern_transform } };
+    Layout::RustFFI::FfiSvgPatternDescription description {};
+    description.pattern_box = Layout::Node::slot_id(pattern_box);
+    description.units_are_object_bounding_box = pattern_units() == SVGUnits::ObjectBoundingBox;
+    description.content_units_are_object_bounding_box = pattern_content_units() == SVGUnits::ObjectBoundingBox;
+    description.has_view_box = view_box().has_value();
+    description.x = Layout::to_ffi_number_percentage(pattern_x());
+    description.y = Layout::to_ffi_number_percentage(pattern_y());
+    description.width = Layout::to_ffi_number_percentage(pattern_width());
+    description.height = Layout::to_ffi_number_percentage(pattern_height());
+    description.pattern_transform_attribute = pattern_transform();
+    auto const* transform_values = style_group<CSS::ComputedValues::TransformValues>();
+    auto const* css_transform_entries = transform_values ? transform_values->resolved_transforms.pointer : nullptr;
+    auto css_transform_count = transform_values ? transform_values->resolved_transforms.length : 0;
+    Layout::RustFFI::layout_arena_svg_paint_resources_push_pattern(sink, &description, css_transform_entries, css_transform_count);
 }
 
 // Reflected length accessors are generated by SVGElement's reflection macro.

@@ -5,18 +5,20 @@
  */
 
 #include <AK/IDAllocator.h>
+#include <AK/Math.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/WeakPtr.h>
 #include <LibCore/EventLoop.h>
-#include <LibCore/Proxy.h>
 #include <LibCore/Socket.h>
 #include <LibCore/System.h>
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/WebSocket.h>
+#include <LibURL/Parser.h>
 #include <LibWebSocket/ConnectionInfo.h>
 #include <LibWebSocket/Message.h>
+#include <RequestServer/AIA.h>
 #include <RequestServer/CURL.h>
 #include <RequestServer/ConnectionFromClient.h>
 #include <RequestServer/Request.h>
@@ -81,10 +83,11 @@ static auto time_curl_call(StringView label, F&& f)
 static constexpr i64 BURST_WINDOW_MS = 100;
 static constexpr u64 BURST_REPORT_THRESHOLD = 5;
 
-ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, IsPrimaryConnection is_primary_connection, IsPrivate is_private, ConnectionMap& connections, Optional<HTTP::DiskCache&> disk_cache, ByteString alt_svc_cache_path)
+ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, IsPrimaryConnection is_primary_connection, IsPrivate is_private, ConnectionMap& connections, RequestTransferLeaseMap& request_transfer_leases, Optional<HTTP::DiskCache&> disk_cache, ByteString alt_svc_cache_path)
     : IPC::ConnectionFromClient<RequestClientEndpoint, RequestServerEndpoint>(*this, move(transport), s_client_ids.allocate())
     , m_is_private(is_private)
     , m_connections(connections)
+    , m_request_transfer_leases(request_transfer_leases)
     , m_disk_cache(disk_cache)
     , m_curl_multi(curl_multi_init())
     , m_resolver(Resolver::default_resolver())
@@ -108,9 +111,23 @@ ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transpo
     set_option(CURLMOPT_TIMERFUNCTION, &on_timeout_callback);
     set_option(CURLMOPT_TIMERDATA, this);
 
+    // https://curl.se/libcurl/c/CURLMOPT_TIMERFUNCTION.html
+    // Your callback function timer_callback should install a single non-repeating timer with an expire time of
+    // timeout_ms milliseconds.
     m_timer = Core::Timer::create_single_shot(0, [this] {
+        auto now = MonotonicTime::now();
+        if (m_curl_timer_due_at.has_value() && now < *m_curl_timer_due_at) {
+            auto remaining_ms = (*m_curl_timer_due_at - now).to_milliseconds();
+            m_timer->restart(AK::clamp_to<int>(remaining_ms));
+            return;
+        }
+
+        m_curl_timer_due_at = {};
         note_event_tick("curl-timer-fired"sv);
         s_curl_timer_due_at = {};
+
+        // When that timer fires, call either curl_multi_socket_action or curl_multi_perform, depending on which
+        // interface you use.
         auto result = time_curl_call("multi_socket_action(timeout)"sv, [this] {
             return curl_multi_socket_action(m_curl_multi, CURL_SOCKET_TIMEOUT, 0, nullptr);
         });
@@ -126,8 +143,16 @@ ConnectionFromClient::~ConnectionFromClient()
     m_pending_websockets.clear();
     m_websockets.clear();
 
+    for (auto& fetch : m_aia_fetches) {
+        curl_multi_remove_handle(m_curl_multi, fetch.key);
+        curl_easy_cleanup(fetch.key);
+    }
+    m_aia_fetches.clear();
+
     curl_multi_cleanup(m_curl_multi);
     m_curl_multi = nullptr;
+
+    s_client_ids.deallocate(client_id());
 }
 
 Optional<ConnectionFromClient&> ConnectionFromClient::primary_connection()
@@ -139,7 +164,7 @@ Optional<ConnectionFromClient&> ConnectionFromClient::primary_connection()
 
 void ConnectionFromClient::request_complete(Badge<Request>, Request const& request)
 {
-    if (request.keep_alive_for_transfer())
+    if (request.has_transfer_lease())
         return;
 
     Core::deferred_invoke([weak_self = make_weak_ptr<ConnectionFromClient>(), request_id = request.request_id(), type = request.type()] {
@@ -157,9 +182,18 @@ void ConnectionFromClient::die()
     if (g_primary_connection == this)
         g_primary_connection = nullptr;
 
-    auto client_id = this->client_id();
-    m_connections.remove(client_id);
-    s_client_ids.deallocate(client_id);
+    Vector<Requests::RequestTransferLeaseKey> transfer_leases_to_cancel;
+    for (auto const& entry : m_request_transfer_leases) {
+        if (entry.value.owner.ptr() == this)
+            transfer_leases_to_cancel.append(entry.key);
+    }
+    for (auto const& transfer_lease : transfer_leases_to_cancel) {
+        auto lease = m_request_transfer_leases.take(transfer_lease);
+        if (lease.has_value())
+            m_active_requests.remove(lease->request_id);
+    }
+
+    m_connections.remove(client_id());
 
     if (m_connections.is_empty())
         Core::EventLoop::current().quit(0);
@@ -210,7 +244,7 @@ ErrorOr<IPC::TransportHandle> ConnectionFromClient::create_client_socket(IsPriva
     auto disk_cache = is_private == IsPrivate::Yes ? Optional<HTTP::DiskCache&> {} : m_disk_cache;
 
     // Note: A ref is stored in the m_connections map
-    auto client = adopt_ref(*new ConnectionFromClient(move(paired.local), IsPrimaryConnection::No, is_private, m_connections, disk_cache, m_alt_svc_cache_path.value_or({})));
+    auto client = adopt_ref(*new ConnectionFromClient(move(paired.local), IsPrimaryConnection::No, is_private, m_connections, m_request_transfer_leases, disk_cache, m_alt_svc_cache_path.value_or({})));
 
     return handle;
 }
@@ -270,7 +304,7 @@ void ConnectionFromClient::set_use_system_dns()
     m_resolver->dns.reset_connection();
 }
 
-void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL::URL url, Vector<HTTP::Header> request_headers, ByteBuffer request_body, HTTP::CacheMode cache_mode, HTTP::Cookie::IncludeCredentials include_credentials, Core::ProxyData proxy_data, bool keep_alive_for_transfer, Optional<u32> address_selection_hint)
+void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL::URL url, Vector<HTTP::Header> request_headers, ByteBuffer request_body, HTTP::CacheMode cache_mode, HTTP::Cookie::IncludeCredentials include_credentials, bool create_transfer_lease, Optional<u32> address_selection_hint, bool notify_on_cache_miss)
 {
     note_event_tick("ipc-start-request"sv);
     dbgln_if(REQUESTSERVER_DEBUG, "RequestServer: start_request({}, {})", request_id, url);
@@ -289,34 +323,59 @@ void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL:
         }
     }
 
-    auto request = Request::fetch(request_id, m_disk_cache, cache_mode, *this, m_curl_multi, m_resolver, move(url), move(method), HTTP::HeaderList::create(move(request_headers)), move(request_body), include_credentials, m_alt_svc_cache_path, proxy_data, keep_alive_for_transfer, address_selection_hint);
+    auto transfer_lease = create_transfer_lease
+        ? Optional<Requests::RequestTransferLeaseKey> { { client_id(), request_id } }
+        : Optional<Requests::RequestTransferLeaseKey> {};
+    auto request = Request::fetch(request_id, m_disk_cache, cache_mode, *this, m_curl_multi, m_resolver, move(url), move(method), HTTP::HeaderList::create(move(request_headers)), move(request_body), include_credentials, m_alt_svc_cache_path, transfer_lease, address_selection_hint, notify_on_cache_miss);
     m_active_requests.set(request_id, move(request));
+
+    if (transfer_lease.has_value())
+        m_request_transfer_leases.set(*transfer_lease, RequestTransferLease { *this, request_id });
 }
 
-void ConnectionFromClient::adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id)
+void ConnectionFromClient::adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease)
 {
-    auto source_connection = m_connections.get(source_client_id);
-    if (!source_connection.has_value()) {
+    auto lease_key = Requests::RequestTransferLeaseKey { source_client_id, source_request_id };
+    auto transfer_lease = m_request_transfer_leases.get(lease_key);
+    if (!transfer_lease.has_value()) {
         async_request_finished(target_request_id, 0, {}, Requests::NetworkError::Unknown);
         return;
     }
 
-    auto request = (*source_connection)->m_active_requests.take(source_request_id);
+    auto source_connection = transfer_lease->owner;
+    auto current_request_id = transfer_lease->request_id;
+    auto request = source_connection->m_active_requests.take(current_request_id);
     if (!request.has_value()) {
         async_request_finished(target_request_id, 0, {}, Requests::NetworkError::Unknown);
         return;
     }
 
-    auto transfer_result = (*request)->transfer_to_client(*this, target_request_id);
-    if (transfer_result.is_error()) {
-        dbgln("RequestServer: Failed to transfer request {} from client {} to client {}: {}", source_request_id, source_client_id, client_id(), transfer_result.error());
-        (*source_connection)->m_active_requests.set(source_request_id, request.release_value());
+    auto const& request_transfer_lease = (*request)->transfer_lease();
+    if (!request_transfer_lease.has_value() || *request_transfer_lease != lease_key) {
+        source_connection->m_active_requests.set(current_request_id, request.release_value());
         async_request_finished(target_request_id, 0, {}, Requests::NetworkError::Unknown);
         return;
     }
 
-    auto should_remove_after_transfer = (*request)->is_complete();
+    auto transfer_lease_to_preserve = preserve_transfer_lease
+        ? Optional<Requests::RequestTransferLeaseKey> { lease_key }
+        : Optional<Requests::RequestTransferLeaseKey> {};
+    auto transfer_result = (*request)->transfer_to_client(*this, target_request_id, move(transfer_lease_to_preserve));
+    if (transfer_result.is_error()) {
+        dbgln("RequestServer: Failed to transfer request {} from client {} to client {}: {}", source_request_id, source_client_id, client_id(), transfer_result.error());
+        source_connection->m_active_requests.set(current_request_id, request.release_value());
+        async_request_finished(target_request_id, 0, {}, Requests::NetworkError::Unknown);
+        return;
+    }
+
+    auto should_remove_after_transfer = (*request)->is_complete() && !preserve_transfer_lease;
     m_active_requests.set(target_request_id, request.release_value());
+    if (preserve_transfer_lease) {
+        transfer_lease->owner = *this;
+        transfer_lease->request_id = target_request_id;
+    } else {
+        m_request_transfer_leases.remove(lease_key);
+    }
     if (should_remove_after_transfer) {
         Core::deferred_invoke([weak_self = make_weak_ptr<ConnectionFromClient>(), target_request_id] {
             if (auto self = weak_self.strong_ref())
@@ -325,29 +384,37 @@ void ConnectionFromClient::adopt_request(int source_client_id, u64 source_reques
     }
 }
 
-void ConnectionFromClient::release_request_for_transfer(u64 request_id)
+void ConnectionFromClient::release_request_transfer_lease(int source_client_id, u64 source_request_id)
 {
-    auto request = m_active_requests.get(request_id);
+    auto lease_key = Requests::RequestTransferLeaseKey { source_client_id, source_request_id };
+    auto lease = m_request_transfer_leases.get(lease_key);
+    if (!lease.has_value() || lease->owner.ptr() != this)
+        return;
+
+    auto owner = lease->owner;
+    auto request_id = lease->request_id;
+    m_request_transfer_leases.remove(lease_key);
+    auto request = owner->m_active_requests.get(request_id);
     if (!request.has_value())
         return;
 
-    (*request)->release_for_transfer();
+    (*request)->release_transfer_lease();
     if ((*request)->is_complete()) {
-        Core::deferred_invoke([weak_self = make_weak_ptr<ConnectionFromClient>(), request_id] {
-            if (auto self = weak_self.strong_ref())
-                self->m_active_requests.remove(request_id);
+        Core::deferred_invoke([weak_owner = owner->make_weak_ptr<ConnectionFromClient>(), request_id] {
+            if (auto owner = weak_owner.strong_ref())
+                owner->m_active_requests.remove(request_id);
         });
     }
 }
 
-void ConnectionFromClient::start_revalidation_request(Badge<Request>, ByteString method, URL::URL url, NonnullRefPtr<HTTP::HeaderList> request_headers, ByteBuffer request_body, HTTP::Cookie::IncludeCredentials include_credentials, Core::ProxyData proxy_data)
+void ConnectionFromClient::start_revalidation_request(Badge<Request>, ByteString method, URL::URL url, NonnullRefPtr<HTTP::HeaderList> request_headers, ByteBuffer request_body, HTTP::Cookie::IncludeCredentials include_credentials)
 {
     note_event_tick("ipc-start-revalidation"sv);
     auto request_id = m_next_revalidation_request_id++;
 
     dbgln_if(REQUESTSERVER_DEBUG, "RequestServer: start_revalidation_request({}, {})", request_id, url);
 
-    auto request = Request::revalidate(request_id, m_disk_cache, *this, m_curl_multi, m_resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, m_alt_svc_cache_path, proxy_data);
+    auto request = Request::revalidate(request_id, m_disk_cache, *this, m_curl_multi, m_resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, m_alt_svc_cache_path);
     m_active_revalidation_requests.set(request_id, move(request));
 }
 
@@ -398,14 +465,32 @@ int ConnectionFromClient::on_timeout_callback(void*, long timeout_ms, void* user
     if (!client->m_timer)
         return 0;
 
-    if (timeout_ms < 0) {
+    // https://curl.se/libcurl/c/CURLMOPT_TIMERFUNCTION.html
+    // A timeout_ms value of -1 passed to this callback means you should delete the timer.
+    if (timeout_ms == -1) {
         client->m_timer->stop();
+        client->m_curl_timer_due_at = {};
         s_curl_timer_due_at = {};
     } else {
-        client->m_timer->restart(timeout_ms);
-        s_curl_timer_due_at = MonotonicTime::now() + AK::Duration::from_milliseconds(timeout_ms);
+        // All other values are valid expire times in number of milliseconds - including zero milliseconds.
+        VERIFY(timeout_ms >= 0);
+        auto due_at = MonotonicTime::now() + AK::Duration::from_milliseconds(timeout_ms);
+        client->m_curl_timer_due_at = due_at;
+        s_curl_timer_due_at = due_at;
+
+        // If this callback is called when a timer is already running, this new expire time replaces the former timeout.
+        // The application should then effectively cancel the old timeout and set a new timeout using this new expire time.
+        //
+        // WARNING: do not call libcurl directly from within the callback itself when the timeout_ms value is zero, since
+        // it risks triggering an unpleasant recursive behavior that immediately calls another call to the callback with
+        // a zero timeout...
+        //
+        // Core::Timer intervals are ints, so wait for longer valid timeouts in chunks without calling libcurl before its
+        // requested expire time.
+        client->m_timer->restart(AK::clamp_to<int>(timeout_ms));
     }
 
+    // The timer callback should return 0 on success, and -1 on error.
     return 0;
 }
 
@@ -435,6 +520,11 @@ void ConnectionFromClient::check_active_requests()
             continue;
         }
 
+        if (reinterpret_cast<uintptr_t>(application_private) & aia_fetch_private_tag) {
+            complete_aia_fetch(msg->easy_handle, msg->data.result);
+            continue;
+        }
+
         ++completions_drained;
         auto* request = static_cast<Request*>(application_private);
         request->notify_fetch_complete({}, msg->data.result);
@@ -442,6 +532,153 @@ void ConnectionFromClient::check_active_requests()
 
     if (completions_drained > 1)
         dbgln_if(REQUESTSERVER_WIRE_DEBUG, "RequestServer wire-batch: drained {} completions in one curl multi tick", completions_drained);
+}
+
+static size_t aia_write_body(char* data, size_t size, size_t count, void* user_data)
+{
+    auto& fetch = *static_cast<AIAFetch*>(user_data);
+    auto const length = size * count;
+    if (fetch.body.size() + length > max_aia_response_size)
+        return 0;
+    if (fetch.body.try_append(data, length).is_error())
+        return 0;
+    return length;
+}
+
+void ConnectionFromClient::fetch_aia_intermediate(Badge<Request>, ByteString const& url, u64 for_request_id)
+{
+    for (auto& in_flight : m_aia_fetches) {
+        if (in_flight.value->url == url) {
+            in_flight.value->request_ids.append(for_request_id);
+            return;
+        }
+    }
+
+    // The lookup below is async, so m_aia_fetches has no entry yet; this is what stops a second request for the
+    // same URL from starting a duplicate lookup in the meantime.
+    if (auto pending = m_pending_aia_lookups.get(url); pending.has_value()) {
+        m_pending_aia_lookups.ensure(url).append(for_request_id);
+        return;
+    }
+    m_pending_aia_lookups.set(url, { for_request_id });
+
+    auto parsed = URL::Parser::basic_parse(url);
+    if (!parsed.has_value() || parsed->serialized_host().is_empty()) {
+        abandon_aia_lookup(url);
+        return;
+    }
+    auto host = parsed->serialized_host().to_byte_string();
+    auto port = parsed->port_or_default();
+    auto weak_self = make_weak_ptr<ConnectionFromClient>();
+
+    // Resolve through RequestServer's own resolver rather than letting curl do it, so the AIA fetch honors the
+    // same DNS configuration (DoH included) as every other request this process makes.
+    m_resolver->dns.lookup(host, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA })
+        ->when_rejected([weak_self, url](auto const& error) {
+            if (auto self = weak_self.strong_ref()) {
+                dbgln_if(REQUESTSERVER_DEBUG, "AIA: DNS lookup failed for {}: {}", url, error);
+                self->abandon_aia_lookup(url);
+            }
+        })
+        .when_resolved([weak_self, url, host, port](auto const& dns_result) {
+            auto self = weak_self.strong_ref();
+            if (!self)
+                return;
+            if (dns_result->is_empty() || !dns_result->has_cached_addresses()) {
+                dbgln_if(REQUESTSERVER_DEBUG, "AIA: DNS lookup returned no addresses for {}", url);
+                self->abandon_aia_lookup(url);
+                return;
+            }
+            self->start_aia_fetch(url, build_curl_resolve_list(*dns_result, host, port));
+        });
+}
+
+// Nothing will arrive to wake the waiting requests, so release them to retry without the intermediate.
+void ConnectionFromClient::abandon_aia_lookup(ByteString const& url)
+{
+    auto waiting = m_pending_aia_lookups.take(url);
+    if (!waiting.has_value())
+        return;
+    for (auto request_id : *waiting) {
+        if (auto request = m_active_requests.get(request_id); request.has_value())
+            (*request)->retry_after_aia({});
+    }
+}
+
+void ConnectionFromClient::start_aia_fetch(ByteString const& url, ByteString resolve_entry)
+{
+    auto waiting = m_pending_aia_lookups.take(url);
+    if (!waiting.has_value() || waiting->is_empty())
+        return;
+
+    auto* easy_handle = curl_easy_init();
+    if (!easy_handle) {
+        for (auto request_id : *waiting) {
+            if (auto request = m_active_requests.get(request_id); request.has_value())
+                (*request)->retry_after_aia({});
+        }
+        return;
+    }
+
+    auto fetch = make<AIAFetch>();
+    fetch->url = url;
+    fetch->request_ids = move(*waiting);
+
+    auto set_option = [&](auto option, auto value) {
+        if (auto result = curl_easy_setopt(easy_handle, option, value); result != CURLE_OK)
+            dbgln("RequestServer: AIA fetch failed to set curl option: {}", curl_easy_strerror(result));
+    };
+    set_option(CURLOPT_PRIVATE, reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(fetch.ptr()) | aia_fetch_private_tag));
+    set_option(CURLOPT_URL, url.characters());
+    set_option(CURLOPT_PROTOCOLS_STR, "http");
+    set_option(CURLOPT_REDIR_PROTOCOLS_STR, "http");
+    set_option(CURLOPT_FOLLOWLOCATION, 1L);
+    set_option(CURLOPT_MAXREDIRS, 5L);
+    set_option(CURLOPT_TIMEOUT, 10L);
+    set_option(CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(max_aia_response_size));
+    set_option(CURLOPT_NOSIGNAL, 1L);
+    set_option(CURLOPT_WRITEFUNCTION, aia_write_body);
+    set_option(CURLOPT_WRITEDATA, fetch.ptr());
+
+    if (curl_slist* resolve_list = curl_slist_append(nullptr, resolve_entry.characters())) {
+        set_option(CURLOPT_RESOLVE, resolve_list);
+        fetch->resolve_list = resolve_list;
+    }
+
+    auto result = curl_multi_add_handle(m_curl_multi, easy_handle);
+    VERIFY(result == CURLM_OK);
+
+    m_aia_fetches.set(easy_handle, move(fetch));
+}
+
+void ConnectionFromClient::complete_aia_fetch(void* easy_handle, int result_code)
+{
+    long response_code = 0;
+    curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
+
+    auto fetch = m_aia_fetches.take(easy_handle);
+    curl_multi_remove_handle(m_curl_multi, easy_handle);
+    curl_easy_cleanup(easy_handle);
+    if (!fetch.has_value())
+        return;
+
+    // curl only reads the resolve list while the handle is attached, so it outlives the handle and is freed here.
+    if ((*fetch)->resolve_list)
+        curl_slist_free_all((*fetch)->resolve_list);
+
+    bool added = false;
+    if (result_code == CURLE_OK && response_code == 200)
+        added = add_fetched_aia_intermediate((*fetch)->body.bytes());
+
+    if (!added) {
+        dbgln_if(REQUESTSERVER_DEBUG, "AIA: intermediate fetch from {} failed (curl={}, status={})", (*fetch)->url, result_code, response_code);
+        mark_aia_url_failed((*fetch)->url);
+    }
+
+    for (auto request_id : (*fetch)->request_ids) {
+        if (auto request = m_active_requests.get(request_id); request.has_value())
+            (*request)->retry_after_aia({});
+    }
 }
 
 void ConnectionFromClient::fail_websocket(u64 websocket_id, Requests::WebSocket::Error error)
@@ -458,6 +695,9 @@ Messages::RequestServer::StopRequestResponse ConnectionFromClient::stop_request(
         dbgln("StopRequest: Request ID {} not found", request_id);
         return false;
     }
+
+    if ((*request)->transfer_lease().has_value())
+        m_request_transfer_leases.remove(*(*request)->transfer_lease());
 
     return true;
 }
@@ -476,9 +716,15 @@ void ConnectionFromClient::ensure_connection(u64 request_id, URL::URL url, ::Req
     m_active_requests.set(request_id, move(request));
 }
 
-void ConnectionFromClient::retrieved_http_cookie(int client_id, u64 request_id, RequestServer::RequestType request_type, String cookie)
+void ConnectionFromClient::retrieved_http_cookie(int client_id, u64 request_id, RequestServer::RequestType request_type, u64 cookie_request_id, String cookie)
 {
     note_event_tick("ipc-retrieved-cookie"sv);
+
+    if (g_primary_connection != this) {
+        did_misbehave("Non-primary connection sent an HTTP cookie response");
+        return;
+    }
+
     if (auto connection = m_connections.get(client_id); connection.has_value()) {
         auto request = [&]() {
             switch (request_type) {
@@ -487,13 +733,14 @@ void ConnectionFromClient::retrieved_http_cookie(int client_id, u64 request_id, 
             case RequestType::BackgroundRevalidation:
                 return (*connection)->m_active_revalidation_requests.get(request_id);
             case RequestType::Connect:
-                break;
+                did_misbehave("HTTP cookie response has an invalid request type");
+                return decltype((*connection)->m_active_requests.get(request_id)) {};
             }
             VERIFY_NOT_REACHED();
         }();
 
-        if (request.has_value())
-            (*request)->notify_retrieved_http_cookie({}, cookie);
+        if (request.has_value() && !(*request)->notify_retrieved_http_cookie({}, cookie_request_id, cookie))
+            did_misbehave("Duplicate or unexpected HTTP cookie response");
     }
 }
 
@@ -507,10 +754,12 @@ void ConnectionFromClient::estimate_cache_size_accessed_since(u64 cache_size_est
     async_estimated_cache_size(cache_size_estimation_id, sizes);
 }
 
-void ConnectionFromClient::remove_cache_entries_accessed_since(UnixDateTime since)
+void ConnectionFromClient::remove_cache_entries_accessed_since(u64 clear_cache_request_id, UnixDateTime since)
 {
     if (m_disk_cache.has_value())
         m_disk_cache->remove_entries_accessed_since(since);
+
+    async_removed_cache_entries(clear_cache_request_id);
 }
 
 Messages::RequestServer::StoreCacheAssociatedDataResponse ConnectionFromClient::store_cache_associated_data(URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data, Core::AnonymousBuffer data)

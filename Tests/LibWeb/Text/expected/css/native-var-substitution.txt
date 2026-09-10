@@ -3,10 +3,12 @@ height: 7px
 cycle fallback: 3px
 fallback inside cycle ignored: rgb(255, 0, 0)
 fallback outside cycle used: rgb(0, 0, 255)
-native parse callback used: true
-C++ resolver unused: true
+native callback-free parses: true
+native callback parse requests: 0
 registered width: 9px
 unregistered height: 11px
 registered universal initial: 13px
-registered value used C++ resolver: true
-unregistered value used native parser: true
+registered callback-free parses: true
+registered callback parse requests: 0
+string-bearing family: LadybirdCallbackFallback
+string-bearing callback parse requests: 0

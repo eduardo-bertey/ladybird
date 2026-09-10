@@ -6,9 +6,10 @@
  */
 
 #include "CanvasTextDrawingStyles.h"
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/FontStyleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
@@ -92,7 +93,7 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
     auto computed_math_depth = CSS::InitialValues::math_depth();
 
     // FIXME: We will need to absolutize this once we support ident() functions
-    auto& font_family = *font_style_value.longhand(CSS::PropertyID::FontFamily);
+    auto font_family = font_style_value.longhand(CSS::PropertyID::FontFamily);
 
     Optional<DOM::AbstractElement> inheritance_parent;
 
@@ -101,7 +102,7 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
 
         if (canvas_element.navigable() && canvas_element.is_connected()) {
             // NOTE: Since we can't set a math depth directly here we always use the inherited value for the computed value
-            computed_math_depth = canvas_element.computed_values()->math_depth();
+            computed_math_depth = canvas_element.template style_group<CSS::ComputedValues::FontValues>()->math_depth;
 
             // NOTE: The canvas itself is considered the inheritance parent
             inheritance_parent = canvas_element;
@@ -140,7 +141,7 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
         },
         {
             // Set explicitly
-            font_family,
+            *font_family,
             computed_font_size,
             computed_font_width,
             computed_font_style,
@@ -167,8 +168,9 @@ void CanvasTextDrawingStyles<CanvasType>::set_font(Utf16View font)
 
     auto font_list = font_source.visit(
         [&](DOM::Document* document) -> RefPtr<Gfx::FontCascadeList const> {
+            drawing_state().font_environment_generation = document->font_computer().environment_generation();
             return document->font_computer().compute_font_for_style_values(
-                font_family,
+                *font_family,
                 computed_font_size->as_length().length().absolute_length_to_px(),
                 computed_font_style->as_font_style().to_font_slope(),
                 computed_font_weight->as_number().number(),

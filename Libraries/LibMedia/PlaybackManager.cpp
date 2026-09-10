@@ -6,9 +6,8 @@
 
 #include <AK/HashMap.h>
 #include <AK/NeverDestroyed.h>
-#include <LibMedia/Containers/Matroska/MatroskaDemuxer.h>
 #include <LibMedia/Demuxer.h>
-#include <LibMedia/FFmpeg/FFmpegDemuxer.h>
+#include <LibMedia/DemuxerRegistry.h>
 #include <LibMedia/MonotonicMediaClock.h>
 #include <LibMedia/PlaybackStates/StartingStateHandler.h>
 #include <LibMedia/Processors/AudioMixer.h>
@@ -35,13 +34,6 @@ HashMap<VideoSinkHandle, PlaybackManager*>& video_sink_registrations()
     return *registrations;
 }
 
-}
-
-DecoderErrorOr<NonnullRefPtr<Demuxer>> PlaybackManager::create_demuxer_for_stream(NonnullRefPtr<MediaStream> const& stream)
-{
-    if (Matroska::Reader::is_matroska_or_webm(stream->create_cursor()))
-        return Matroska::MatroskaDemuxer::from_stream(stream);
-    return FFmpeg::FFmpegDemuxer::from_stream(stream);
 }
 
 DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlaybackManager const& self, NonnullRefPtr<Demuxer> const& demuxer, Core::EventLoop& main_thread_event_loop)
@@ -133,8 +125,7 @@ DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlayback
                 return;
             self->update_duration_from_scan_states();
             self->update_pipeline_state();
-            if (self->on_buffered_ranges_change)
-                self->on_buffered_ranges_change();
+            self->dispatch_buffered_ranges_change();
         });
         self->update_duration_from_scan_states();
 
@@ -215,7 +206,7 @@ void PlaybackManager::add_media_source(NonnullRefPtr<MediaStream> const& stream)
     auto& main_thread_event_loop = Core::EventLoop::current();
 
     Threading::ThreadPool::the().submit([self = move(self), stream, &main_thread_event_loop] mutable {
-        auto demuxer_or_error = create_demuxer_for_stream(stream);
+        auto demuxer_or_error = create_demuxer(stream);
         if (demuxer_or_error.is_error()) {
             handle_media_init_error(move(self), main_thread_event_loop, demuxer_or_error.release_error());
             return;
@@ -389,6 +380,14 @@ void PlaybackManager::check_for_duration_change(AK::Duration duration)
         on_duration_change(m_duration);
 }
 
+void PlaybackManager::set_duration(AK::Duration duration)
+{
+    if (m_duration == duration)
+        return;
+    m_duration = duration;
+    dispatch_buffered_ranges_change();
+}
+
 void PlaybackManager::dispatch_error(DecoderError&& error)
 {
     VERIFY(error.category() != DecoderErrorCategory::EndOfStream);
@@ -398,6 +397,12 @@ void PlaybackManager::dispatch_error(DecoderError&& error)
     m_is_in_error_state = true;
     if (on_error)
         on_error(move(error));
+}
+
+void PlaybackManager::dispatch_buffered_ranges_change()
+{
+    if (on_buffered_ranges_change)
+        on_buffered_ranges_change();
 }
 
 void PlaybackManager::set_clock(NonnullRefPtr<MediaClock> const& clock)
@@ -444,6 +449,7 @@ void PlaybackManager::attach_video_sink(VideoTrackData& track_data, NonnullRefPt
     MUST(video_sink->connect_input(track_data.producer));
     track_data.video_sink = move(video_sink);
     update_pipeline_state();
+    dispatch_buffered_ranges_change();
 }
 
 VideoSinkHandle PlaybackManager::reserve_video_sink_handle(Track const& track)
@@ -477,6 +483,7 @@ void PlaybackManager::disable_video_sink_by_handle(VideoSinkHandle handle)
     }
     track_data->handle = {};
     update_pipeline_state();
+    dispatch_buffered_ranges_change();
 }
 
 void PlaybackManager::set_video_sink_ticking(VideoSinkHandle handle, bool ticking)
@@ -491,7 +498,7 @@ void PlaybackManager::set_video_sink_ticking(VideoSinkHandle handle, bool tickin
     manager->update_pipeline_state();
 }
 
-void PlaybackManager::detach_lost_video_sink(VideoSinkHandle handle)
+void PlaybackManager::detach_video_sink(VideoSinkHandle handle)
 {
     auto* track_data = find_video_data_for_handle(handle);
     if (!track_data)
@@ -502,6 +509,7 @@ void PlaybackManager::detach_lost_video_sink(VideoSinkHandle handle)
     }
     track_data->sink_status = PipelineStatus::Pending;
     update_pipeline_state();
+    dispatch_buffered_ranges_change();
 }
 
 ErrorOr<PlaybackManager::RemoteVideoEdge> PlaybackManager::create_video_edge(VideoSinkHandle handle, RemoteVideoSink::Delegates delegates)
@@ -541,12 +549,15 @@ RefPtr<VideoFrame> PlaybackManager::current_presented_frame(VideoSinkHandle hand
     return track_data.video_sink->current_frame();
 }
 
-void PlaybackManager::release_video_edge(VideoSinkHandle handle)
+void PlaybackManager::release_video_edge(VideoSinkHandle handle, VideoSink const& released_sink)
 {
     auto* manager = video_sink_registrations().get(handle).value_or(nullptr);
     if (!manager)
         return;
-    manager->disable_video_sink_by_handle(handle);
+    auto* track_data = manager->find_video_data_for_handle(handle);
+    if (!track_data || track_data->video_sink != &released_sink)
+        return;
+    manager->detach_video_sink(handle);
 }
 
 void PlaybackManager::enable_an_audio_track(Track const& track)
@@ -560,6 +571,7 @@ void PlaybackManager::enable_an_audio_track(Track const& track)
     }
     track_data.enabled = true;
     update_pipeline_state();
+    dispatch_buffered_ranges_change();
 }
 
 void PlaybackManager::disable_an_audio_track(Track const& track)
@@ -573,6 +585,7 @@ void PlaybackManager::disable_an_audio_track(Track const& track)
     }
     track_data.enabled = false;
     update_pipeline_state();
+    dispatch_buffered_ranges_change();
 }
 
 bool PlaybackManager::track_is_enabled(Track const& track) const
@@ -628,6 +641,7 @@ AvailableData PlaybackManager::available_data()
 TimeRanges PlaybackManager::buffered_time_ranges() const
 {
     TimeRanges intersection { { AK::Duration::zero(), m_duration } };
+    bool any_track_contributed_ranges = false;
 
     for (auto const& demuxer : m_demuxers) {
         for (auto const& track_state : demuxer->scan_state().tracks) {
@@ -639,8 +653,12 @@ TimeRanges PlaybackManager::buffered_time_ranges() const
             if (track_state.reached_end_of_stream && !track_ranges.is_empty())
                 track_ranges.add_range(track_ranges[track_ranges.size() - 1].start, m_duration);
             intersection = intersection.intersection(track_ranges);
+            any_track_contributed_ranges = true;
         }
     }
+
+    if (!any_track_contributed_ranges)
+        return {};
 
     return intersection;
 }

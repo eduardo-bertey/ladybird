@@ -47,7 +47,7 @@ public:
         other.m_value = { .short_ascii_string = ShortString::create_empty() };
     }
 
-    constexpr ~Utf16StringBase()
+    ALWAYS_INLINE constexpr ~Utf16StringBase()
     {
         if !consteval {
             destroy_string();
@@ -341,10 +341,19 @@ public:
 
     [[nodiscard]] constexpr FlatPtr raw(Badge<Utf16FlyString>) const { return raw(); }
 
+    template<OneOf<Utf16String, Utf16FlyString> T>
+    [[nodiscard]] constexpr FlatPtr leak_raw(Badge<T>)
+    {
+        auto raw_value = raw();
+        m_value = { .short_ascii_string = ShortString::create_empty() };
+        return raw_value;
+    }
+
     // NB: Adopts a raw value previously produced by raw(), together with ownership of one
     //     reference to its data if it has long storage. For FFI bridges that retain the raw
     //     representation of a string.
-    [[nodiscard]] ALWAYS_INLINE static Utf16StringBase adopt_raw(Badge<Utf16FlyString>, FlatPtr raw)
+    template<OneOf<Utf16String, Utf16FlyString> T>
+    [[nodiscard]] ALWAYS_INLINE static Utf16StringBase adopt_raw(Badge<T>, FlatPtr raw)
     {
         Utf16StringBase string;
         auto const** data = __builtin_launder(&string.m_value.data);

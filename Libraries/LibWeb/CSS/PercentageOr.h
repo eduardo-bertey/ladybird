@@ -64,7 +64,10 @@ public:
 
     CSSPixels to_px(CSSPixels reference_value) const
     {
-        return resolved(reference_value).absolute_length_to_px();
+        if (!is_calculated())
+            return resolved(reference_value).absolute_length_to_px();
+        auto resolved_length = calculated()->resolve_length({ .percentage_basis = Length::make_px(reference_value) }).value();
+        return CSSPixels::truncated_value_for(resolved_length.absolute_length_to_px_without_rounding());
     }
 
     Length resolved(CSSPixels reference_value) const
@@ -187,13 +190,6 @@ public:
     Length length() const { return m_length_percentage->length(); }
     Percentage percentage() const { return m_length_percentage->percentage(); }
     ValueComparingNonnullRefPtr<CalculatedStyleValue const> calculated() const { return m_length_percentage->calculated(); }
-
-    LengthOrAuto resolved_or_auto(CSSPixels reference_value) const
-    {
-        if (is_auto())
-            return LengthOrAuto::make_auto();
-        return length_percentage().resolved(reference_value);
-    }
 
     CSSPixels to_px_or_zero(CSSPixels reference_value) const
     {

@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/FixedArray.h>
-#include <LibGfx/YUVData.h>
+#include <LibMedia/Demuxer.h>
+#include <LibMedia/DemuxerRegistry.h>
 #include <LibMedia/FFmpeg/FFmpegDemuxer.h>
 #include <LibMedia/FFmpeg/FFmpegVideoDecoder.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
@@ -22,6 +22,47 @@ TEST_CASE(avc_in_matroska)
     decode_video("./avc_in_matroska.mkv"sv, 50, make_decoder);
 }
 
+struct DemuxerAndVideoTrack {
+    NonnullRefPtr<Media::Demuxer> demuxer;
+    Media::Track track;
+};
+
+static DemuxerAndVideoTrack create_demuxer_and_video_track(StringView path)
+{
+    auto file = MUST(Core::File::open(path, Core::File::OpenMode::Read));
+    auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
+    auto demuxer = MUST(Media::create_demuxer(stream));
+    auto track = MUST(demuxer->get_preferred_track_for_type(Media::TrackType::Video));
+    VERIFY(track.has_value());
+    MUST(demuxer->create_context_for_track(*track));
+    return { move(demuxer), track.release_value() };
+}
+
+TEST_CASE(h264_configuration_change)
+{
+    auto [initial_demuxer, initial_track] = create_demuxer_and_video_track("./avc.mp4"sv);
+    auto initial_sample = MUST(initial_demuxer->get_next_sample_for_track(initial_track));
+    auto decoder = MUST(Media::FFmpeg::FFmpegVideoDecoder::try_create(initial_sample.codec_id(), initial_sample.new_codec_configuration().value()));
+
+    auto [new_demuxer, new_track] = create_demuxer_and_video_track("./vfr.mkv"sv);
+
+    bool decoded_frame = false;
+    while (!decoded_frame) {
+        auto sample = MUST(new_demuxer->get_next_sample_for_track(new_track));
+        MUST(decoder->receive_coded_data(sample, Media::DecodeIntent::Output));
+
+        while (true) {
+            auto decoded_frame_result = decoder->take_next_output(new_track.video_data().cicp);
+            if (decoded_frame_result.is_error()) {
+                EXPECT_EQ(decoded_frame_result.error().category(), Media::DecoderErrorCategory::NeedsMoreInput);
+                break;
+            }
+            EXPECT_EQ(decoded_frame_result.value()->size(), Gfx::Size<u32>(1280, 720));
+            decoded_frame = true;
+        }
+    }
+}
+
 TEST_CASE(avc_in_mp4_with_reordered_frames)
 {
     auto file = MUST(Core::File::open("./avc.mp4"sv, Core::File::OpenMode::Read));
@@ -32,27 +73,19 @@ TEST_CASE(avc_in_mp4_with_reordered_frames)
     auto track = optional_track.release_value();
     MUST(demuxer->create_context_for_track(track));
 
-    auto codec_id = MUST(demuxer->get_codec_id_for_track(track));
-    auto codec_initialization_data = MUST(demuxer->get_codec_initialization_data_for_track(track));
-    auto decoder = MUST(Media::FFmpeg::FFmpegVideoDecoder::try_create(codec_id, codec_initialization_data));
+    auto first_sample = MUST(demuxer->get_next_sample_for_track(track));
+    auto decoder = MUST(Media::FFmpeg::FFmpegVideoDecoder::try_create(first_sample.codec_id(), first_sample.new_codec_configuration().value()));
+    MUST(decoder->receive_coded_data(first_sample, Media::DecodeIntent::Output));
 
     size_t frame_count = 0;
     auto last_timestamp = AK::Duration::min();
 
     auto take_decoded_frame = [&]() -> Media::DecoderErrorOr<void> {
-        auto metadata = TRY(decoder->peek_next_output(track.video_data().cicp));
+        auto decoded_frame = TRY(decoder->take_next_output(track.video_data().cicp));
 
-        auto plane_sizes = MUST(Gfx::YUVData::plane_sizes(metadata.size, metadata.bit_depth, metadata.subsampling));
-        auto storage = MUST(FixedArray<u8>::create(plane_sizes.total));
-        auto yuv_data = MUST(Gfx::YUVData::create(metadata.size, metadata.bit_depth, metadata.subsampling, metadata.cicp,
-            storage.span().slice(0, plane_sizes.y),
-            storage.span().slice(plane_sizes.y, plane_sizes.u),
-            storage.span().slice(plane_sizes.y + plane_sizes.u, plane_sizes.v)));
-        MUST(decoder->take_next_output_into(yuv_data));
-
-        EXPECT(last_timestamp <= metadata.timestamp);
-        EXPECT(!metadata.duration.is_zero());
-        last_timestamp = metadata.timestamp;
+        EXPECT(last_timestamp <= decoded_frame->timestamp());
+        EXPECT(!decoded_frame->duration().is_zero());
+        last_timestamp = decoded_frame->timestamp();
         ++frame_count;
         return {};
     };
@@ -67,7 +100,7 @@ TEST_CASE(avc_in_mp4_with_reordered_frames)
         auto sample = sample_result.release_value();
         EXPECT(!sample.duration().is_zero());
 
-        MUST(decoder->receive_coded_data(sample.timestamp(), sample.duration(), sample.data()));
+        MUST(decoder->receive_coded_data(sample, Media::DecodeIntent::Output));
         while (true) {
             auto frame_result = take_decoded_frame();
             if (frame_result.is_error()) {
@@ -87,4 +120,41 @@ TEST_CASE(avc_in_mp4_with_reordered_frames)
     }
 
     EXPECT_EQ(frame_count, 50u);
+}
+
+TEST_CASE(h264_reference_only_frames_are_decoded_but_not_produced)
+{
+    auto [demuxer, track] = create_demuxer_and_video_track("./avc.mp4"sv);
+
+    auto first_sample = MUST(demuxer->get_next_sample_for_track(track));
+    auto decoder = MUST(Media::FFmpeg::FFmpegVideoDecoder::try_create(first_sample.codec_id(), first_sample.new_codec_configuration().value()));
+
+    Vector<AK::Duration> presented_timestamps;
+    auto drain = [&] {
+        while (true) {
+            auto decoded_frame_result = decoder->take_next_output(track.video_data().cicp);
+            if (decoded_frame_result.is_error())
+                return;
+            presented_timestamps.append(decoded_frame_result.value()->timestamp());
+        }
+    };
+
+    // Only the last of these frames is wanted for display; the rest are decoded so it has something to reference.
+    static constexpr size_t REFERENCE_ONLY_SAMPLE_COUNT = 8;
+    MUST(decoder->receive_coded_data(first_sample, Media::DecodeIntent::Reference));
+    drain();
+    for (size_t index = 1; index < REFERENCE_ONLY_SAMPLE_COUNT; index++) {
+        auto sample = MUST(demuxer->get_next_sample_for_track(track));
+        MUST(decoder->receive_coded_data(sample, Media::DecodeIntent::Reference));
+        drain();
+    }
+
+    auto wanted_sample = MUST(demuxer->get_next_sample_for_track(track));
+    auto wanted_timestamp = wanted_sample.presentation_timestamp();
+    MUST(decoder->receive_coded_data(wanted_sample, Media::DecodeIntent::Output));
+    decoder->signal_end_of_stream();
+    drain();
+
+    EXPECT_EQ(presented_timestamps.size(), 1u);
+    EXPECT_EQ(presented_timestamps.first(), wanted_timestamp);
 }

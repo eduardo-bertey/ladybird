@@ -10,9 +10,12 @@
 #include <LibGC/Ptr.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibURL/URL.h>
+#include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/CrossProcessId.h>
+#include <LibWeb/HTML/NavigateParams.h>
+#include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::HTML {
 
@@ -28,18 +31,44 @@ public:
 
     GC::Ptr<Navigable> parent() const { return m_parent; }
 
-    bool is_ancestor_of(GC::Ref<Navigable>) const;
+    bool is_ancestor_of(Navigable const&) const;
+
+    virtual bool has_been_destroyed() const = 0;
 
     virtual GC::Ptr<WindowProxy> active_window_proxy() = 0;
     virtual Utf16String const& target_name() const = 0;
+    virtual bool is_traversable() const { return false; }
+    GC::Ref<Navigable> traversable_navigable();
     GC::Ref<Navigable> top_level_traversable();
+    virtual bool is_top_level_traversable() const { return false; }
     virtual Optional<URL::URL> active_document_url() const = 0;
     virtual Optional<URL::Origin> active_document_origin() const = 0;
+    virtual bool active_document_is_fully_active() const = 0;
+    virtual bool active_document_is(DOM::Document const&) const = 0;
+
+    virtual Optional<URL::URL> active_document_top_level_creation_url() const = 0;
+    virtual Optional<URL::Origin> active_document_top_level_origin() const = 0;
+    virtual bool active_document_has_cross_site_ancestor() const = 0;
+
+    virtual bool has_session_history_entry_and_ready_for_navigation() const = 0;
+    virtual bool delays_the_load_event_of_its_container() const = 0;
+
+    WebIDL::ExceptionOr<void> navigate(NavigateParams);
+
+    bool allowed_by_sandboxing_to_navigate(Navigable const& target, SourceSnapshotParams const&) const;
 
 protected:
     Navigable() = default;
     void set_id(CrossProcessId id) { m_id = id; }
     void set_parent(GC::Ptr<Navigable> parent) { m_parent = parent; }
+
+    virtual WebIDL::ExceptionOr<void> continue_navigation_in_active_document_agent(
+        NavigateParams,
+        ContentSecurityPolicy::Directives::Directive::NavigationType,
+        GC::Ref<SourceSnapshotParams>,
+        URL::Origin initiator_origin_snapshot,
+        URL::URL initiator_base_url_snapshot)
+        = 0;
 
     virtual void visit_edges(Cell::Visitor&) override;
 

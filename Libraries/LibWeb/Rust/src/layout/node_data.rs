@@ -5,16 +5,19 @@
  */
 
 use crate::layout::CssPixels;
+use std::cell::Cell;
 use std::ffi::c_void;
 
 pub const INVALID_NODE_SLOT_INDEX: u32 = u32::MAX;
+pub const GENERATED_FOR_AFTER: u8 = 1;
+pub const GENERATED_FOR_FIRST_LETTER: u8 = 4;
 pub const GENERATED_FOR_MARKER: u8 = 6;
 
 // The full C++ StyleGroupIndex space; LayoutRustBridge.cpp static-asserts the
 // count so the style container array and the registered group indices line up.
 pub const STYLE_GROUP_COUNT: usize = 23;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct FfiReplacedContentFacts {
     pub has_auto_content_width: bool,
@@ -126,7 +129,6 @@ pub enum NodeKind {
     TextAreaBox = 33,
     TextInputBox = 34,
     TextNode = 35,
-    TextSliceNode = 36,
     VideoBox = 37,
     Viewport = 38,
 }
@@ -139,7 +141,10 @@ pub enum NodeFlag {
     ChildrenAreInline = 1 << 2,
     IsFlexItem = 1 << 3,
     IsGridItem = 1 << 4,
-    HasBeenWrappedInTableWrapper = 1 << 5,
+    /// The box is an element's or a pseudo-element's own box, and that element or pseudo-element
+    /// stores a scroll offset other than zero. The overflow update measures such a box eagerly
+    /// after a full commit so the offset can be clamped.
+    HasScrollOffset = 1 << 5,
     IsBody = 1 << 6,
     NeedsLayoutUpdate = 1 << 7,
     NeedsOwnGeometryUpdate = 1 << 8,
@@ -159,49 +164,108 @@ pub enum NodeFlag {
     ProducesLineBoxFragmentWhenEmpty = 1 << 22,
     ListMarkerIsInside = 1 << 23,
     HasAnchorNames = 1 << 24,
+    InsetsUseAnchorFunctions = 1 << 25,
+    HasCommittedFragmentLink = 1 << 26,
+    HasPreserve3dTransformStyle = 1 << 27,
+    IsMissingTableCell = 1 << 28,
+    HasAnimatedOpacityOrTransform = 1 << 29,
+    IsDocumentElement = 1 << 30,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum CompositorAnimationFrameKind {
+    Opacity = 1 << 0,
+    BackgroundColor = 1 << 1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FfiNodeLink {
+    Parent,
+    FirstChild,
+    LastChild,
+    PreviousSibling,
+    NextSibling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DomPaintFact {
+    Inert = 1 << 0,
+    EditableOrEditingHost = 1 << 1,
+    InsideBlockingWheelEventHandler = 1 << 2,
+    NestedNavigableContainer = 1 << 3,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiNodeConstructionFacts {
+    pub kind: NodeKind,
+    pub shell: *mut c_void,
+    pub dom_node: *mut c_void,
+    pub is_anonymous: bool,
+    pub is_html_input_element: bool,
+    pub is_html_html_element: bool,
+    pub is_document_element: bool,
+    pub is_in_user_agent_shadow_tree: bool,
+    pub uses_button_layout: bool,
+    pub is_editing_host: bool,
+    pub is_body: bool,
+    pub dom_paint_facts: u8,
 }
 
 #[repr(C)]
-pub struct NodeData {
-    pub parent: NodeSlotId,
-    pub first_child: NodeSlotId,
-    pub last_child: NodeSlotId,
-    pub previous_sibling: NodeSlotId,
-    pub next_sibling: NodeSlotId,
-    pub containing_block: NodeSlotId,
-    pub inline_containing_block: NodeSlotId,
-    pub kind: NodeKind,
-    pub generated_for: u8,
-    pub intrinsic_cache_epoch: u16,
-    pub flags: u32,
-    pub initial_quote_nesting_level: u32,
-    pub slot_generation: u8,
-    pub table_column_span: u16,
-    pub table_row_span: u16,
-    pub style: *const c_void,
-    pub shell: *mut c_void,
+pub(crate) struct NodeData {
+    pub parent: Cell<NodeSlotId>,
+    pub first_child: Cell<NodeSlotId>,
+    pub last_child: Cell<NodeSlotId>,
+    pub previous_sibling: Cell<NodeSlotId>,
+    pub next_sibling: Cell<NodeSlotId>,
+    pub containing_block: Cell<NodeSlotId>,
+    pub inline_containing_block: Cell<NodeSlotId>,
+    pub kind: Cell<NodeKind>,
+    pub generated_for: Cell<u8>,
+    pub intrinsic_cache_epoch: Cell<u16>,
+    pub flags: Cell<u32>,
+    /// Advanced on every layout invalidation that reaches this node or its
+    /// subtree, with no propagation boundary: unlike the intrinsic epoch,
+    /// changes inside absolutely positioned and SVG descendants must reach
+    /// every ancestor, because their fragments live in ancestor run trees.
+    /// Wide enough that wrapping between a cache store and the next probe
+    /// is unreachable.
+    pub fragment_cache_epoch: Cell<u32>,
+    pub slot_generation: Cell<u8>,
+    pub compositor_animation_frame_kinds: Cell<u8>,
+    pub table_column_span: Cell<u16>,
+    pub table_row_span: Cell<u16>,
+    pub dom_paint_facts: Cell<u8>,
+    pub style: Cell<*const c_void>,
+    pub shell: Cell<*mut c_void>,
 }
 
 impl Default for NodeData {
     fn default() -> Self {
         Self {
-            parent: NodeSlotId::INVALID,
-            first_child: NodeSlotId::INVALID,
-            last_child: NodeSlotId::INVALID,
-            previous_sibling: NodeSlotId::INVALID,
-            next_sibling: NodeSlotId::INVALID,
-            containing_block: NodeSlotId::INVALID,
-            inline_containing_block: NodeSlotId::INVALID,
-            kind: NodeKind::Unset,
-            generated_for: 0,
-            intrinsic_cache_epoch: 0,
-            flags: 0,
-            initial_quote_nesting_level: 0,
-            slot_generation: 0,
-            table_column_span: 1,
-            table_row_span: 1,
-            style: std::ptr::null(),
-            shell: std::ptr::null_mut(),
+            parent: Cell::new(NodeSlotId::INVALID),
+            first_child: Cell::new(NodeSlotId::INVALID),
+            last_child: Cell::new(NodeSlotId::INVALID),
+            previous_sibling: Cell::new(NodeSlotId::INVALID),
+            next_sibling: Cell::new(NodeSlotId::INVALID),
+            containing_block: Cell::new(NodeSlotId::INVALID),
+            inline_containing_block: Cell::new(NodeSlotId::INVALID),
+            kind: Cell::new(NodeKind::Unset),
+            generated_for: Cell::new(0),
+            intrinsic_cache_epoch: Cell::new(0),
+            flags: Cell::new(0),
+            slot_generation: Cell::new(0),
+            compositor_animation_frame_kinds: Cell::new(0),
+            table_column_span: Cell::new(1),
+            table_row_span: Cell::new(1),
+            dom_paint_facts: Cell::new(0),
+            fragment_cache_epoch: Cell::new(0),
+            style: Cell::new(std::ptr::null()),
+            shell: Cell::new(std::ptr::null_mut()),
         }
     }
 }
@@ -213,7 +277,7 @@ mod tests {
     #[test]
     fn node_kind_has_a_stable_default_and_byte_width() {
         assert_eq!(std::mem::size_of::<NodeKind>(), 1);
-        assert_eq!(NodeData::default().kind, NodeKind::Unset);
+        assert_eq!(NodeData::default().kind.get(), NodeKind::Unset);
     }
 
     #[test]
@@ -221,7 +285,12 @@ mod tests {
         assert_eq!(std::mem::size_of::<NodeData>(), 64);
         assert_eq!(std::mem::offset_of!(NodeData, intrinsic_cache_epoch), 30);
         assert_eq!(std::mem::offset_of!(NodeData, flags), 32);
+        assert_eq!(std::mem::offset_of!(NodeData, fragment_cache_epoch), 36);
         assert_eq!(std::mem::offset_of!(NodeData, slot_generation), 40);
+        assert_eq!(std::mem::offset_of!(NodeData, compositor_animation_frame_kinds), 41);
+        assert_eq!(std::mem::offset_of!(NodeData, table_column_span), 42);
+        assert_eq!(std::mem::offset_of!(NodeData, table_row_span), 44);
+        assert_eq!(std::mem::offset_of!(NodeData, dom_paint_facts), 46);
         assert_eq!(std::mem::offset_of!(NodeData, style), 48);
         assert_eq!(std::mem::offset_of!(NodeData, shell), 56);
     }
@@ -251,6 +320,12 @@ mod tests {
     }
 
     #[test]
+    fn committed_fragment_link_flag_uses_a_previously_unassigned_bit() {
+        assert_eq!(NodeFlag::HasCommittedFragmentLink as u32, 1 << 26);
+        assert_eq!(NodeFlag::HasPreserve3dTransformStyle as u32, 1 << 27);
+    }
+
+    #[test]
     fn stamped_fact_flags_use_previously_unassigned_bits() {
         assert_eq!(NodeFlag::IsHtmlInputElement as u32, 1 << 13);
         assert_eq!(NodeFlag::IsHtmlHtmlElement as u32, 1 << 14);
@@ -259,5 +334,6 @@ mod tests {
         assert_eq!(NodeFlag::IsEditingHost as u32, 1 << 17);
         assert_eq!(NodeFlag::ReplacedBoxCanHaveChildren as u32, 1 << 18);
         assert_eq!(NodeFlag::ProducesLineBoxFragmentWhenEmpty as u32, 1 << 22);
+        assert_eq!(NodeFlag::IsDocumentElement as u32, 1 << 30);
     }
 }

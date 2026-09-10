@@ -13,12 +13,18 @@ function(ladybird_generated_sources target_name)
 endfunction()
 
 function(ladybird_testjs_test test_src sub_dir)
-    cmake_parse_arguments(PARSE_ARGV 2 LADYBIRD_TEST "" "CUSTOM_MAIN" "LIBS")
+    cmake_parse_arguments(PARSE_ARGV 2 LADYBIRD_TEST "NO_TEST" "CUSTOM_MAIN;NAME" "LIBS")
     if ("${LADYBIRD_TEST_CUSTOM_MAIN}" STREQUAL "")
         set(LADYBIRD_TEST_CUSTOM_MAIN "$<TARGET_OBJECTS:JavaScriptTestRunnerMain>")
     endif()
     list(APPEND LADYBIRD_TEST_LIBS LibJS LibCore LibFileSystem)
+    set(test_options)
+    if (LADYBIRD_TEST_NO_TEST)
+        list(APPEND test_options NO_TEST)
+    endif()
     ladybird_test(${test_src} ${sub_dir}
+        ${test_options}
+        NAME "${LADYBIRD_TEST_NAME}"
         CUSTOM_MAIN "${LADYBIRD_TEST_CUSTOM_MAIN}"
         LIBS ${LADYBIRD_TEST_LIBS})
 endfunction()
@@ -111,6 +117,27 @@ function(invoke_py_generator name script primary_source header implementation)
         dependencies ${invoke_py_generator_dependencies}
         extra_header "${invoke_py_generator_EXTRA_HEADER}"
     )
+endfunction()
+
+function(invoke_py_header_generator name script primary_source header)
+    cmake_parse_arguments(invoke_py_header_generator "" "" "arguments;dependencies" ${ARGN})
+
+    set(script_path "${LADYBIRD_SOURCE_DIR}/Meta/Generators/${script}")
+    add_custom_command(
+        OUTPUT "${header}"
+        COMMAND ${Python3_EXECUTABLE} "${script_path}"
+                -h "${header}.tmp"
+                ${invoke_py_header_generator_arguments}
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${header}.tmp" "${header}"
+        COMMAND "${CMAKE_COMMAND}" -E remove "${header}.tmp"
+        VERBATIM
+        DEPENDS "${script_path}" ${invoke_py_header_generator_dependencies} "${primary_source}"
+    )
+
+    add_custom_target("generate_${name}" DEPENDS "${header}")
+    add_dependencies(ladybird_codegen_accumulator "generate_${name}")
+    list(APPEND CURRENT_LIB_GENERATED "${name}")
+    set(CURRENT_LIB_GENERATED ${CURRENT_LIB_GENERATED} PARENT_SCOPE)
 endfunction()
 
 function(invoke_idl_generator cpp_name idl_name generator primary_source header implementation idl)

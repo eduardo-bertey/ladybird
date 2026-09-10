@@ -9,10 +9,11 @@
 #include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/DecodedImageFrame.h>
+#include <LibGfx/VideoSurfaceImage.h>
 #include <LibGfx/YUVData.h>
 #include <LibMedia/Sinks/DisplayingVideoSink.h>
 #include <LibMedia/VideoFrame.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibMedia/VideoSurface.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
@@ -28,8 +29,8 @@
 #include <LibWeb/HTML/VideoTrack.h>
 #include <LibWeb/HTML/VideoTrackList.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Layout/VideoBox.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Layout/Box.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Platform/ImageCodecPlugin.h>
 
 namespace Web::HTML {
@@ -72,19 +73,11 @@ void HTMLVideoElement::attribute_changed(Utf16FlyString const& name, Optional<Ut
     }
 }
 
-RefPtr<Layout::Node> HTMLVideoElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+Layout::Node* HTMLVideoElement::create_layout_node(CSS::LayoutStyle style)
 {
-    return make_ref_counted<Layout::VideoBox>(document(), *this, style);
-}
-
-Layout::VideoBox* HTMLVideoElement::layout_node()
-{
-    return static_cast<Layout::VideoBox*>(Node::layout_node());
-}
-
-Layout::VideoBox const* HTMLVideoElement::layout_node() const
-{
-    return static_cast<Layout::VideoBox const*>(Node::layout_node());
+    auto& video_box = Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::VideoBox);
+    video_box.set_replaced_box_can_have_children(shadow_root() != nullptr);
+    return &video_box;
 }
 
 void HTMLVideoElement::set_intrinsic_video_dimensions(Optional<Gfx::Size<u32>> dimensions)
@@ -154,14 +147,17 @@ void HTMLVideoElement::update_natural_dimensions()
     // resource, if that is available; otherwise the natural height is missing.
     auto natural_dimensions = m_intrinsic_video_dimensions.map([](Gfx::Size<u32> size) { return size.to_type<CSSPixels>(); });
 
-    if (current_representation() == Representation::PosterFrame && m_poster_frame)
+    if (current_representation() == Representation::PosterFrame && m_poster_frame.has_value())
         natural_dimensions = m_poster_frame->size().to_type<CSSPixels>();
 
-    if (natural_dimensions == m_natural_dimensions)
+    if (natural_dimensions == m_natural_dimensions) {
+        Painting::push_video_paint_facts(*this);
         return;
+    }
 
     set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLVideoElementNaturalDimensionsChanged);
     m_natural_dimensions = natural_dimensions;
+    Painting::push_video_paint_facts(*this);
 }
 
 Optional<Gfx::Size<u32>> HTMLVideoElement::natural_media_size() const
@@ -184,7 +180,9 @@ WebIDL::ExceptionOr<void> HTMLVideoElement::determine_element_poster_frame(Optio
         m_fetch_controller->stop_fetch();
 
     static constexpr auto finalize = [](HTMLVideoElement& self, RefPtr<Gfx::Bitmap> poster_frame) {
-        self.m_poster_frame = move(poster_frame);
+        self.m_poster_frame.clear();
+        if (poster_frame)
+            self.m_poster_frame = Gfx::DecodedImageFrame { *poster_frame };
         self.m_load_event_delayer.clear();
         self.m_fetch_controller = nullptr;
         self.update_natural_dimensions();
@@ -286,14 +284,14 @@ HTMLVideoElement::Representation HTMLVideoElement::current_representation() cons
     //    but the media resource does not have a video channel)
     if (ready_state() == ReadyState::HaveNothing || video_tracks()->length() == 0) {
         // The video element represents its poster frame, if any, or else transparent black with no intrinsic dimensions.
-        return poster_frame() ? Representation::PosterFrame : Representation::TransparentBlack;
+        return poster_frame().has_value() ? Representation::PosterFrame : Representation::TransparentBlack;
     }
 
     // -> When the video element is paused, the current playback position is the first frame of video, and the element's
     //    show poster flag is set
     if (paused() && current_playback_position() == 0 && show_poster()) {
         // The video element represents its poster frame, if any, or else the first frame of the video.
-        return poster_frame() ? Representation::PosterFrame : Representation::FirstVideoFrame;
+        return poster_frame().has_value() ? Representation::PosterFrame : Representation::FirstVideoFrame;
     }
 
     // -> When the video element is paused, and the frame of video corresponding to the current playback position
@@ -329,14 +327,24 @@ Optional<Gfx::DecodedImageFrame> HTMLVideoElement::current_decoded_image_frame()
     auto current_frame = current_presented_frame();
     if (!current_frame)
         return {};
-    auto bitmap_or_error = current_frame->yuv_data().to_bitmap();
+
+    auto bitmap_or_error = [&] -> ErrorOr<NonnullRefPtr<Gfx::Bitmap>> {
+#ifdef AK_OS_MACOS
+        if (auto surface = current_frame->surface())
+            return Gfx::bitmap_from_video_surface(surface->io_surface(), current_frame->cicp());
+#endif
+        auto yuv_data = current_frame->yuv_data();
+        if (!yuv_data.has_value())
+            return Error::from_string_literal("Video frame has no pixels to read");
+        return yuv_data->to_bitmap();
+    }();
     if (bitmap_or_error.is_error()) {
         dbgln("Could not convert video frame to bitmap: {}", bitmap_or_error.release_error());
         return {};
     }
     auto bitmap = bitmap_or_error.release_value();
     auto color_space = Gfx::ColorSpace {};
-    if (auto color_space_result = Gfx::ColorSpace::from_cicp(current_frame->yuv_data().cicp()); !color_space_result.is_error())
+    if (auto color_space_result = Gfx::ColorSpace::from_cicp(current_frame->cicp()); !color_space_result.is_error())
         color_space = color_space_result.release_value();
     return Gfx::DecodedImageFrame { NonnullRefPtr<Gfx::Bitmap const> { *bitmap }, move(color_space) };
 }

@@ -5,6 +5,7 @@
  */
 
 #include <LibCore/ArgsParser.h>
+#include <LibCore/CrashHandler.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
@@ -18,15 +19,18 @@
 #include <LibRequests/RequestClient.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
-#include <LibWeb/HTML/UniversalGlobalScope.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
-#include <LibWeb/Platform/FontPlugin.h>
 #include <LibWebView/Plugins/ImageCodecPlugin.h>
 #include <LibWebView/Utilities.h>
 #include <Services/RendererSandbox.h>
 #include <WebWorker/ConnectionFromClient.h>
+
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+#    include <LibWasmCompilerClient/State.h>
+#endif
 
 #include <openssl/thread.h>
 
@@ -60,7 +64,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     bool file_origins_are_tuple_origins = false;
     bool disable_sandbox = false;
 
+    int crash_report_fd = -1;
     Core::ArgsParser args_parser;
+    args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
     args_parser.add_option(serenity_resource_root, "Absolute path to directory for serenity resources", "serenity-resource-root", 'r', "serenity-resource-root");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
     args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
@@ -73,6 +79,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
 
     args_parser.parse(arguments);
+
+    if (crash_report_fd >= 0) {
+        if (auto result = Core::CrashHandler::initialize(crash_report_fd); result.is_error())
+            warnln("Could not install crash report handler: {}", result.error());
+    }
 
     if (wait_for_debugger)
         Core::Process::wait_for_debugger_and_break();
@@ -91,11 +102,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     OPENSSL_TRY(OSSL_set_max_threads(nullptr, Core::System::hardware_concurrency()));
 
-    Web::HTML::UniversalGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
+    Web::HTML::WindowOrWorkerGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
-
-    Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(false));
 
     Web::Bindings::initialize_main_thread_vm(worker_type);
 
@@ -113,6 +122,14 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         if (auto result = connect_to_image_decoder(handle); result.is_error())
             dbgln("Failed to connect to image decoder: {}", result.error());
     };
+
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    WasmCompilerClient::compiler_state().install_compiler_callback();
+
+    client->on_wasm_compiler_connection = [](auto handle) {
+        WasmCompilerClient::compiler_state().replace_connection(move(handle));
+    };
+#endif
 
     return event_loop.exec();
 }

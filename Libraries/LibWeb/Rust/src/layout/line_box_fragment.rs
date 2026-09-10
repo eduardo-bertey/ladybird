@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use super::*;
+
 pub(crate) const GLYPH_TEXT_TYPE_COMMON: u8 = 0;
 pub(crate) const GLYPH_TEXT_TYPE_CONTEXT_DEPENDENT: u8 = 1;
 pub(crate) const GLYPH_TEXT_TYPE_END_PADDING: u8 = 2;
@@ -14,10 +16,10 @@ pub(crate) fn is_ascii_space(code_unit: u16) -> bool {
     matches!(code_unit, 0x09..=0x0d | 0x20)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct GlyphData {
-    pub(crate) glyphs: Vec<FfiDrawGlyph>,
-    pub(crate) font: *const c_void,
+    pub(crate) glyphs: Vec<libgfx_rust::text_layout::DrawGlyph>,
+    pub(crate) font: libgfx_rust::font::FontHandle,
     pub(crate) text_type: u8,
     // GlyphRun::width is not updated by the C++ fragment merge machine.
     pub(crate) width: f32,
@@ -25,38 +27,25 @@ pub(crate) struct GlyphData {
 
 // The advance of a run's trailing whitespace, recorded at shaping time so that trimming it subtracts exactly what
 // shaping added.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TrailingWhitespace {
     pub(crate) length_in_code_units: usize,
     pub(crate) inline_size: CssPixels,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct LineBoxFragmentData {
-    pub(crate) layout_node: Node,
-    pub(crate) style_source: Node,
-    pub(crate) start: usize,
-    pub(crate) length_in_code_units: usize,
-    pub(crate) inline_offset: CssPixels,
-    pub(crate) block_offset: CssPixels,
-    pub(crate) relpos_delta: FfiCssPixelPoint,
-    pub(crate) inline_length: CssPixels,
-    pub(crate) block_length: CssPixels,
-    pub(crate) border_box_block_start: CssPixels,
-    pub(crate) baseline: CssPixels,
-    pub(crate) direction: u8,
-    pub(crate) writing_mode: u8,
+    pub(crate) record: inline_content::FragmentRecord,
     pub(crate) glyphs: Option<GlyphData>,
     pub(crate) insert_position: f32,
     pub(crate) current_insert_direction: u8,
     pub(crate) has_trailing_whitespace: bool,
+    pub(crate) has_text_overflow_ellipsis: bool,
+    pub(crate) has_soft_wrap_opportunity_after: bool,
     pub(crate) is_fully_truncated: bool,
-    pub(crate) is_atomic_inline: bool,
-    pub(crate) white_space_collapse: u8,
     pub(crate) trailing_whitespace: TrailingWhitespace,
     pub(crate) text_utf16: *const u16,
     pub(crate) text_length_in_code_units: usize,
-    pub(crate) content_baselines: Option<DerivedBaselines>,
 }
 
 #[derive(Clone, Copy)]
@@ -66,6 +55,19 @@ pub(crate) struct FragmentBuildFacts {
     pub(crate) white_space_collapse: u8,
     pub(crate) text_utf16: *const u16,
     pub(crate) text_length_in_code_units: usize,
+}
+
+impl std::ops::Deref for LineBoxFragmentData {
+    type Target = inline_content::FragmentRecord;
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+
+impl std::ops::DerefMut for LineBoxFragmentData {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.record
+    }
 }
 
 impl LineBoxFragmentData {
@@ -84,7 +86,7 @@ impl LineBoxFragmentData {
         glyphs: Option<GlyphData>,
         facts: FragmentBuildFacts,
     ) -> Self {
-        let mut fragment = Self {
+        let record = inline_content::FragmentRecord {
             layout_node,
             style_source: facts.style_source,
             start,
@@ -96,19 +98,39 @@ impl LineBoxFragmentData {
             block_length,
             border_box_block_start,
             baseline: CssPixels::default(),
+            accumulated_vertical_shift: CssPixels::default(),
             direction,
             writing_mode,
+            is_block_ellipsis: false,
+            is_atomic_inline: facts.is_atomic_inline,
+            white_space_collapse: facts.white_space_collapse,
+            content_baselines: None,
+            line_index: 0,
+            dom_start_offset_in_node: 0,
+            dom_end_offset_in_node: 0,
+            dom_end_offset_with_trailing_whitespace: 0,
+            trailing_whitespace_length_in_code_units: 0,
+            glyph_run: None,
+        };
+        let mut fragment = Self::with_record(record, glyphs);
+        fragment.text_utf16 = facts.text_utf16;
+        fragment.text_length_in_code_units = facts.text_length_in_code_units;
+        fragment
+    }
+
+    pub(crate) fn with_record(record: inline_content::FragmentRecord, glyphs: Option<GlyphData>) -> Self {
+        let mut fragment = Self {
+            record,
             glyphs,
             insert_position: 0.0,
             current_insert_direction: direction::LTR,
             has_trailing_whitespace: false,
+            has_text_overflow_ellipsis: false,
+            has_soft_wrap_opportunity_after: false,
             is_fully_truncated: false,
-            is_atomic_inline: facts.is_atomic_inline,
-            white_space_collapse: facts.white_space_collapse,
             trailing_whitespace: TrailingWhitespace::default(),
-            text_utf16: facts.text_utf16,
-            text_length_in_code_units: facts.text_length_in_code_units,
-            content_baselines: None,
+            text_utf16: std::ptr::null(),
+            text_length_in_code_units: 0,
         };
         if let Some(glyphs) = &fragment.glyphs {
             fragment.current_insert_direction = fragment.resolve_glyph_run_direction(glyphs.text_type);
@@ -119,24 +141,8 @@ impl LineBoxFragmentData {
         fragment
     }
 
-    pub(crate) fn offset(&self) -> (CssPixels, CssPixels) {
-        to_physical(self.writing_mode, self.inline_offset, self.block_offset)
-    }
-
-    pub(crate) fn size(&self) -> (CssPixels, CssPixels) {
-        to_physical(self.writing_mode, self.inline_length, self.block_length)
-    }
-
-    pub(crate) fn physical_horizontal_extent(&self) -> CssPixels {
-        to_physical(self.writing_mode, self.inline_length, self.block_length).0
-    }
-
-    pub(crate) fn physical_vertical_extent(&self) -> CssPixels {
-        to_physical(self.writing_mode, self.inline_length, self.block_length).1
-    }
-
     pub(crate) fn text(&self) -> &[u16] {
-        if self.length_in_code_units == 0 {
+        if self.length_in_code_units == 0 || self.is_block_ellipsis {
             return &[];
         }
         assert!(!self.text_utf16.is_null());

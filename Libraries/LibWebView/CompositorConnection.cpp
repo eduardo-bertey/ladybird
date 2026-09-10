@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/QuickSort.h>
 #include <LibWebView/CompositorConnection.h>
 
 #include <AK/Debug.h>
@@ -12,7 +13,8 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/PaintingSurface.h>
 #include <LibIPC/Transport.h>
-#include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/Page/Page.h>
 
 namespace WebView {
 
@@ -66,6 +68,7 @@ void CompositorConnection::stop_presenting_to_client(Web::Compositor::Compositor
 
 void CompositorConnection::destroy_context(Web::Compositor::CompositorContextId context_id)
 {
+    m_pending_async_scroll_updates.remove(context_id);
     if (!can_send_message_to_compositor())
         return;
     async_destroy_context(context_id);
@@ -73,12 +76,8 @@ void CompositorConnection::destroy_context(Web::Compositor::CompositorContextId 
 
 static constexpr size_t max_image_frames_per_message = 100;
 
-void CompositorConnection::update_display_list(Web::Compositor::CompositorContextId context_id, NonnullRefPtr<Web::Painting::DisplayList> const& display_list, Web::Painting::AccumulatedVisualContextTree const& visual_context_tree, Web::Painting::DisplayListResourceTransaction resource_transaction, Web::Painting::ScrollStateSnapshot const& scroll_state_snapshot)
+bool CompositorConnection::post_image_frame_resources_in_batches(Web::Compositor::CompositorContextId context_id, Vector<Web::Painting::DisplayListImageFrameResource> image_frames)
 {
-    if (!can_send_message_to_compositor())
-        return;
-
-    auto image_frames = move(resource_transaction.image_frames);
     for (size_t start = 0; start < image_frames.size(); start += max_image_frames_per_message) {
         auto count = min(max_image_frames_per_message, image_frames.size() - start);
         Vector<Web::Painting::DisplayListImageFrameResource> batch;
@@ -88,20 +87,36 @@ void CompositorConnection::update_display_list(Web::Compositor::CompositorContex
         auto encoded_batch = MUST(Messages::CompositorWebContentServer::UpdateImageFrameResources::static_encode(context_id, batch));
         if (post_message(encoded_batch).is_error()) {
             did_lose_compositor();
-            return;
+            return false;
         }
     }
+    return true;
+}
+
+void CompositorConnection::update_display_list(Web::Compositor::CompositorContextId context_id, NonnullRefPtr<Web::Painting::DisplayList> const& display_list, Web::Painting::AccumulatedVisualContextTree const& visual_context_tree, Web::Painting::DisplayListResourceTransaction resource_transaction, Web::Painting::ScrollStateSnapshot const& scroll_state_snapshot)
+{
+    if (!can_send_message_to_compositor())
+        return;
+
+    if (!post_image_frame_resources_in_batches(context_id, move(resource_transaction.image_frames)))
+        return;
 
     auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateDisplayList::static_encode(context_id, display_list, visual_context_tree, resource_transaction, scroll_state_snapshot));
     if (post_message(encoded_message).is_error())
         did_lose_compositor();
 }
 
-void CompositorConnection::update_visual_context_tree(Web::Compositor::CompositorContextId context_id, Web::Painting::AccumulatedVisualContextTree const& visual_context_tree)
+void CompositorConnection::update_visual_context_tree(Web::Compositor::CompositorContextId context_id, Web::Painting::AccumulatedVisualContextTree const& visual_context_tree, Web::Painting::DisplayListResourceTransaction resource_transaction)
 {
     if (!can_send_message_to_compositor())
         return;
-    async_update_visual_context_tree(context_id, visual_context_tree);
+
+    if (!post_image_frame_resources_in_batches(context_id, move(resource_transaction.image_frames)))
+        return;
+
+    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateVisualContextTree::static_encode(context_id, visual_context_tree, resource_transaction));
+    if (post_message(encoded_message).is_error())
+        did_lose_compositor();
 }
 
 void CompositorConnection::update_scroll_state(Web::Compositor::CompositorContextId context_id, Web::Painting::ScrollStateSnapshot const& scroll_state_snapshot)
@@ -125,11 +140,11 @@ void CompositorConnection::remove_video_sink(Media::VideoSinkHandle video_sink_h
     async_remove_video_sink(video_sink_handle);
 }
 
-void CompositorConnection::set_video_update_flags(Media::VideoSinkHandle video_sink_handle, Web::Compositor::VideoUpdateFlags flags)
+void CompositorConnection::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
 {
     if (!can_send_message_to_compositor())
         return;
-    async_set_video_update_flags(video_sink_handle, flags);
+    async_set_video_sink_ticking(video_sink_handle, should_tick);
 }
 
 Optional<Web::Painting::CanvasId> CompositorConnection::create_canvas_2d_context(Gfx::IntSize size, bool alpha)
@@ -179,12 +194,12 @@ void CompositorConnection::invalidate_wheel_event_listener_state(Web::Compositor
     async_invalidate_wheel_event_listener_state(context_id, generation);
 }
 
-Web::Compositor::AsyncScrollEnqueueResult CompositorConnection::async_scroll_by(Web::Compositor::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::AsyncScrollOperationTracking operation_tracking)
+Web::Compositor::AsyncScrollEnqueueResult CompositorConnection::async_scroll_by(Web::Compositor::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::SnapContainerHandling snap_container_handling, Web::Compositor::AsyncScrollOperationTracking operation_tracking)
 {
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::AsyncScrollBy>(context_id, document_id, position, delta, viewport_rect, operation_tracking);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::AsyncScrollBy>(context_id, document_id, position, delta, viewport_rect, snap_container_handling, operation_tracking);
     if (!response) {
         did_lose_compositor();
         return {};
@@ -192,12 +207,12 @@ Web::Compositor::AsyncScrollEnqueueResult CompositorConnection::async_scroll_by(
     return response->take_result();
 }
 
-Web::Compositor::AsyncScrollEnqueueResult CompositorConnection::smooth_scroll_to(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel)
+Web::Compositor::AsyncScrollEnqueueResult CompositorConnection::smooth_scroll_to(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel, Web::Compositor::ScrollAnimationKind animation_kind)
 {
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::SmoothScrollTo>(context_id, stable_node_id, offset, viewport_rect, device_pixels_per_css_pixel);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::SmoothScrollTo>(context_id, stable_node_id, offset, main_thread_offset, viewport_rect, device_pixels_per_css_pixel, animation_kind);
     if (!response) {
         did_lose_compositor();
         return {};
@@ -212,17 +227,79 @@ void CompositorConnection::cancel_smooth_scroll(Web::Compositor::CompositorConte
     async_cancel_smooth_scroll(context_id, stable_node_id);
 }
 
-Web::Compositor::PendingAsyncScrollUpdates CompositorConnection::take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id)
+Web::Compositor::PendingAsyncScrollUpdates CompositorConnection::take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollUpdateFreshness freshness)
 {
-    if (!can_send_message_to_compositor())
-        return {};
-
-    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::TakePendingAsyncScrollUpdates>(context_id);
-    if (!response) {
-        did_lose_compositor();
-        return {};
+    // The compositor process pushes its scroll updates as it makes them, in order with the input
+    // events it forwards, so a rendering update finds the latest ones here. A reader that needs the
+    // compositor's state as of this instant asks for what it has not pushed yet, and first merges
+    // the pushes that arrived ahead of that answer but were not dispatched during the wait.
+    if (freshness == Web::Compositor::AsyncScrollUpdateFreshness::FromCompositor && can_send_message_to_compositor()) {
+        auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::TakePendingAsyncScrollUpdates>(context_id);
+        // The pushes that arrived ahead of the answer and the answer itself are publications of the
+        // same queue; they merge in the order the compositor published them, whatever order the
+        // transport handed them over in, so a gesture state settles as the newest publication says.
+        struct Arrival {
+            Web::Compositor::CompositorContextId context_id;
+            Web::Compositor::PendingAsyncScrollUpdates updates;
+        };
+        Vector<Arrival> arrivals;
+        for (auto& message : take_unprocessed_messages(Messages::CompositorWebContentClient::AsyncScrollUpdates::ENDPOINT_MAGIC, Messages::CompositorWebContentClient::AsyncScrollUpdates::static_message_id())) {
+            auto& pushed = static_cast<Messages::CompositorWebContentClient::AsyncScrollUpdates&>(*message);
+            arrivals.append({ pushed.context_id(), pushed.updates() });
+        }
+        if (!response)
+            did_lose_compositor();
+        else
+            arrivals.append({ context_id, response->take_updates() });
+        quick_sort(arrivals, [](auto const& a, auto const& b) { return a.updates.sequence < b.updates.sequence; });
+        for (auto& arrival : arrivals)
+            merge_async_scroll_updates(arrival.context_id, move(arrival.updates));
     }
-    return response->take_updates();
+
+    auto pending = m_pending_async_scroll_updates.get(context_id);
+    if (!pending.has_value())
+        return {};
+    Web::Compositor::PendingAsyncScrollUpdates updates;
+    updates.sequence = pending->sequence;
+    updates.scroll_offsets = move(pending->scroll_offsets);
+    updates.completed_operation_ids = move(pending->completed_operation_ids);
+    updates.operation_ids_taken_over_by_user_input = move(pending->operation_ids_taken_over_by_user_input);
+    updates.user_scroll_gesture_in_progress = pending->user_scroll_gesture_in_progress;
+    updates.user_scroll_gesture_ended = pending->user_scroll_gesture_ended;
+    // Whether a gesture is in progress is a state the compositor process keeps current; the rest
+    // was consumed here.
+    pending->scroll_offsets.clear();
+    pending->completed_operation_ids.clear();
+    pending->operation_ids_taken_over_by_user_input.clear();
+    pending->user_scroll_gesture_ended = false;
+    return updates;
+}
+
+void CompositorConnection::async_scroll_updates(Web::Compositor::CompositorContextId context_id, Web::Compositor::PendingAsyncScrollUpdates updates)
+{
+    merge_async_scroll_updates(context_id, move(updates));
+}
+
+void CompositorConnection::merge_async_scroll_updates(Web::Compositor::CompositorContextId context_id, Web::Compositor::PendingAsyncScrollUpdates updates)
+{
+    auto& pending = m_pending_async_scroll_updates.ensure(context_id);
+    // Whether a gesture is in progress is a state, not an event: the newest publication decides it.
+    bool const is_newest = updates.sequence >= pending.sequence;
+    pending.sequence = max(pending.sequence, updates.sequence);
+    for (auto const& scroll_offset : updates.scroll_offsets) {
+        auto existing = pending.scroll_offsets.find_if([&](auto const& existing) { return existing.stable_node_id == scroll_offset.stable_node_id; });
+        if (existing != pending.scroll_offsets.end()) {
+            existing->compositor_scroll_offset = scroll_offset.compositor_scroll_offset;
+            existing->unadopted_scroll_delta.translate_by(scroll_offset.unadopted_scroll_delta);
+        } else {
+            pending.scroll_offsets.append(scroll_offset);
+        }
+    }
+    pending.completed_operation_ids.extend(move(updates.completed_operation_ids));
+    pending.operation_ids_taken_over_by_user_input.extend(move(updates.operation_ids_taken_over_by_user_input));
+    if (is_newest)
+        pending.user_scroll_gesture_in_progress = updates.user_scroll_gesture_in_progress;
+    pending.user_scroll_gesture_ended |= updates.user_scroll_gesture_ended;
 }
 
 void CompositorConnection::viewport_size_updated(Web::Compositor::CompositorContextId context_id, Gfx::IntSize viewport_size, Web::Compositor::WindowResizingInProgress window_resize_in_progress)
@@ -232,11 +309,26 @@ void CompositorConnection::viewport_size_updated(Web::Compositor::CompositorCont
     async_viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
 }
 
-void CompositorConnection::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
+bool CompositorConnection::request_rendering_opportunity(Web::Compositor::CompositorContextId context_id, double maximum_frames_per_second)
+{
+    if (!can_send_message_to_compositor())
+        return false;
+    async_request_rendering_opportunity(context_id, maximum_frames_per_second);
+    return true;
+}
+
+void CompositorConnection::hurry_rendering_opportunity(Web::Compositor::CompositorContextId context_id)
 {
     if (!can_send_message_to_compositor())
         return;
-    async_present_frame(context_id, viewport_rect, damage_rect);
+    async_hurry_rendering_opportunity(context_id);
+}
+
+void CompositorConnection::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect)
+{
+    if (!can_send_message_to_compositor())
+        return;
+    async_present_frame(context_id, viewport_rect);
 }
 
 Optional<Web::Painting::CanvasId> CompositorConnection::create_webgl_context(Web::WebGL::WebGLVersion webgl_version, Gfx::IntSize size, bool depth, bool stencil, bool antialias, Vector<String>& out_supported_extensions)
@@ -359,7 +451,22 @@ void CompositorConnection::mouse_event(u64 page_id, Web::MouseEvent event)
 
 void CompositorConnection::request_rendering_update()
 {
-    Web::HTML::main_thread_event_loop().queue_task_to_update_the_rendering();
+    for (auto& navigable : Web::HTML::all_local_navigables()) {
+        if (navigable->is_traversable())
+            navigable->page().client().request_frame();
+    }
+}
+
+void CompositorConnection::rendering_opportunity(Web::Compositor::CompositorContextId context_id, i64 frame_time_nanoseconds, double frame_interval_milliseconds)
+{
+    for (auto& navigable : Web::HTML::all_local_navigables()) {
+        if (!navigable->is_traversable() || !navigable->has_compositor_context())
+            continue;
+        if (navigable->compositor_context().id() != context_id)
+            continue;
+        navigable->page().client().rendering_opportunity(frame_time_nanoseconds, frame_interval_milliseconds);
+        return;
+    }
 }
 
 void CompositorConnection::did_complete_screenshot(Web::Compositor::ScreenshotRequestId request_id)

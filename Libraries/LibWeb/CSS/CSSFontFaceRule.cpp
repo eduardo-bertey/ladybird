@@ -8,11 +8,13 @@
 #include <LibGC/Heap.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontStyleMapping.h>
+#include <LibJS/Runtime/ExternalMemory.h>
 #include <LibWeb/CSS/CSSFontFaceRule.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
-#include <LibWeb/CSS/FontFace.h>
+#include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFaceSet.h>
+#include <LibWeb/CSS/FontFaceState.h>
 #include <LibWeb/CSS/Serialize.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Dump.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -21,16 +23,29 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSFontFaceRule);
 
-GC::Ref<CSSFontFaceRule> CSSFontFaceRule::create(GC::Ref<CSSFontFaceDescriptors> style)
+GC::Ref<CSSFontFaceRule> CSSFontFaceRule::create(RustRule rule)
 {
-    return GC::Heap::the().allocate<CSSFontFaceRule>(style);
+    return GC::Heap::the().allocate<CSSFontFaceRule>(move(rule));
 }
 
-CSSFontFaceRule::CSSFontFaceRule(GC::Ref<CSSFontFaceDescriptors> style)
-    : CSSRule(Type::FontFace)
-    , m_style(style)
+CSSFontFaceRule::CSSFontFaceRule(RustRule rule)
+    : CSSRule(move(rule))
+    , m_descriptors(Parser::ValueParserFFI::rust_descriptor_block_retain(native_rule().payload().descriptors))
 {
-    m_style->set_parent_rule(*this);
+}
+
+size_t CSSFontFaceRule::external_memory_size() const
+{
+    return JS::saturating_add_external_memory_size(Base::external_memory_size(), m_descriptors.external_memory_size());
+}
+
+GC::Ref<CSSFontFaceDescriptors> CSSFontFaceRule::descriptors() const
+{
+    if (!m_style) {
+        m_style = CSSFontFaceDescriptors::create(m_descriptors.retain());
+        m_style->set_parent_rule(const_cast<CSSFontFaceRule&>(*this));
+    }
+    return *m_style;
 }
 
 bool CSSFontFaceRule::is_valid() const
@@ -38,19 +53,14 @@ bool CSSFontFaceRule::is_valid() const
     // @font-face rules require a font-family and src descriptor; if either of these are missing, the @font-face rule
     // must not be considered when performing the font matching algorithm.
     // https://drafts.csswg.org/css-fonts-4/#font-face-rule
-    return !m_style->descriptor(DescriptorNameAndID::from_id(DescriptorID::FontFamily)).is_null()
-        && !m_style->descriptor(DescriptorNameAndID::from_id(DescriptorID::Src)).is_null();
-}
-
-ParsedFontFace CSSFontFaceRule::font_face() const
-{
-    return ParsedFontFace::from_descriptors(m_style);
+    return !m_descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::FontFamily)).is_null()
+        && !m_descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::Src)).is_null();
 }
 
 // https://drafts.csswg.org/cssom/#ref-for-cssfontfacerule
 Utf16String CSSFontFaceRule::serialized() const
 {
-    auto& descriptors = *m_style;
+    auto const& descriptors = m_descriptors;
 
     Utf16StringBuilder builder;
     // The result of concatenating the following:
@@ -145,12 +155,18 @@ void CSSFontFaceRule::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_style);
-    visitor.visit(m_css_connected_font_face);
+}
+
+RefPtr<FontFaceState> CSSFontFaceRule::css_connected_font_face() const
+{
+    auto* sheet = parent_style_sheet();
+    return sheet ? sheet->css_connected_font_face(native_rule().identity()) : nullptr;
 }
 
 void CSSFontFaceRule::handle_descriptor_change(Utf16FlyString const& property)
 {
-    if (!m_css_connected_font_face)
+    auto font_face = css_connected_font_face();
+    if (!font_face)
         return;
 
     if (!is_valid()) {
@@ -158,12 +174,31 @@ void CSSFontFaceRule::handle_descriptor_change(Utf16FlyString const& property)
         return;
     }
 
-    if (property.equals_ignoring_ascii_case("src"_utf16_fly_string))
+    if (property.equals_ignoring_ascii_case("src"_utf16_fly_string)) {
         handle_src_descriptor_change();
+        return;
+    }
+
+    auto descriptor_affects_font_matching = property.equals_ignoring_ascii_case("font-family"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-weight"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-style"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-width"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-stretch"_utf16_fly_string);
+
+    FontComputer* font_computer = nullptr;
+    if (descriptor_affects_font_matching) {
+        if (auto document = parent_style_sheet() ? parent_style_sheet()->owning_document() : nullptr) {
+            font_computer = &document->font_computer();
+            font_computer->unregister_font_face(*font_face);
+        }
+    }
 
     // https://drafts.csswg.org/css-font-loading/#font-face-css-connection
     // any change made to a @font-face descriptor is immediately reflected in the corresponding FontFace attribute
-    m_css_connected_font_face->reparse_connected_css_font_face_rule_descriptors();
+    font_face->reparse_connected_css_font_face_rule_descriptors();
+
+    if (font_computer)
+        font_computer->register_font_face(*font_face);
 }
 
 // https://drafts.csswg.org/css-font-loading/#font-face-css-connection
@@ -173,7 +208,7 @@ void CSSFontFaceRule::handle_src_descriptor_change()
     // stop being CSS-connected. A new FontFace reflecting its new src must be created and CSS-connected to the
     // @font-face.
 
-    if (!m_css_connected_font_face)
+    if (!css_connected_font_face())
         return;
 
     disconnect_font_face();
@@ -186,23 +221,21 @@ void CSSFontFaceRule::handle_src_descriptor_change()
     if (!document)
         return;
 
-    auto new_font_face = FontFace::create_css_connected(HTML::relevant_realm(*document), *this);
+    auto new_font_face = FontFaceState::create_css_connected(HTML::relevant_realm(*document), native_rule().identity(), *style_sheet);
     document->fonts()->add_css_connected_font(new_font_face);
 }
 
+// https://drafts.csswg.org/css-font-loading/#font-face-css-connection
+// If a @font-face rule is removed from the document, its corresponding FontFace object is no longer CSS-connected.
+// The connection is not restorable by any means (but adding the @font-face back to the stylesheet will create a
+// brand new FontFace object which is CSS-connected).
 void CSSFontFaceRule::disconnect_font_face()
 {
-    if (!m_css_connected_font_face)
+    auto font_face = css_connected_font_face();
+    if (!font_face)
         return;
 
-    m_css_connected_font_face->disconnect_from_css_rule();
-
-    if (auto* style_sheet = parent_style_sheet()) {
-        if (auto document = style_sheet->owning_document())
-            document->fonts()->delete_(*m_css_connected_font_face);
-    }
-
-    m_css_connected_font_face = nullptr;
+    font_face->disconnect_from_css_rule();
 }
 
 void CSSFontFaceRule::dump(StringBuilder& builder, int indent_levels) const

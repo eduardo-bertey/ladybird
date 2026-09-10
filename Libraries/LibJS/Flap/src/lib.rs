@@ -545,6 +545,14 @@ impl Compiler {
     pub fn lower(&self, prepared: &PreparedProgram) -> Result<LowProgram, CompileError> {
         let mut program = LowProgram::new();
         program.runtime = low_ir::RuntimeConstants::from_layout(&prepared.constants);
+        for (handler, layout) in prepared.handlers.iter().zip(&prepared.bytecode.handler_layouts) {
+            if let Some(layout) = &layout.slow_path {
+                program
+                    .runtime
+                    .slow_paths
+                    .insert(handler.name().to_string(), layout.clone());
+            }
+        }
         program.dispatch_handlers = prepared.bytecode.dispatch_handlers.clone();
 
         for template in &prepared.handlers {
@@ -640,12 +648,15 @@ const EXECUTION_CONTEXT_PROGRAM_COUNTER = 56
 const SIZEOF_EXECUTION_CONTEXT = 120
 const VM_RUNNING_EXECUTION_CONTEXT = 15288
 const VM_BREAKPOINT_CONTROLLER = 16664
+const SLOW_PATH_CONTINUATION_BIT = 32
 const EXECUTABLE_BYTECODE_DATA = 104
 const INT32_TAG = 0x7FFA
 const BOOLEAN_TAG = 0x7FF9
 const INT32_TAG_SHIFTED = 0x7FFA000000000000
 const NAN_BASE_TAG = 0x7FF8
 const CANON_NAN_BITS = 0x7FF8000000000000
+const VM_HEAP_REGION_BASE = 16664
+const HEAP_REGION_OFFSET_MASK = 0x3FFFFFFFFFF
 "#;
 
     fn compiler(architecture: Architecture) -> Compiler {
@@ -673,6 +684,59 @@ handler Nop() { dispatch_next; }
                 name: "layout.conf",
                 contents: REQUIRED_LAYOUT,
             }),
+        }
+    }
+
+    #[test]
+    fn compiles_checked_int64_conversion_and_remainder_for_each_target() {
+        let source = r#"
+handler Mod(dst: out Operand, lhs: in Operand, rhs: in Operand) {
+    let failure = || @cold { dispatch_next; };
+    guard let Value<f64>(lhs_number) = load(lhs) else failure;
+    guard let Value<f64>(rhs_number) = load(rhs) else failure;
+    guard let lhs_integer = double_to_int64(lhs_number) else failure;
+    guard let rhs_integer = double_to_int64(rhs_number) else failure;
+    guard rhs_integer != 0 else failure;
+    let zero: i64 = 0;
+    let negative_one = zero - 1;
+    guard rhs_integer != negative_one else failure;
+    let remainder = mod_i64(lhs_integer, rhs_integer);
+    store(dst, box_f64(i64_to_f64(remainder)));
+    dispatch_next;
+}
+handler Widen(dst: out Operand, src: in Operand) {
+    let failure = || @cold { dispatch_next; };
+    guard let Value<f64>(number) = load(src) else failure;
+    guard let integer = double_to_int64(number) else failure;
+    store(dst, box_f64(i64_to_f64(i64(i32(integer)))));
+    dispatch_next;
+}
+
+"#;
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let assembly = compiler(architecture).compile(unit(source)).unwrap();
+            let assembly = assembly.as_str();
+            match architecture {
+                Architecture::X86_64 => {
+                    assert!(assembly.contains("cvttsd2si r"));
+                    assert!(assembly.contains("cvtsi2sd xmm"));
+                    assert!(assembly.contains("ucomisd"));
+                    assert!(assembly.contains("jp "));
+                    assert!(assembly.contains("movsxd"));
+                    assert!(assembly.contains("cqo"));
+                    assert!(assembly.contains("idiv r"));
+                }
+                Architecture::Aarch64 => {
+                    assert!(assembly.contains("fcvtzs x"));
+                    assert!(assembly.contains("scvtf d"));
+                    assert!(assembly.contains("cmn x"));
+                    assert!(assembly.contains("b.vs "));
+                    assert!(assembly.contains("fcmp d"));
+                    assert!(assembly.contains("sxtw x"));
+                    assert!(assembly.contains("sdiv x"));
+                    assert!(assembly.contains("msub x"));
+                }
+            }
         }
     }
 
@@ -982,7 +1046,7 @@ specialize Clear(dst: Undefined);
         assert!(
             emission_error
                 .message
-                .contains("required runtime constant 'INT32_TAG_SHIFTED'")
+                .contains("required runtime constant 'SLOW_PATH_CONTINUATION_BIT'")
         );
     }
 

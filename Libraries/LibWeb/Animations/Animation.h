@@ -34,6 +34,7 @@ class Animation : public DOM::EventTarget {
     GC_DECLARE_ALLOCATOR(Animation);
 
 public:
+    static constexpr size_t effect_offset() { return offsetof(Animation, m_effect); }
     enum class ShouldInvalidate {
         Yes,
         No,
@@ -67,12 +68,10 @@ public:
     void calculate_auto_aligned_start_time();
 
     // https://drafts.csswg.org/web-animations-2/#dom-animation-currenttime
-    NullableCSSNumberish current_time_for_bindings() const
-    {
-        update_style_if_needed();
-        return NullableCSSNumberish::from_optional_css_numberish_time(current_time());
-    }
+    NullableCSSNumberish current_time_for_bindings() const;
     Optional<TimeValue> current_time() const;
+    Optional<TimeValue> current_time_for_observation() const;
+    Optional<TimeValue> current_time_at(Optional<TimeValue> timeline_time) const;
     virtual WebIDL::ExceptionOr<void> set_current_time_for_bindings(NullableCSSNumberish const&);
 
     double playback_rate() const { return m_playback_rate; }
@@ -90,6 +89,7 @@ public:
     // https://www.w3.org/TR/web-animations-1/#dom-animation-pending
     bool pending_for_bindings() const;
     bool pending() const { return m_pending_play_task == TaskState::Scheduled || m_pending_pause_task == TaskState::Scheduled; }
+    bool has_pending_play_task() const { return m_pending_play_task == TaskState::Scheduled; }
 
     // https://www.w3.org/TR/web-animations-1/#dom-animation-ready
     GC::Ref<WebIDL::Promise> ready_for_bindings() const;
@@ -100,7 +100,7 @@ public:
     }
 
     // https://www.w3.org/TR/web-animations-1/#dom-animation-finished
-    GC::Ref<WebIDL::Promise> finished_for_bindings() const;
+    GC::Ref<WebIDL::Promise> finished_for_bindings();
     GC::Ref<WebIDL::Promise> finished() const { return current_finished_promise(); }
     bool is_finished() const { return m_is_finished; }
 
@@ -139,6 +139,9 @@ public:
 
     Optional<DOM::AbstractElement> owning_element() const { return m_owning_element; }
     void set_owning_element(Optional<DOM::AbstractElement>&& value) { m_owning_element = move(value); }
+    void schedule_disassociation_from_target_after_css_cancellation() { m_css_cancellation_disassociation_pending = true; }
+    bool css_cancellation_disassociation_pending() const { return m_css_cancellation_disassociation_pending; }
+    void disassociate_from_target_after_css_cancellation();
     void update_style_if_needed() const;
 
     virtual AnimationClass animation_class() const { return AnimationClass::None; }
@@ -155,10 +158,18 @@ protected:
     Animation(HTML::EnvironmentSettingsObject&);
 
     HTML::EnvironmentSettingsObject& relevant_settings_object() const { return *m_environment; }
+
+    // Install an effect whose target must not observe this animation until a surrounding style
+    // stabilization epoch commits it.
+    void set_provisional_effect(GC::Ref<AnimationEffect>);
+    void discard_provisional_effect();
+
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void finalize() override;
 
 private:
+    AnimationPlayState play_state_at(Optional<TimeValue> current_time) const;
+
     virtual GC::Ptr<Bindings::Wrappable> relevant_global_impl() const override;
 
     enum class TaskState {
@@ -182,7 +193,7 @@ private:
 
     void apply_any_pending_playback_rate();
     WebIDL::ExceptionOr<void> silently_set_current_time(Optional<TimeValue>);
-    void update_finished_state(DidSeek, SynchronouslyNotify, ShouldInvalidate = ShouldInvalidate::Yes);
+    void update_finished_state(DidSeek, SynchronouslyNotify, ShouldInvalidate = ShouldInvalidate::Yes, Optional<TimeValue> observed_current_time = {});
     void reset_an_animations_pending_tasks();
 
     bool is_ready() const;
@@ -246,6 +257,8 @@ private:
 
     // https://www.w3.org/TR/css-animations-2/#owning-element-section
     Optional<DOM::AbstractElement> m_owning_element;
+    bool m_css_cancellation_disassociation_pending { false };
+    bool m_needs_target_reassociation { false };
 
     Optional<HTML::TaskID> m_pending_finish_microtask_id;
 

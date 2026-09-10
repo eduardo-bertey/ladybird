@@ -18,6 +18,7 @@
 #include <LibWeb/CSS/FontFeatureData.h>
 #include <LibWeb/CSS/Percentage.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/PixelUnits.h>
@@ -47,8 +48,22 @@ struct FontFaceKey {
     }
 };
 
+enum class ComputedFontFamilySyntax {
+    CustomIdent,
+    String,
+};
+
+struct ComputedFontFamilyName {
+    Utf16FlyString name;
+    ComputedFontFamilySyntax syntax { ComputedFontFamilySyntax::CustomIdent };
+
+    bool operator==(ComputedFontFamilyName const&) const = default;
+};
+
+using ComputedFontFamily = Variant<GenericFontFamily, ComputedFontFamilyName>;
+
 struct ComputedFontCacheKey {
-    ValueComparingNonnullRefPtr<StyleValue const> font_family;
+    Vector<ComputedFontFamily> font_families;
     FontOpticalSizing font_optical_sizing;
     CSSPixels font_size;
     int font_slope;
@@ -65,18 +80,17 @@ class FontLoader final : public GC::Cell {
     GC_DECLARE_ALLOCATOR(FontLoader);
 
 public:
-    FontLoader(FontComputer&, RuleOrDeclaration, Utf16FlyString family_name, Vector<Gfx::UnicodeRange> unicode_ranges, Vector<URL> urls, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load = {});
+    FontLoader(FontComputer&, RuleOrDeclaration, Vector<URL> urls, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load = {});
 
     virtual ~FontLoader();
 
-    Vector<Gfx::UnicodeRange> const& unicode_ranges() const { return m_unicode_ranges; }
-
-    RefPtr<Gfx::Font const> font_with_point_size(float point_size, Gfx::FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features);
     void start_loading_next_url();
 
     bool is_loading() const;
-
-    Utf16FlyString family_name() const { return m_family_name; }
+    void did_request_for_rendering();
+    bool may_finish_from_cache() const;
+    bool has_started_request() const;
+    bool has_received_font_data() const { return m_has_received_font_data; }
 
     void subscribe(GC::Ref<GC::Function<void(RefPtr<Gfx::Typeface const>)>>);
 
@@ -89,13 +103,13 @@ private:
 
     GC::Ref<FontComputer> m_font_computer;
     RuleOrDeclaration m_rule_or_declaration;
-    Utf16FlyString m_family_name;
-    Vector<Gfx::UnicodeRange> m_unicode_ranges;
     RefPtr<Gfx::Typeface const> m_typeface;
     Vector<URL> m_urls;
     GC::Ptr<Fetch::Infrastructure::FetchController> m_fetch_controller;
     Vector<GC::Ref<GC::Function<void(RefPtr<Gfx::Typeface const>)>>> m_subscribers;
+    Optional<DOM::DocumentLoadEventDelayer> m_document_load_event_delayer;
     bool m_has_completed { false };
+    bool m_has_received_font_data { false };
 };
 
 class WEB_API FontComputer final : public GC::Cell {
@@ -103,50 +117,63 @@ class WEB_API FontComputer final : public GC::Cell {
     GC_DECLARE_ALLOCATOR(FontComputer);
 
 public:
-    explicit FontComputer(DOM::Document& document)
-        : m_document(document)
-    {
-    }
-
-    ~FontComputer() = default;
+    explicit FontComputer(DOM::Document&);
+    virtual ~FontComputer() override;
 
     DOM::Document& document() { return m_document; }
     DOM::Document const& document() const { return m_document; }
 
     Gfx::Font const& initial_font() const;
+    bool should_defer_initial_paint();
+    bool has_completed_initial_paint() const { return m_has_completed_initial_paint; }
+    bool initial_paint_had_pending_fonts() const { return m_initial_paint_had_pending_fonts; }
 
     void clear_computed_font_cache(Utf16FlyString const& family_name);
     void clear_font_feature_values_cache(Utf16FlyString const& family_name);
     void did_load_font(Utf16FlyString const& family_name);
+    void did_load_font(FontFaceKey const&);
 
-    void register_font_face(GC::Ref<FontFace>);
-    void unregister_font_face(GC::Ref<FontFace>);
+    void register_font_face(NonnullRefPtr<FontFaceState>);
+    void unregister_font_face(NonnullRefPtr<FontFaceState>);
+    void synchronize_font_face_order(Vector<NonnullRefPtr<FontFaceState>> const&);
 
-    GC::Ptr<FontLoader> load_font_face(ParsedFontFace const&, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load = {});
+    GC::Ptr<FontLoader> load_font_face(ParsedFontFace const&, RefPtr<StyleSheetState>, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load = {});
 
-    void load_fonts_from_sheet(CSSStyleSheet&);
-    void unload_fonts_from_sheet(CSSStyleSheet&);
+    void load_fonts_from_sheet(StyleSheetState&);
+    void unload_fonts_from_sheet(StyleSheetState&);
 
+    NonnullRefPtr<Gfx::FontCascadeList const> compute_font_for_style_values(Vector<ComputedFontFamily> font_families, CSSPixels const& font_size, int font_slope, double font_weight, Percentage const& font_width, FontOpticalSizing font_optical_sizing, HashMap<Utf16FlyString, double> const& font_variation_settings, FontFeatureData const& font_feature_data) const;
     NonnullRefPtr<Gfx::FontCascadeList const> compute_font_for_style_values(StyleValue const& font_family, CSSPixels const& font_size, int font_slope, double font_weight, Percentage const& font_width, FontOpticalSizing font_optical_sizing, HashMap<Utf16FlyString, double> const& font_variation_settings, FontFeatureData const& font_feature_data) const;
+    u64 environment_generation() const { return m_environment_generation; }
 
 private:
     virtual void visit_edges(Visitor&) override;
 
+    void begin_font_face_change_batch();
+    void end_font_face_change_batch();
+    void clear_computed_font_cache_for_families(Vector<Utf16FlyString> const& family_names);
+
     struct MatchingFontCandidate;
     RefPtr<Gfx::FontCascadeList const> find_matching_font_weight_ascending(Vector<MatchingFontCandidate> const& candidates, int target_weight, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values, bool inclusive) const;
     RefPtr<Gfx::FontCascadeList const> find_matching_font_weight_descending(Vector<MatchingFontCandidate> const& candidates, int target_weight, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values, bool inclusive) const;
-    NonnullRefPtr<Gfx::FontCascadeList const> compute_font_for_style_values_impl(StyleValue const& font_family, CSSPixels const& font_size, int font_slope, double font_weight, Percentage const& font_width, FontOpticalSizing font_optical_sizing, HashMap<Utf16FlyString, double> const& font_variation_settings, FontFeatureData const& font_feature_data) const;
+    NonnullRefPtr<Gfx::FontCascadeList const> compute_font_for_style_values_impl(ReadonlySpan<ComputedFontFamily const> font_families, CSSPixels const& font_size, int font_slope, double font_weight, Percentage const& font_width, FontOpticalSizing font_optical_sizing, HashMap<Utf16FlyString, double> const& font_variation_settings, FontFeatureData const& font_feature_data) const;
     RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(Utf16FlyString const& family_name, int weight, Percentage const& font_width, int slope, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values) const;
 
     HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values_for_family(Utf16FlyString const& family_name) const;
 
     GC::Ref<DOM::Document> m_document;
 
-    HashMap<FontFaceKey, Vector<GC::Ref<FontFace>>> m_font_faces;
+    HashMap<FontFaceKey, Vector<NonnullRefPtr<FontFaceState>>> m_font_faces;
     HashMap<String, GC::Ref<FontLoader>> m_loaders_by_url;
 
     mutable HashMap<ComputedFontCacheKey, NonnullRefPtr<Gfx::FontCascadeList const>> m_computed_font_cache;
     mutable HashMap<Utf16FlyString, HashMap<FontFeatureValueKey, Vector<u32>>> m_font_feature_values_cache;
+
+    bool m_has_completed_initial_paint { false };
+    bool m_initial_paint_had_pending_fonts { false };
+    u32 m_font_face_change_batch_depth { 0 };
+    u64 m_environment_generation { 1 };
+    Vector<Utf16FlyString> m_batched_font_face_change_families;
 };
 
 }

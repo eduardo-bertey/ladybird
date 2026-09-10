@@ -15,6 +15,7 @@
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Fetch/Fetching/PendingResponse.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 
 namespace Web::Fetch::Infrastructure {
@@ -96,7 +97,7 @@ bool Request::destination_is_script_like() const
 // https://fetch.spec.whatwg.org/#subresource-request
 bool Request::is_subresource_request() const
 {
-    // A subresource request is a request whose destination is "audio", "audioworklet", "font", "image", "json", "manifest", "paintworklet", "script", "style", "track", "video", "xslt", or the empty string.
+    // A subresource request is a request whose destination is "audio", "audioworklet", "font", "image", "json", "manifest", "paintworklet", "script", "style", "text", "track", "video", "xslt", or the empty string.
     static constexpr Array subresource_request_destinations = {
         Destination::Audio,
         Destination::AudioWorklet,
@@ -107,6 +108,7 @@ bool Request::is_subresource_request() const
         Destination::PaintWorklet,
         Destination::Script,
         Destination::Style,
+        Destination::Text,
         Destination::Track,
         Destination::Video,
         Destination::XSLT,
@@ -263,6 +265,7 @@ GC::Ref<Request> Request::clone(JS::Realm& realm) const
     new_request->set_prevent_no_cache_cache_control_header_modification(m_prevent_no_cache_cache_control_header_modification);
     new_request->set_done(m_done);
     new_request->set_timing_allow_failed(m_timing_allow_failed);
+    new_request->m_navigation_timing_allow_values_list = m_navigation_timing_allow_values_list;
 
     // 2. If request’s body is non-null, set newRequest’s body to the result of cloning request’s body.
     if (auto const* body = m_body.get_pointer<GC::Ref<Body>>())
@@ -270,6 +273,23 @@ GC::Ref<Request> Request::clone(JS::Realm& realm) const
 
     // 3. Return newRequest.
     return new_request;
+}
+
+// https://fetch.spec.whatwg.org/#append-to-a-requests-navigation-timing-allow-values-list
+void Request::append_to_navigation_timing_allow_values_list(Response const& response)
+{
+    // 1. Assert: request is a navigation request.
+    VERIFY(is_navigation_request());
+
+    // 2. Let taoValues be the result of getting, decoding, and splitting `Timing-Allow-Origin` from response's header list.
+    auto tao_values = response.header_list()->get_decode_and_split("Timing-Allow-Origin"sv);
+
+    // 3. If taoValues is null, then set taoValues to « ».
+    if (!tao_values.has_value())
+        tao_values = Vector<String> {};
+
+    // 4. Append taoValues to request's navigation timing allow values list.
+    m_navigation_timing_allow_values_list.append(tao_values.release_value());
 }
 
 // https://fetch.spec.whatwg.org/#concept-request-add-range-header
@@ -408,6 +428,8 @@ StringView request_destination_to_string(Request::Destination destination)
         return "sharedworker"sv;
     case Request::Destination::Style:
         return "style"sv;
+    case Request::Destination::Text:
+        return "text"sv;
     case Request::Destination::Track:
         return "track"sv;
     case Request::Destination::Video:
@@ -464,6 +486,8 @@ static Optional<Request::Destination> translate_potential_destination_impl(auto 
         return Request::Destination::SharedWorker;
     if (potential_destination == "style"sv)
         return Request::Destination::Style;
+    if (potential_destination == "text"sv)
+        return Request::Destination::Text;
     if (potential_destination == "track"sv)
         return Request::Destination::Track;
     if (potential_destination == "video"sv)

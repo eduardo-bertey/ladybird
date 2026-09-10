@@ -21,7 +21,6 @@
 #include <LibGC/RootVector.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Bytecode/Label.h>
-#include <LibJS/Bytecode/Operand.h>
 #include <LibJS/Bytecode/Register.h>
 #include <LibJS/CyclicModule.h>
 #include <LibJS/Export.h>
@@ -114,15 +113,6 @@ public:
         return m_running_execution_context->registers_and_constants_and_locals_and_arguments()[r.index()];
     }
 
-    ALWAYS_INLINE Value get(Bytecode::Operand op) const
-    {
-        return m_running_execution_context->registers_and_constants_and_locals_and_arguments()[op.raw()];
-    }
-    ALWAYS_INLINE void set(Bytecode::Operand op, Value value)
-    {
-        m_running_execution_context->registers_and_constants_and_locals_and_arguments_span().data()[op.raw()] = value;
-    }
-
     void do_return(Value value)
     {
         if (value.is_special_empty_value())
@@ -164,7 +154,7 @@ public:
     ExecutionContext* push_inline_frame(
         ECMAScriptFunctionObject& callee_function,
         Bytecode::Executable& callee_executable,
-        ReadonlySpan<Bytecode::Operand> arguments,
+        ReadonlySpan<Value> arguments,
         u32 return_pc,
         u32 dst_raw,
         Value this_value,
@@ -187,6 +177,8 @@ public:
     {
         return m_utf16_string_cache;
     }
+
+    Bytecode::KeyedPropertyLookupCache& keyed_property_lookup_cache() { return *m_keyed_property_lookup_cache; }
 
     auto& numeric_string_cache() { return m_numeric_string_cache; }
 
@@ -367,7 +359,6 @@ public:
     u32 execution_generation() const { return m_execution_generation; }
     void finish_execution_generation() { ++m_execution_generation; }
     FlatPtr primitive_storage_cage_base() const { return m_primitive_storage_cage_base; }
-
     u32 register_native_function(NativeFunctionPointer, NativeFunctionType);
     NativeFunctionPointer native_function(u32 index, NativeFunctionType expected_type) const;
 
@@ -589,6 +580,7 @@ private:
     static VM* s_the;
 
     HashMap<Utf16String, GC::Ptr<PrimitiveString>> m_utf16_string_cache;
+    OwnPtr<Bytecode::KeyedPropertyLookupCache> m_keyed_property_lookup_cache;
 
     static constexpr size_t numeric_string_cache_size = 1000;
     AK::Array<GC::Ptr<PrimitiveString>, numeric_string_cache_size> m_numeric_string_cache;
@@ -643,6 +635,7 @@ private:
 
     u32 m_execution_generation { 0 };
     FlatPtr m_primitive_storage_cage_base { 0 };
+    FlatPtr m_heap_region_base { 0 };
     Vector<NativeFunctionTableEntry> m_native_function_table;
     NativeFunctionTableEntry const* m_native_function_table_data { nullptr };
     u32 m_run_executable_depth { 0 };

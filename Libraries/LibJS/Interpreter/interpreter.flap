@@ -30,25 +30,64 @@ inline fn check_tag_is_double(tag: inout ValueTag, else failure: Label) {
 }
 
 inline fn box_cell(cell: Environment) -> Value {
-    let bits: u64 = alias(cell);
+    let mut bits: u64 = alias(cell);
+    bits = heap_region_offset(bits);
     bits = bits | SHIFTED_IS_CELL_PATTERN;
     # FIXME: Use a representation alias once it can coalesce with an inline
     #        function return without leaving its result uninitialized.
-    let value: Value;
+    let mut value: Value;
     mov(value, bits);
     value
 }
 
 inline fn box_object(object: Object) -> Value<Object> {
-    let pointer: u64 = alias(object);
-    pointer = pointer << 16;
-    pointer = pointer >> 16;
+    let mut pointer: u64 = alias(object);
+    pointer = heap_region_offset(pointer);
     pointer = pointer | OBJECT_TAG_SHIFTED;
     # FIXME: Use a representation alias once it can coalesce with an inline
     #        function return without leaving its result uninitialized.
-    let value: Value<Object>;
+    let mut value: Value<Object>;
     mov(value, pointer);
     value
+}
+
+inline fn load_direct_getter_value(
+    function: Object,
+    receiver_object: Object,
+    else failure: Label
+) -> Value {
+    let direct_getter: DirectGetterFunction = alias(function);
+    let wrapper_words: Sequence<u64> = alias(receiver_object);
+    let implementation = wrapper_words[direct_getter.wrapper_implementation_word_offset];
+    guard implementation != 0 else failure;
+    let implementation_words: Sequence<u64> = alias(implementation);
+
+    # This first version directly reuses wrappers only in the main world.
+    let receiver_weak_impl = implementation_words[direct_getter.main_world_wrapper_word_offset];
+    guard receiver_weak_impl != 0 else failure;
+    let receiver_weak_impl_words: Sequence<u64> = alias(receiver_weak_impl);
+    let cached_receiver = receiver_weak_impl_words[direct_getter.weak_impl_value_word_offset];
+    let receiver_pointer: u64 = alias(receiver_object);
+    guard cached_receiver == receiver_pointer else failure;
+
+    let result_implementation = implementation_words[direct_getter.implementation_value_word_offset];
+    if result_implementation == 0 {
+        let mut null_value: Value;
+        mov(null_value, NULL_VALUE);
+        null_value
+    } else {
+        let result_implementation_words: Sequence<u64> = alias(result_implementation);
+        let result_weak_impl = result_implementation_words[direct_getter.main_world_wrapper_word_offset];
+        guard result_weak_impl != 0 else failure;
+        let result_weak_impl_words: Sequence<u64> = alias(result_weak_impl);
+        let cached_result = result_weak_impl_words[direct_getter.weak_impl_value_word_offset];
+        guard cached_result != 0 else failure;
+        let result_object: Object = alias(cached_result);
+        let result_flags = result_object.flags;
+        branch_bits_set(result_flags, OBJECT_FLAG_IS_GLOBAL_OBJECT, failure);
+        let result_value: Value = alias(box_object(result_object));
+        result_value
+    }
 }
 
 inline fn move_operand(dst: out Operand, src: in Operand) {
@@ -81,13 +120,26 @@ inline fn numeric_pair_to_f64(
     (lhs_result, rhs_result)
 }
 
+inline fn integer_value_to_i64(value: Value, else failure: Label) -> i64 {
+    match value {
+        Value<i32>(integer) => {
+            i64(integer)
+        },
+        Value<f64>(number) => {
+            guard let integer = double_to_int64(number) else failure;
+            integer
+        },
+        _ => failure,
+    }
+}
+
 inline fn load_property_lookup_cache(
     cache: PropertyLookupCacheIndex,
     else fail: Label
 ) -> PropertyLookupCache {
     let executable = exec_ctx.executable;
     assert_nonzero(executable);
-    let property_cache = executable.property_lookup_caches[load(cache)];
+    let mut property_cache = executable.property_lookup_caches[load(cache)];
     guard property_cache != 0 else fail;
     and(property_cache, PROPERTY_LOOKUP_CACHE_DATA_POINTER_MASK);
     assert_nonzero(property_cache);
@@ -124,9 +176,9 @@ inline fn walk_environment_chain(
     initial_environment: Environment,
     coordinate: EnvironmentCoordinate
 ) -> (DeclarativeEnvironment, u32) {
-    let environment = initial_environment;
+    let mut environment = initial_environment;
     let coordinate = &coordinate;
-    let hops = coordinate.hops;
+    let mut hops = coordinate.hops;
     let binding_index = coordinate.binding_index;
     assert_nonzero(environment);
     if hops != 0 {
@@ -159,8 +211,8 @@ inline fn walk_cached_environment_chain(
     initial_hops: u32,
     else failure: Label
 ) -> DeclarativeEnvironment {
-    let environment = initial_environment;
-    let hops = initial_hops;
+    let mut environment = initial_environment;
+    let mut hops = initial_hops;
     assert_nonzero(environment);
     if hops != 0 {
         do {
@@ -234,6 +286,10 @@ inline fn caged_primitive_storage_address(
     cage_base + ((cached_offset + alias(index) * alias(scale)) & PRIMITIVE_STORAGE_CAGE_OFFSET_MASK)
 }
 
+inline fn heap_region_offset(pointer: u64) -> u64 {
+    pointer & HEAP_REGION_OFFSET_MASK
+}
+
 inline fn load_caged_u8(cage_base: u64, cached_offset: u64, index: u32) -> u8 {
     let values: Sequence<u8> = alias(
         caged_primitive_storage_address(cage_base, cached_offset, index, 1)
@@ -293,7 +349,7 @@ inline fn primitive_storage_cage_base() -> u64 {
 }
 
 inline fn normalize_completion_value(initial_value: Value) -> (Value, Value) {
-    let value = initial_value;
+    let mut value = initial_value;
     let empty_tag: Value = Value<Empty>;
     # FIXME: Use an immutable value-producing if once its result can coalesce
     #        with an inline function output on AArch64.
@@ -309,10 +365,16 @@ inline fn return_to_caller(
 ) {
     let caller_frame = exec_ctx.caller_frame;
     guard caller_frame != 0 else top_level;
+    let mut result = return_value;
+    if exec_ctx.caller_is_construct {
+        if result is not Value<Object> {
+            result = exec_ctx.this_value;
+        }
+    }
     let return_pc = exec_ctx.caller_return_pc;
     let destination_index = exec_ctx.caller_dst_raw;
     caller_frame.program_counter = return_pc;
-    caller_frame.slots[destination_index] = return_value;
+    caller_frame.slots[destination_index] = result;
     let vm = current_vm();
     vm.running_execution_context = caller_frame;
     vm.interpreter_stack_top = alias(exec_ctx);
@@ -343,14 +405,14 @@ inline fn update_operand(
     slow_path: SlowPath
 ) {
     let value = load(operand);
-    guard let Value<i32>(integer) = value else slow;
+    guard let mut Value<i32>(integer) = value else slow;
     integer_operation(integer, 1) else overflow;
     store(operand, box_i32(integer));
     dispatch_next;
 
     let overflow = || @cold {
         let overflowed_integer = unbox_i32(load(operand));
-        let result = to_f64(overflowed_integer);
+        let mut result = to_f64(overflowed_integer);
         let one = unbox_f64(DOUBLE_ONE);
         float_operation(result, one);
         store(operand, box_f64(result));
@@ -369,7 +431,7 @@ inline fn post_update_operand(
     slow_path: SlowPath
 ) {
     let old = load(operand);
-    guard let Value<i32>(integer) = old else slow;
+    guard let mut Value<i32>(integer) = old else slow;
     store(dst, old);
     integer_operation(integer, 1) else overflow;
     store(operand, box_i32(integer));
@@ -377,7 +439,7 @@ inline fn post_update_operand(
 
     let overflow = || @cold {
         let overflowed_integer = unbox_i32(load(operand));
-        let result = to_f64(overflowed_integer);
+        let mut result = to_f64(overflowed_integer);
         let one = unbox_f64(DOUBLE_ONE);
         float_operation(result, one);
         store(operand, box_f64(result));
@@ -419,13 +481,13 @@ inline fn bitwise_binary(
     };
 
     let non_int32 = || @cold {
-        guard let lhs_integer = numeric_value_to_i32(lhs) else slow;
+        guard let mut lhs_integer = numeric_value_to_i32(lhs) else slow;
         guard let rhs_integer = numeric_value_to_i32(rhs) else slow;
         operation(lhs_integer, rhs_integer);
         store(dst, box_i32(lhs_integer));
         dispatch_next;
     };
-    guard let Value<i32>(lhs_integer) = lhs else non_int32;
+    guard let mut Value<i32>(lhs_integer) = lhs else non_int32;
     guard let Value<i32>(rhs_integer) = rhs else non_int32;
 
     operation(lhs_integer, rhs_integer);
@@ -444,8 +506,8 @@ inline fn signed_shift(
         call_binary_slow_path(slow_path, dst, lhs, rhs);
     };
 
-    guard let Value<i32>(integer) = lhs else slow;
-    guard let Value<i32>(count) = rhs else slow;
+    guard let mut Value<i32>(integer) = lhs else slow;
+    guard let mut Value<i32>(count) = rhs else slow;
     count = count & 31;
     operation(integer, count);
     store(dst, box_i32(integer));
@@ -534,9 +596,9 @@ inline fn strict_equality(
     not_equal: Label,
     else slow: Label
 ) {
-    let rhs_tag = extract_tag(rhs);
+    let mut rhs_tag = extract_tag(rhs);
     branch_eq(rhs_tag, INT32_TAG, rhs_i32);
-    let lhs_tag = extract_tag(lhs);
+    let mut lhs_tag = extract_tag(lhs);
     guard lhs_tag == rhs_tag else different_tags;
     equality_same_tag(lhs, rhs, lhs_tag, equal, not_equal, compare_f64) else slow;
 
@@ -584,9 +646,9 @@ inline fn loose_equality(
     not_equal: Label,
     else slow: Label
 ) {
-    let rhs_tag = extract_tag(rhs);
+    let mut rhs_tag = extract_tag(rhs);
     branch_eq(rhs_tag, INT32_TAG, rhs_i32);
-    let lhs_tag = extract_tag(lhs);
+    let mut lhs_tag = extract_tag(lhs);
     guard lhs_tag == rhs_tag else different_tags;
     equality_same_tag(lhs, rhs, lhs_tag, equal, not_equal, compare_f64) else slow;
 
@@ -809,16 +871,13 @@ inline fn load_primitive_string_utf16_code_unit(
 
     let short_string_info = string.utf16_short_string_byte_count_and_flag;
     if short_string_info lacks UTF16_SHORT_STRING_FLAG {
-        let encoded_length = utf16_data.length_in_code_units;
-        let signed_length: i64 = alias(encoded_length);
-        if signed_length < 0 {
-            let length = encoded_length << 1 >> 1;
-            guard length > alias(index) else out_of_bounds;
+        let length = utf16_data.length_in_code_units;
+        guard length > index else out_of_bounds;
+        if utf16_data.flags has UTF16_STRING_DATA_HAS_UTF16_STORAGE {
             let utf16_storage: Sequence<u16> = alias(utf16_data.string_storage);
             let code_unit: u32 = alias(utf16_storage[index]);
             code_unit
         } else {
-            guard encoded_length > alias(index) else out_of_bounds;
             let code_unit: u32 = alias(utf16_data.string_storage[index]);
             code_unit
         }
@@ -834,6 +893,35 @@ inline fn load_primitive_string_utf16_code_unit(
 # Handlers whose complete semantics live in their C++ slow path.
 
 # Bytecode handlers are kept in native layout order.
+
+handler Enter() {
+    let executable = exec_ctx.executable;
+    assert_nonzero(executable);
+    let registers_and_locals_count = executable.registers_and_locals_count;
+    let empty_tag: Value = Value<Empty>;
+    let mut slot_index: u64 = RESERVED_REGISTER_COUNT;
+    while slot_index + 1 < alias(registers_and_locals_count) {
+        let next_slot_index = slot_index + 1;
+        values[slot_index] = empty_tag;
+        values[next_slot_index] = empty_tag;
+        slot_index = slot_index + 2;
+    }
+    if slot_index < alias(registers_and_locals_count) {
+        values[slot_index] = empty_tag;
+    }
+    let constant_count = executable.asm_constants_size;
+    let constant_data = executable.asm_constants_data;
+    let mut write_index: u64 = alias(registers_and_locals_count);
+    let mut constant_index: u64 = 0;
+    while constant_index < alias(constant_count) {
+        assert_nonzero(constant_data);
+        values[write_index] = constant_data[constant_index];
+        constant_index = constant_index + 1;
+        write_index = write_index + 1;
+    }
+    exec_ctx.frame_initialized = true;
+    dispatch_next;
+}
 
 handler Mov(
     dst: out Operand,
@@ -1030,12 +1118,12 @@ handler Exp(
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
-) {
+) @cold {
     call_binary_slow_path(exp_values, dst, load(lhs), load(rhs));
 }
 
 handler ConcatString(
-    dst: out Operand,
+    dst: inout Operand,
     src: Operand
 ) @cold = call_slow_path(concat_string);
 
@@ -1610,7 +1698,7 @@ handler NewArrayWithLength(
 ) @cold = call_slow_path(new_array_with_length);
 
 handler ArrayAppend(
-    dst: out Operand,
+    dst: in Operand,
     src: Operand,
     is_spread: bool
 ) @cold = call_slow_path(array_append);
@@ -1823,8 +1911,8 @@ handler BitwiseNot(
 ) {
     match load(src) {
         Value<i32>(integer) => {
-            integer = ~integer;
-            store(dst, box_i32(integer));
+            let result = ~integer;
+            store(dst, box_i32(result));
             dispatch_next;
         },
 
@@ -1871,8 +1959,8 @@ handler UnsignedRightShift(
     };
 
     guard let Value<i32>(integer) = lhs else slow;
-    guard let Value<i32>(count) = rhs else slow;
-    let value = u32(integer);
+    guard let mut Value<i32>(count) = rhs else slow;
+    let mut value = u32(integer);
     let as_double = || @cold {
         store(dst, box_f64(u32_to_f64(value)));
         dispatch_next;
@@ -1891,16 +1979,49 @@ handler Mod(
     rhs: in Operand
 ) {
     let lhs = load(lhs);
-    let rhs = load(rhs);
 
     let slow = || @cold {
-        call_binary_slow_path(mod_values, dst, lhs, rhs);
+        let rhs_value = load(rhs);
+        call_binary_slow_path(mod_values, dst, lhs, rhs_value);
     };
 
-    guard let Value<i32>(lhs_int) = lhs else slow;
-    guard let Value<i32>(rhs_int) = rhs else slow;
+    let try_int64 = || @cold {
+        guard let lhs_integer = integer_value_to_i64(lhs) else slow;
+        guard let rhs_integer = integer_value_to_i64(load(rhs)) else slow;
+        guard rhs_integer != 0 else slow;
+
+        let zero = || @cold {
+            let negative_zero = || @cold {
+                store(dst, Value<NegativeZero>);
+                dispatch_next;
+            };
+            guard lhs_integer >= 0 else negative_zero;
+            branch_value_bits_negative(lhs, negative_zero);
+            let zero_value: Value = INT32_TAG_SHIFTED;
+            store(dst, zero_value);
+            dispatch_next;
+        };
+
+        # NB: Avoid signed division overflow for INT64_MIN % -1.
+        let zero_integer: i64 = 0;
+        let negative_one = zero_integer - 1;
+        guard rhs_integer != negative_one else zero;
+        let remainder = mod_i64(lhs_integer, rhs_integer);
+        guard remainder != 0 else zero;
+        let remainder_int32 = i32(remainder);
+        let widened_remainder = i64(remainder_int32);
+        guard widened_remainder == remainder else @cold {
+            store(dst, box_f64(i64_to_f64(remainder)));
+            dispatch_next;
+        };
+        store(dst, box_i32(remainder_int32));
+        dispatch_next;
+    };
+
+    guard let Value<i32>(lhs_int) = lhs else try_int64;
+    guard let Value<i32>(rhs_int) = load(rhs) else try_int64;
     guard rhs_int != 0 else slow;
-    guard lhs_int >= 0 else slow;
+    guard lhs_int >= 0 else try_int64;
     let [_, remainder] = divmod(lhs_int, rhs_int);
     store(dst, box_i32(remainder));
     dispatch_next;
@@ -1995,10 +2116,10 @@ handler UnaryMinus(
     dst: out Operand,
     src: in Operand
 ) {
-    let value = load(src);
+    let mut value = load(src);
 
     match value {
-        Value<i32>(integer) => {
+        Value<i32>(mut integer) => {
             let negative_zero = || @cold {
                 store(dst, Value<NegativeZero>);
                 dispatch_next;
@@ -2167,7 +2288,7 @@ handler PutByValue(
         }
     };
 
-    guard let Value<i32>(source_i32) = source else store_non_integer;
+    guard let mut Value<i32>(source_i32) = source else store_non_integer;
     match typed_array_kind {
         TYPED_ARRAY_KIND_UINT8 | TYPED_ARRAY_KIND_INT8 => {
             let values: Sequence<u8> = alias(
@@ -2239,7 +2360,13 @@ handler GetById(
     cache: PropertyLookupCacheIndex
 ) {
     let try_cache = || @cold {
-        guard call_interp(asm_try_get_by_id_cache) == 0 else slow;
+        let executable = exec_ctx.executable;
+        let caches: u64 = alias(executable.property_lookup_caches);
+        let cache_index: u64 = alias(load(cache));
+        let cache_pointer = caches + cache_index * PROPERTY_LOOKUP_CACHE_SIZE;
+        let result: Value = call_helper_with_two_arguments(asm_try_get_by_id_cache, load(base), cache_pointer);
+        guard result is not Value<Empty> else slow;
+        store(dst, result);
         dispatch_next;
     };
 
@@ -2247,27 +2374,157 @@ handler GetById(
         call_slow_path(get_by_id);
     };
 
+    let invoke_accessor_slow = || @cold {
+        guard call_interp(asm_try_inline_get_by_id_accessor) == 0 else {
+            call_slow_path(get_by_id_cached_accessor);
+        };
+        let inline_vm = current_vm();
+        exec_ctx = inline_vm.running_execution_context;
+        assert_nonzero(exec_ctx);
+        values = exec_ctx.slots;
+        let inline_executable = exec_ctx.executable;
+        assert_nonzero(inline_executable);
+        pb = inline_executable.bytecode_data;
+        pc = 0;
+        goto_handler(pc);
+    };
+
+    let invoke_accessor = |accessor_value: Value, receiver_object: Object, property_cache: PropertyLookupCache| @cold {
+        let accessor: Accessor = unbox_object(accessor_value);
+        let getter = accessor.getter;
+        guard getter != 0 else {
+            store(dst, Value<Undefined>);
+            dispatch_next;
+        };
+        let function: Object = alias(getter);
+        let flags = function.flags;
+        guard flags has OBJECT_FLAG_IS_RAW_NATIVE_FUNCTION else invoke_accessor_slow;
+
+        if flags has OBJECT_FLAG_IS_DIRECT_GETTER_FUNCTION {
+            if property_cache.direct_getter_validated != 0 {
+                guard let result = load_direct_getter_value(function, receiver_object) else invoke_accessor_slow;
+                store(dst, result);
+                dispatch_next;
+            }
+            goto invoke_accessor_slow();
+        }
+
+        let raw_native_function: RawNativeFunction = alias(function);
+        let native_function_index = raw_native_function.native_function_index;
+        let native_table_vm = current_vm();
+        let native_function_entry = &native_table_vm.native_function_table[native_function_index];
+        let native_function_type = native_function_entry.type;
+        assert_lt_unsigned(native_function_type, NATIVE_FUNCTION_TYPE_COUNT);
+
+        # Construct the lightweight zero-argument frame used by raw native getters.
+        let native_stack_vm = current_vm();
+        let frame_base = native_stack_vm.interpreter_stack_top;
+        let native_stack_limit = native_stack_vm.interpreter_stack_limit;
+        let native_frame: ExecutionContext = alias(frame_base);
+        let native_frame_end: u64 = frame_base + SIZEOF_EXECUTION_CONTEXT;
+        assert_ge_unsigned(native_frame_end, frame_base);
+        guard native_frame_end <= native_stack_limit else invoke_accessor_slow;
+        let native_limit_vm = current_vm();
+        let machine_stack_limit: u64 = native_limit_vm.stack_base + VM_STACK_SPACE_LIMIT;
+        assert_ge_unsigned(machine_stack_limit, native_limit_vm.stack_base);
+        guard machine_stack_limit <= fp else invoke_accessor_slow;
+        let native_stack_update_vm = current_vm();
+        native_stack_update_vm.interpreter_stack_top = native_frame_end;
+        # RawNativeFunction is the zero-valued native function table type.
+        native_frame.slot_count = native_function_type;
+        native_frame.argument_count = native_function_type;
+        native_frame.passed_argument_count = 0;
+        let realm = function.shape.realm;
+        native_frame.function = function;
+        native_frame.realm = realm;
+        let lexical_environment = exec_ctx.lexical_environment;
+        let variable_environment = exec_ctx.variable_environment;
+        assert_nonzero(lexical_environment);
+        assert_nonzero(variable_environment);
+        native_frame.lexical_environment = lexical_environment;
+        native_frame.variable_environment = variable_environment;
+        native_frame.private_environment = exec_ctx.private_environment;
+        let receiver: Value = alias(box_object(receiver_object));
+        native_frame.this_value = receiver;
+        native_frame.script_or_module = zeroed();
+        native_frame.executable = null;
+        native_frame.program_counter = 0;
+        native_frame.skip_when_determining_incumbent_counter = 0;
+        native_frame.yield_continuation = EXECUTION_CONTEXT_NO_YIELD_CONTINUATION;
+        native_frame.yield_is_await = false;
+        native_frame.yield_value_is_iterator_result = false;
+        native_frame.caller_is_construct = false;
+        native_frame.frame_initialized = false;
+        let native_pc: u32 = pc;
+        let [destination_offset, _] = load_pair32(
+            [pb, pc, dst],
+            [pb, pc, base]
+        );
+        exec_ctx.program_counter = native_pc;
+        native_frame.caller_frame = exec_ctx;
+        # The exception helper only needs a PC within the current instruction.
+        native_frame.caller_return_pc = native_pc + 1;
+        native_frame.caller_dst_raw = destination_offset;
+        let native_running_vm = current_vm();
+        native_running_vm.running_execution_context = native_frame;
+        exec_ctx = native_frame;
+        values = exec_ctx.slots;
+        let native_function = native_function_entry.function;
+        let mut [native_return, variant] = call_raw_native(native_function);
+        let native_payload = native_return;
+        variant = variant & 255;
+        assert_lt_unsigned(variant, 2);
+        guard variant == 0 else @cold {
+            let helper_argument = native_payload;
+            let exception_pc: i32 = call_helper(
+                asm_helper_handle_raw_native_exception,
+                helper_argument
+            );
+            guard exception_pc >= 0 else @cold {
+                exit;
+            };
+            let exception_vm = current_vm();
+            exec_ctx = exception_vm.running_execution_context;
+            assert_nonzero(exec_ctx);
+            values = exec_ctx.slots;
+            let exception_executable = exec_ctx.executable;
+            assert_nonzero(exception_executable);
+            pb = exception_executable.bytecode_data;
+            pc = exec_ctx.program_counter;
+            goto_handler(pc);
+        };
+        let caller_frame = exec_ctx.caller_frame;
+        assert_nonzero(caller_frame);
+        let return_vm = current_vm();
+        return_vm.running_execution_context = caller_frame;
+        return_vm.interpreter_stack_top = alias(exec_ctx);
+        exec_ctx = caller_frame;
+        values = exec_ctx.slots;
+        store(dst, native_payload);
+        dispatch_next;
+    };
+
     guard let Value<Object>(object) = load(base) else try_cache;
     let shape = object.shape;
     guard let property_cache = load_property_lookup_cache(cache) else try_cache;
     guard property_cache.shape == shape else try_cache;
-    let cached_prototype = property_cache.prototype;
+    guard property_cache.entry_type != PROPERTY_LOOKUP_CACHE_ENTRY_TYPE_GET_MISSING_PROPERTY else try_cache;
+    let load_cached_value = |holder: Object, object: Object, property_cache: PropertyLookupCache, shape: Shape| {
+        guard property_cache.shape_dictionary_generation == shape.dictionary_generation else try_cache;
+        let value = holder.named_properties[property_cache.property_offset];
+        guard value is not Value<Accessor> else invoke_accessor(value, object, property_cache);
+        store(dst, value);
+        dispatch_next;
+    };
 
-    # FIXME: Restore a value-producing if once SSA destruction can coalesce its
-    #        holder phi with object without adding a hot-path jump.
-    let holder = object;
-    if cached_prototype != 0 {
+    let cached_prototype = property_cache.prototype;
+    guard cached_prototype == 0 else @cold {
         let prototype_chain_validity = property_cache.prototype_chain_validity;
         guard prototype_chain_validity != 0 else try_cache;
         guard prototype_chain_validity.valid != 0 else try_cache;
-        holder = cached_prototype;
-    }
-
-    guard property_cache.shape_dictionary_generation == shape.dictionary_generation else try_cache;
-    let value = holder.named_properties[property_cache.property_offset];
-    guard value is not Value<Accessor> else try_cache;
-    store(dst, value);
-    dispatch_next;
+        goto load_cached_value(cached_prototype, object, property_cache, shape);
+    };
+    goto load_cached_value(object, object, property_cache, shape);
 }
 
 handler GetByIdWithThis(
@@ -2623,7 +2880,7 @@ handler Call(
     let metadata = shared_data.asm_call_metadata;
     guard metadata has SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_CAN_INLINE_CALL else slow;
     guard metadata lacks SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_NEEDS_ENVIRONMENT_OR_THIS_VALUE_RESOLUTION else invoke_interp_inline;
-    let receiver: Value = Value<Empty>;
+    let mut receiver: Value = Value<Empty>;
     if metadata has SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_USES_THIS {
         receiver = load(this_value);
         if metadata lacks SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_STRICT {
@@ -2679,43 +2936,26 @@ handler Call(
     frame.saved_lexical_environment = empty_tag;
     frame.script_or_module = ecmascript_function.script_or_module;
     frame.program_counter = 0;
+    let frame_id_vm = current_vm();
+    let frame_id = frame_id_vm.interpreter_stack_next_frame_id;
+    frame.frame_id = frame_id;
+    frame_id_vm.interpreter_stack_next_frame_id = frame_id + 1;
     frame.skip_when_determining_incumbent_counter = 0;
     frame.yield_continuation = EXECUTION_CONTEXT_NO_YIELD_CONTINUATION;
     frame.yield_is_await = false;
     frame.yield_value_is_iterator_result = false;
     frame.caller_is_construct = false;
+    frame.frame_initialized = false;
     frame.caller_frame = exec_ctx;
     let [_, return_pc, return_destination] = call_site_info(length, dst);
     frame.caller_return_pc = return_pc;
     frame.caller_dst_raw = return_destination;
-    let slot_index: u64 = RESERVED_REGISTER_COUNT;
-    while slot_index + 1 < alias(registers_and_locals_count) {
-        let next_slot_index = slot_index + 1;
-        frame_values[slot_index] = empty_tag;
-        frame_values[next_slot_index] = empty_tag;
-        slot_index = slot_index + 2;
-    }
-    if slot_index < alias(registers_and_locals_count) {
-        frame_values[slot_index] = empty_tag;
-    }
-    let executable = frame.executable;
-    assert_nonzero(executable);
-    let constant_count = executable.asm_constants_size;
-    let constant_data = executable.asm_constants_data;
-    let write_index: u64 = alias(registers_and_locals_count);
-    let constant_index: u64 = 0;
-    while constant_index < alias(constant_count) {
-        assert_nonzero(constant_data);
-        frame_values[write_index] = constant_data[constant_index];
-        constant_index = constant_index + 1;
-        write_index = write_index + 1;
-    }
     let actual_argument_count = load(argument_count);
     assert_ge_unsigned(formal_count, actual_argument_count);
-    write_index = alias(registers_and_locals_count) + alias(constant_count);
+    let mut write_index: u64 = alias(callee_slot_count);
     let caller_values = exec_ctx.slots;
     let argument_operand_indices = &arguments;
-    let argument_index: u32 = 0;
+    let mut argument_index: u32 = 0;
     while argument_index < actual_argument_count {
         frame_values[write_index] = caller_values[argument_operand_indices[argument_index]];
         argument_index = argument_index + 1;
@@ -2793,11 +3033,16 @@ handler Call(
         # Raw native frames deliberately have no executable.
         native_frame.executable = null;
         native_frame.program_counter = 0;
+        let native_frame_id_vm = current_vm();
+        let native_frame_id = native_frame_id_vm.interpreter_stack_next_frame_id;
+        native_frame.frame_id = native_frame_id;
+        native_frame_id_vm.interpreter_stack_next_frame_id = native_frame_id + 1;
         native_frame.skip_when_determining_incumbent_counter = 0;
         native_frame.yield_continuation = EXECUTION_CONTEXT_NO_YIELD_CONTINUATION;
         native_frame.yield_is_await = false;
         native_frame.yield_value_is_iterator_result = false;
         native_frame.caller_is_construct = false;
+        native_frame.frame_initialized = false;
         let [native_pc, after_pc, destination_offset] = call_site_info(length, dst);
         exec_ctx.program_counter = native_pc;
         native_frame.caller_frame = exec_ctx;
@@ -2806,7 +3051,7 @@ handler Call(
         let native_caller_values = exec_ctx.slots;
         let native_argument_operand_indices = &arguments;
         let native_frame_values = native_frame.slots;
-        let argument_index: u32 = 0;
+        let mut argument_index: u32 = 0;
         while argument_index < actual_argument_count {
             native_frame_values[argument_index] = native_caller_values[native_argument_operand_indices[argument_index]];
             argument_index = argument_index + 1;
@@ -2822,7 +3067,7 @@ handler Call(
         let native_function = native_function_entry.function;
         # FIXME: Bind native_payload directly once the allocator can keep the
         #        ABI-pinned result live alongside the native result variant.
-        let [native_return, variant] = call_raw_native(native_function);
+        let mut [native_return, variant] = call_raw_native(native_function);
         let native_payload = native_return;
         variant = variant & 255;
         assert_lt_unsigned(variant, 2);
@@ -2871,7 +3116,7 @@ handler CallBuiltinMathAbs(
     };
 
     validate_builtin(callee, BUILTIN_MATH_ABS) else slow;
-    let argument_value = load(argument);
+    let mut argument_value = load(argument);
     match argument_value {
         Value<f64> => {
             clear_bit(argument_value, 63);
@@ -2879,9 +3124,9 @@ handler CallBuiltinMathAbs(
             dispatch_next;
         },
 
-        Value<i32>(integer_value) => {
+        Value<i32>(mut integer_value) => {
             let overflow = || @cold {
-                let overflowed_integer = unbox_i32(argument_value);
+                let mut overflowed_integer = unbox_i32(argument_value);
                 neg(overflowed_integer);
                 let unsigned_integer: u32 = alias(overflowed_integer);
                 store(dst, box_f64(u32_to_f64(unsigned_integer)));
@@ -3113,7 +3358,7 @@ handler CallBuiltinStringFromCharCode(
     };
 
     validate_builtin(callee, BUILTIN_STRING_FROM_CHAR_CODE) else slow;
-    guard let Value<i32>(code_unit) = load(argument) else slow;
+    guard let mut Value<i32>(code_unit) = load(argument) else slow;
     let single_utf16_code_unit = || {
         assert_lt_unsigned(code_unit, 0x10000);
         let result: Value = call_helper(asm_helper_single_utf16_code_unit_string, code_unit);
@@ -3287,7 +3532,7 @@ handler IteratorNext(
     dst: out Operand,
     iterator_object: Operand,
     iterator_next: Operand,
-    iterator_done: Operand
+    iterator_done: inout Operand
 ) @cold = call_slow_path(asm_slow_path_iterator_next);
 
 handler IteratorNextUnpack(
@@ -3295,14 +3540,14 @@ handler IteratorNextUnpack(
     dst_done: out Operand,
     iterator_object: Operand,
     iterator_next: Operand,
-    iterator_done: Operand
+    iterator_done: inout Operand
 ) @cold = call_slow_path(iterator_next_unpack);
 
 handler IteratorToArray(
     dst: out Operand,
     iterator_object: Operand,
     iterator_next_method: Operand,
-    iterator_done_property: Operand
+    iterator_done_property: inout Operand
 ) @cold = call_slow_path(iterator_to_array);
 
 handler CallConstruct(
@@ -3511,8 +3756,8 @@ handler DeleteVariable(
 ) @cold = call_slow_path(delete_variable);
 
 handler GetCompletionFields(
-    type_dst: Operand,
-    value_dst: Operand,
+    type_dst: out Operand,
+    value_dst: out Operand,
     completion: Operand
 ) @cold = call_slow_path(get_completion_fields);
 

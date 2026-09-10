@@ -9,14 +9,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/StyleValues/FilterStyleValue.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Layout/Node.h>
 
 namespace Web::HTML {
 
@@ -57,11 +56,9 @@ void CanvasRenderingContext2D::did_draw_hook()
 {
     m_element->set_canvas_content_dirty();
 
-    // NB: Invalidate the cached DrawCanvas command so that if another change causes the display list to be recorded, it
-    // contains the new content generation and damages the canvas. Don't request a display list recording here: the new
-    // content reaches the compositor through the canvas surface registry when the canvas is presented.
-    if (auto paintable = m_element->unsafe_paintable())
-        paintable->invalidate_paint_cache();
+    // NB: Don't request a display list recording here: the new content reaches the compositor through the canvas
+    // surface registry when the canvas is presented, and the cached DrawCanvas command is invalidated when the
+    // content generation moves in prepare_for_compositing.
     m_element->set_needs_repaint(InvalidateDisplayList::No);
 }
 
@@ -83,10 +80,10 @@ DOM::EventTarget& CanvasRenderingContext2D::context_event_target()
 Gfx::Color CanvasRenderingContext2D::resolve_drop_shadow_color(CSS::DropShadowFilterStyleValue const& drop_shadow) const
 {
     DOM::AbstractElement abstract_element { *m_element };
-    m_element->document().update_style_if_needed_for_element(abstract_element);
+    m_element->document().update_style_for_element(abstract_element, DOM::Document::StyleUpdateMode::OnlyIfNeeded);
 
     Gfx::Color color = Gfx::Color::Black;
-    if (drop_shadow.color() && m_element->computed_values()) {
+    if (drop_shadow.color() && m_element->has_style()) {
         auto color_context = CSS::ColorResolutionContext::for_element(abstract_element);
         color = drop_shadow.color()->to_color(color_context).value_or(Gfx::Color::Black);
     }

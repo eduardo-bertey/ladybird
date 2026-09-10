@@ -110,8 +110,10 @@ void WalkerActor::handle_message(Message const& message)
     }
 
     if (message.type == "getLayoutInspector"sv) {
-        if (!m_layout_inspector)
+        if (!m_layout_inspector) {
             m_layout_inspector = devtools().register_actor<LayoutInspectorActor>(m_tab, make_weak_ptr<WalkerActor>());
+            add_child_actor(*m_layout_inspector);
+        }
 
         JsonObject actor;
         actor.set("actor"sv, m_layout_inspector->name());
@@ -569,6 +571,7 @@ JsonValue WalkerActor::serialize_node(JsonObject const& node) const
     auto is_scrollable = node.get_bool("scrollable"sv).value_or(false);
 
     auto is_shadow_root = false;
+    auto is_pseudo_element = false;
     auto is_after_pseudo_element = false;
     auto is_before_pseudo_element = false;
     auto is_marker_pseudo_element = false;
@@ -584,6 +587,7 @@ JsonValue WalkerActor::serialize_node(JsonObject const& node) const
     if (type == "shadow-root"sv) {
         is_shadow_root = true;
     } else if (type == "pseudo-element"sv) {
+        is_pseudo_element = true;
         auto pseudo_element = node.get_integer<UnderlyingType<Web::CSS::PseudoElement>>("pseudo-element"sv).map([](auto value) {
             VERIFY(value < to_underlying(Web::CSS::PseudoElement::KnownPseudoElementCount));
             return static_cast<Web::CSS::PseudoElement>(value);
@@ -638,6 +642,7 @@ JsonValue WalkerActor::serialize_node(JsonObject const& node) const
     serialized.set("isInHTMLDocument"sv, true);
     serialized.set("isMarkerPseudoElement"sv, is_marker_pseudo_element);
     serialized.set("isNativeAnonymous"sv, false);
+    serialized.set("isPseudoElement"sv, is_pseudo_element);
     serialized.set("isScrollable"sv, is_scrollable);
     serialized.set("isShadowHost"sv, false);
     serialized.set("isShadowRoot"sv, is_shadow_root);
@@ -1060,6 +1065,10 @@ void WalkerActor::clear_dom_tree_state()
     m_dom_node_mutations.clear();
     m_has_new_mutations_since_last_mutations_request = false;
     clear_dom_tree_cache();
+    for (auto const& actor : m_node_actors) {
+        if (auto node_actor = actor.value.strong_ref())
+            unregister_child_actor(*node_actor);
+    }
     m_node_actors.clear();
 }
 
@@ -1104,6 +1113,7 @@ NodeActor const& WalkerActor::actor_for_node(JsonObject const& node)
     }
 
     auto& node_actor = devtools().register_actor<NodeActor>(identifier, *this);
+    add_child_actor(node_actor);
     m_node_actors.set(identifier, node_actor);
 
     return node_actor;

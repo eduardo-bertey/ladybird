@@ -62,6 +62,10 @@
 #    cmakedefine01 DEVTOOLS_DEBUG
 #endif
 
+#ifndef DISPLAY_LIST_RUNS_DEBUG
+#    cmakedefine01 DISPLAY_LIST_RUNS_DEBUG
+#endif
+
 #ifndef DNS_DEBUG
 #    cmakedefine01 DNS_DEBUG
 #endif
@@ -134,6 +138,14 @@
 #    cmakedefine01 IMAGE_LOADER_DEBUG
 #endif
 
+#ifndef ISOBMFF_DEBUG
+#    cmakedefine01 ISOBMFF_DEBUG
+#endif
+
+#ifndef ISOBMFF_TRACE_DEBUG
+#    cmakedefine01 ISOBMFF_TRACE_DEBUG
+#endif
+
 #ifndef JS_MODULE_DEBUG
 #    cmakedefine01 JS_MODULE_DEBUG
 #endif
@@ -202,6 +214,10 @@
 #    cmakedefine01 REGEX_DEBUG
 #endif
 
+#ifndef RENDERING_SCHEDULER_DEBUG
+#    cmakedefine01 RENDERING_SCHEDULER_DEBUG
+#endif
+
 #ifndef REQUESTSERVER_DEBUG
 #    cmakedefine01 REQUESTSERVER_DEBUG
 #endif
@@ -228,10 +244,6 @@
 
 #ifndef SYNTAX_HIGHLIGHTING_DEBUG
 #    cmakedefine01 SYNTAX_HIGHLIGHTING_DEBUG
-#endif
-
-#ifndef STYLE_INVALIDATION_DEBUG
-#    cmakedefine01 STYLE_INVALIDATION_DEBUG
 #endif
 
 #ifndef TEXTEDITOR_DEBUG

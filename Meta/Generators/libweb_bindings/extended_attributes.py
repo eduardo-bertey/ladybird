@@ -2,11 +2,16 @@
 #
 # SPDX-License-Identifier: BSD-2-Clause
 
+from __future__ import annotations
+
 from Generators.libweb_bindings.includes import GeneratedIncludes
 
 
 def wrap_with_extended_attribute_exposure_checks(
-    includes: GeneratedIncludes, extended_attributes: dict[str, str], text: str
+    includes: GeneratedIncludes,
+    extended_attributes: dict[str, str],
+    text: str,
+    experimental_name: str | None = None,
 ) -> str:
     if "SecureContext" in extended_attributes:
         includes.add("LibWeb/Bindings/PrincipalHostDefined.h")
@@ -23,9 +28,13 @@ def wrap_with_extended_attribute_exposure_checks(
 """
 
     if "Experimental" in extended_attributes:
-        includes.add("LibWeb/HTML/UniversalGlobalScope.h")
+        # The name is what a site-compatibility rule lists to expose this member for the sites it matches.
+        if experimental_name is None:
+            raise ValueError("[Experimental] members need a name for site-compatibility rules")
+        includes.add("LibWeb/Bindings/PrincipalHostDefined.h")
+        includes.add("LibWeb/HTML/WindowOrWorkerGlobalScope.h")
         text = text.replace("\n", "\n    ")
-        text = f"""    if (HTML::UniversalGlobalScopeMixin::expose_experimental_interfaces()) {{
+        text = f"""    if (HTML::WindowOrWorkerGlobalScopeMixin::expose_experimental_interface(Bindings::principal_host_defined_environment_settings_object(realm), "{experimental_name}"sv)) {{
     {text}    }}
 """
 
@@ -39,7 +48,7 @@ def wrap_with_ce_reactions(includes: GeneratedIncludes, expression: str, this_ob
         // For [CEReactions]: https://html.spec.whatwg.org/multipage/custom-elements.html#cereactions
 
         // 1. Push a new element queue onto this object's relevant agent's custom element reactions stack.
-        auto& reactions_stack = HTML::relevant_similar_origin_window_agent({this_object_realm}.global_object()).custom_element_reactions_stack;
+        auto& reactions_stack = Bindings::main_thread_similar_origin_window_agent().custom_element_reactions_stack;
         reactions_stack.element_queue_stack.append({{}});
 
         // 2. Run the originally-specified steps for this construct, catching any exceptions. If the steps return a value, let value be the returned value. If they throw an exception, let exception be the thrown exception.

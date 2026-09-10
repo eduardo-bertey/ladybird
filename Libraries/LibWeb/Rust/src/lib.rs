@@ -4,38 +4,26 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-// Unconditional in every build flavor: the HTML tokenizer transfers allocation
-// ownership across the FFI boundary, so the crate-global allocator must stay
-// the Ladybird allocator for C++-side frees to stay balanced.
+// The browser transfers HTML buffers to C++, so both sides must use the same allocator.
+// The standalone replay program has no C++ runtime or cross-language buffer transfers.
+#[cfg(not(feature = "style-replay"))]
+/// cbindgen:ignore
 #[path = "../../../RustAllocator.rs"]
 mod rust_allocator;
+
+#[path = "../../../RustPanic.rs"]
+mod rust_panic;
 
 mod encoding_detection;
 
 pub mod css;
 pub mod layout;
+pub mod painting;
+pub mod svg;
 
 pub use libweb_html_tokenizer as html_tokenizer;
 
-use std::panic::AssertUnwindSafe;
-use std::panic::catch_unwind;
-
-fn abort_on_panic<F: FnOnce() -> R, R>(f: F) -> R {
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(result) => result,
-        Err(payload) => {
-            let message = if let Some(message) = payload.downcast_ref::<&str>() {
-                (*message).to_string()
-            } else if let Some(message) = payload.downcast_ref::<String>() {
-                message.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            eprintln!("Rust panic at FFI boundary: {message}");
-            std::process::abort();
-        }
-    }
-}
+use crate::rust_panic::abort_on_panic;
 
 unsafe fn bytes_from_raw<'a>(bytes: *const u8, len: usize) -> Option<&'a [u8]> {
     unsafe {

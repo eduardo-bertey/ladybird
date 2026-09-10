@@ -31,6 +31,16 @@ SessionHistoryEntry::~SessionHistoryEntry() = default;
 RefPtr<DocumentState> SessionHistoryEntry::document_state() const { return m_document_state; }
 void SessionHistoryEntry::set_document_state(RefPtr<DocumentState> document_state) { m_document_state = move(document_state); }
 
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#she-document
+UniqueNodeID SessionHistoryEntry::document_id() const
+{
+    // To get a session history entry's document, return its document state's document.
+    VERIFY(m_document_state);
+    auto id = m_document_state->document_id();
+    VERIFY(id.has_value());
+    return id.release_value();
+}
+
 SessionHistoryEntry::SessionHistoryEntry()
     : m_classic_history_api_state(MUST(structured_serialize_for_storage(JS::VM::the(), JS::js_null())))
     , m_navigation_api_state(MUST(structured_serialize_for_storage(JS::VM::the(), JS::js_undefined())))
@@ -39,30 +49,38 @@ SessionHistoryEntry::SessionHistoryEntry()
 {
 }
 
-static SessionHistoryDocumentStateDescriptor create_session_history_document_state_descriptor(DocumentState& document_state)
+SessionHistoryEntryDescriptor create_initial_session_history_entry_descriptor(CrossProcessId document_state_id, Optional<URL::Origin> opener_origin, Optional<URL::URL> opener_base_url, Utf16String navigable_target_name)
 {
-    Vector<SessionHistoryNestedHistoryDescriptor> nested_history_descriptors;
-    nested_history_descriptors.ensure_capacity(document_state.nested_histories().size());
-    for (auto const& nested_history : document_state.nested_histories()) {
-        Vector<SessionHistoryEntryDescriptor> nested_entry_descriptors;
-        nested_entry_descriptors.ensure_capacity(nested_history.entries.size());
-        for (auto const& nested_entry : nested_history.entries) {
-            // NB: UI-process session history mirrors only concrete used history steps. A child entry whose step is
-            //     still "pending" has not been attached to the traversable's step graph yet.
-            if (!nested_entry->step_value().has_value())
-                continue;
-            nested_entry_descriptors.unchecked_append(create_session_history_entry_descriptor(nested_entry));
-        }
+    // NB: An origin and about base URL are recorded only where they are inherited from an opener. The process hosting
+    //     this traversable determines the origin of a document that inherits none, and nothing outside it needs to know which.
+    return {
+        .step = 0,
+        .url = URL::about_blank(),
+        .document_state = {
+            .id = document_state_id,
+            .history_policy_container = DocumentState::Client::Tag,
+            .request_referrer = Fetch::Infrastructure::Request::Referrer::Client,
+            .request_referrer_policy = ReferrerPolicy::DEFAULT_REFERRER_POLICY,
+            .initiator_origin = opener_origin,
+            .origin = move(opener_origin),
+            .about_base_url = move(opener_base_url),
+            .resource = Empty {},
+            .reload_pending = false,
+            .ever_populated = false,
+            .navigable_target_name = move(navigable_target_name),
+            .nested_histories = {},
+        },
+        .classic_history_api_state = {},
+        .navigation_api_state = {},
+        .navigation_api_key = generate_random_uuid_utf16(),
+        .navigation_api_id = generate_random_uuid_utf16(),
+        .scroll_restoration_mode = ScrollRestorationMode::Auto,
+        .scroll_position_data = {},
+    };
+}
 
-        // NB: Keep the nested-history descriptor even when every entry in it is still pending. The entries are not
-        //     used history steps yet, but the descriptor id preserves the live child navigable identity when the UI
-        //     process later reseeds an already-loaded document.
-        nested_history_descriptors.unchecked_append({
-            .id = nested_history.id,
-            .entries = move(nested_entry_descriptors),
-        });
-    }
-
+SessionHistoryDocumentStateDescriptor create_session_history_document_state_descriptor(DocumentState const& document_state)
+{
     return {
         .id = document_state.cross_process_id(),
         .history_policy_container = document_state.history_policy_container(),
@@ -75,7 +93,7 @@ static SessionHistoryDocumentStateDescriptor create_session_history_document_sta
         .reload_pending = document_state.reload_pending(),
         .ever_populated = document_state.ever_populated(),
         .navigable_target_name = document_state.navigable_target_name(),
-        .nested_histories = move(nested_history_descriptors),
+        .nested_histories = {},
     };
 }
 
@@ -100,6 +118,84 @@ SessionHistoryEntryDescriptor create_session_history_entry_descriptor(SessionHis
     };
 }
 
+Optional<SessionHistoryEntryPersistedState> create_session_history_entry_persisted_state(SessionHistoryEntry const& entry)
+{
+    auto document_state = entry.document_state();
+    if (!document_state)
+        return {};
+
+    return SessionHistoryEntryPersistedState {
+        .entry_identity = session_history_entry_identity(entry),
+        .scroll_position_data = entry.scroll_position_data(),
+    };
+}
+
+SessionHistoryEntryIdentity session_history_entry_identity(SessionHistoryEntry const& entry)
+{
+    auto document_state = entry.document_state();
+    VERIFY(document_state);
+    return {
+        .document_state_id = document_state->cross_process_id(),
+        .navigation_api_id = entry.navigation_api_id(),
+    };
+}
+
+SessionHistoryEntryIdentity session_history_entry_identity(SessionHistoryEntryDescriptor const& entry)
+{
+    return {
+        .document_state_id = entry.document_state.id,
+        .navigation_api_id = entry.navigation_api_id,
+    };
+}
+
+PendingSessionHistoryEntryDescriptor create_pending_session_history_entry_descriptor(SessionHistoryEntry const& entry)
+{
+    VERIFY(!entry.step_value().has_value());
+    SessionHistoryDocumentStateDescriptor document_state_descriptor;
+    if (auto document_state = entry.document_state())
+        document_state_descriptor = create_session_history_document_state_descriptor(*document_state);
+
+    return {
+        .url = entry.url(),
+        .document_state = move(document_state_descriptor),
+        .classic_history_api_state = entry.classic_history_api_state(),
+        .navigation_api_state = entry.navigation_api_state(),
+        .navigation_api_key = entry.navigation_api_key(),
+        .navigation_api_id = entry.navigation_api_id(),
+        .scroll_restoration_mode = entry.scroll_restoration_mode(),
+        .scroll_position_data = entry.scroll_position_data(),
+    };
+}
+
+PendingSessionHistoryEntryDescriptor create_pending_session_history_entry_descriptor(SessionHistoryEntryDescriptor entry)
+{
+    return {
+        .url = move(entry.url),
+        .document_state = move(entry.document_state),
+        .classic_history_api_state = move(entry.classic_history_api_state),
+        .navigation_api_state = move(entry.navigation_api_state),
+        .navigation_api_key = move(entry.navigation_api_key),
+        .navigation_api_id = move(entry.navigation_api_id),
+        .scroll_restoration_mode = entry.scroll_restoration_mode,
+        .scroll_position_data = move(entry.scroll_position_data),
+    };
+}
+
+SessionHistoryEntryDescriptor create_session_history_entry_descriptor(PendingSessionHistoryEntryDescriptor entry, i32 step)
+{
+    return {
+        .step = step,
+        .url = move(entry.url),
+        .document_state = move(entry.document_state),
+        .classic_history_api_state = move(entry.classic_history_api_state),
+        .navigation_api_state = move(entry.navigation_api_state),
+        .navigation_api_key = move(entry.navigation_api_key),
+        .navigation_api_id = move(entry.navigation_api_id),
+        .scroll_restoration_mode = entry.scroll_restoration_mode,
+        .scroll_position_data = move(entry.scroll_position_data),
+    };
+}
+
 SameDocumentNavigationEntry create_same_document_navigation_entry(SessionHistoryEntry const& entry)
 {
     auto document_state = entry.document_state();
@@ -116,177 +212,84 @@ SameDocumentNavigationEntry create_same_document_navigation_entry(SessionHistory
     };
 }
 
-static bool session_history_nested_history_descriptors_match(Vector<SessionHistoryNestedHistoryDescriptor> const& a, Vector<SessionHistoryNestedHistoryDescriptor> const& b);
-
-static bool serialized_directives_match(Vector<ContentSecurityPolicy::Directives::SerializedDirective> const& a, Vector<ContentSecurityPolicy::Directives::SerializedDirective> const& b)
+SessionHistoryEntryIdentity session_history_entry_identity(SameDocumentNavigationEntry const& entry)
 {
-    if (a.size() != b.size())
-        return false;
-
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i].name != b[i].name || a[i].value != b[i].value)
-            return false;
-    }
-    return true;
+    return {
+        .document_state_id = entry.document_state_id,
+        .navigation_api_id = entry.navigation_api_id,
+    };
 }
 
-static bool serialized_policies_match(Vector<ContentSecurityPolicy::SerializedPolicy> const& a, Vector<ContentSecurityPolicy::SerializedPolicy> const& b)
+void apply_session_history_entry_descriptor_from_ui_process(SessionHistoryEntry& entry, SessionHistoryEntryDescriptor& entry_descriptor)
 {
-    if (a.size() != b.size())
-        return false;
-
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (!serialized_directives_match(a[i].directives, b[i].directives)
-            || a[i].disposition != b[i].disposition
-            || a[i].source != b[i].source
-            || a[i].self_origin != b[i].self_origin
-            || a[i].pre_parsed_policy_string != b[i].pre_parsed_policy_string)
-            return false;
-    }
-    return true;
+    entry.set_url(move(entry_descriptor.url));
+    entry.set_step(static_cast<int>(entry_descriptor.step));
+    entry.set_classic_history_api_state(move(entry_descriptor.classic_history_api_state));
+    entry.set_navigation_api_state(move(entry_descriptor.navigation_api_state));
+    entry.set_navigation_api_key(move(entry_descriptor.navigation_api_key));
+    entry.set_navigation_api_id(move(entry_descriptor.navigation_api_id));
+    entry.set_scroll_restoration_mode(entry_descriptor.scroll_restoration_mode);
+    entry.set_scroll_position_data(move(entry_descriptor.scroll_position_data));
 }
 
-static bool embedder_policies_match(EmbedderPolicy const& a, EmbedderPolicy const& b)
+void apply_session_history_document_state_descriptor_from_ui_process(DocumentState& document_state, SessionHistoryDocumentStateDescriptor const& document_state_descriptor)
 {
-    return a.value == b.value
-        && a.report_only_value == b.report_only_value
-        && a.reporting_endpoint == b.reporting_endpoint
-        && a.report_only_reporting_endpoint == b.report_only_reporting_endpoint;
+    VERIFY(document_state.cross_process_id() == document_state_descriptor.id);
+    document_state.set_history_policy_container(document_state_descriptor.history_policy_container);
+    document_state.set_request_referrer(document_state_descriptor.request_referrer);
+    document_state.set_request_referrer_policy(document_state_descriptor.request_referrer_policy);
+    document_state.set_initiator_origin(document_state_descriptor.initiator_origin);
+    document_state.set_origin(document_state_descriptor.origin);
+    document_state.set_about_base_url(document_state_descriptor.about_base_url);
+    document_state.set_resource(document_state_descriptor.resource);
+    document_state.set_reload_pending(document_state_descriptor.reload_pending);
+    document_state.set_ever_populated(document_state_descriptor.ever_populated);
+    document_state.set_navigable_target_name(document_state_descriptor.navigable_target_name);
 }
 
-static bool serialized_policy_containers_match(SerializedPolicyContainer const& a, SerializedPolicyContainer const& b)
+RefPtr<DocumentState> get_or_create_document_state_from_ui_process(SessionHistoryDocumentStateDescriptor const& document_state_descriptor, SessionHistoryEntryReconstructionState& reconstruction_state)
 {
-    return serialized_policies_match(a.csp_list, b.csp_list)
-        && embedder_policies_match(a.embedder_policy, b.embedder_policy)
-        && a.referrer_policy == b.referrer_policy;
-}
+    RefPtr<DocumentState> document_state;
+    if (auto existing_document_state = reconstruction_state.document_states.get(document_state_descriptor.id); existing_document_state.has_value())
+        document_state = *existing_document_state;
 
-static bool history_policy_containers_match(Variant<SerializedPolicyContainer, DocumentState::Client> const& a, Variant<SerializedPolicyContainer, DocumentState::Client> const& b)
-{
-    if (auto const* a_serialized_policy_container = a.get_pointer<SerializedPolicyContainer>()) {
-        auto const* b_serialized_policy_container = b.get_pointer<SerializedPolicyContainer>();
-        return b_serialized_policy_container && serialized_policy_containers_match(*a_serialized_policy_container, *b_serialized_policy_container);
+    if (!document_state) {
+        document_state = DocumentState::create(document_state_descriptor.id);
+        reconstruction_state.document_states.set(document_state_descriptor.id, document_state);
     }
 
-    return a.has<DocumentState::Client>() && b.has<DocumentState::Client>();
+    apply_session_history_document_state_descriptor_from_ui_process(*document_state, document_state_descriptor);
+    return document_state;
 }
 
-static bool session_history_document_state_descriptors_match(SessionHistoryDocumentStateDescriptor const& a, SessionHistoryDocumentStateDescriptor const& b)
+NonnullRefPtr<SessionHistoryEntry> create_session_history_entry_from_ui_process(SessionHistoryEntryDescriptor entry_descriptor, SessionHistoryEntryReconstructionState& reconstruction_state)
 {
-    return a.id == b.id
-        && history_policy_containers_match(a.history_policy_container, b.history_policy_container)
-        && a.request_referrer == b.request_referrer
-        && a.request_referrer_policy == b.request_referrer_policy
-        && a.initiator_origin == b.initiator_origin
-        && a.origin == b.origin
-        && a.about_base_url == b.about_base_url
-        && a.resource == b.resource
-        && a.reload_pending == b.reload_pending
-        && a.ever_populated == b.ever_populated
-        && a.is_provisional == b.is_provisional
-        && a.navigable_target_name == b.navigable_target_name
-        && session_history_nested_history_descriptors_match(a.nested_histories, b.nested_histories);
+    auto entry = SessionHistoryEntry::create();
+    apply_session_history_entry_descriptor_from_ui_process(*entry, entry_descriptor);
+
+    auto document_state = get_or_create_document_state_from_ui_process(entry_descriptor.document_state, reconstruction_state);
+    VERIFY(document_state);
+    entry->set_document_state(move(document_state));
+    return entry;
 }
 
-bool session_history_entry_descriptors_match(SessionHistoryEntryDescriptor const& a, SessionHistoryEntryDescriptor const& b)
+}
+
+template<>
+ErrorOr<void> IPC::encode(Encoder& encoder, Web::HTML::SessionHistoryEntryIdentity const& identity)
 {
-    return a.step == b.step
-        && a.url == b.url
-        && session_history_document_state_descriptors_match(a.document_state, b.document_state)
-        && a.classic_history_api_state == b.classic_history_api_state
-        && a.navigation_api_state == b.navigation_api_state
-        && a.navigation_api_key == b.navigation_api_key
-        && a.navigation_api_id == b.navigation_api_id
-        && a.scroll_restoration_mode == b.scroll_restoration_mode
-        && a.scroll_position_data == b.scroll_position_data;
+    TRY(encoder.encode(identity.document_state_id));
+    TRY(encoder.encode(identity.navigation_api_id));
+    return {};
 }
 
-static bool session_history_entry_descriptors_match(Vector<SessionHistoryEntryDescriptor> const& a, Vector<SessionHistoryEntryDescriptor> const& b)
+template<>
+ErrorOr<Web::HTML::SessionHistoryEntryIdentity> IPC::decode(Decoder& decoder)
 {
-    if (a.size() != b.size())
-        return false;
-
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (session_history_entry_descriptors_match(a[i], b[i]))
-            continue;
-        return false;
-    }
-    return true;
-}
-
-static bool session_history_nested_history_descriptors_match(Vector<SessionHistoryNestedHistoryDescriptor> const& a, Vector<SessionHistoryNestedHistoryDescriptor> const& b)
-{
-    if (a.size() != b.size())
-        return false;
-
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i].id == b[i].id && session_history_entry_descriptors_match(a[i].entries, b[i].entries))
-            continue;
-        return false;
-    }
-    return true;
-}
-
-static bool session_history_nested_history_descriptors_match_document_state_nested_histories(Vector<SessionHistoryNestedHistoryDescriptor> const& descriptors, Vector<DocumentState::NestedHistory> const& nested_histories)
-{
-    if (descriptors.size() != nested_histories.size())
-        return false;
-
-    for (size_t i = 0; i < descriptors.size(); ++i) {
-        auto const& descriptor = descriptors[i];
-        auto const& nested_history = nested_histories[i];
-        if (descriptor.id != nested_history.id || descriptor.entries.size() != nested_history.entries.size())
-            return false;
-        for (size_t j = 0; j < descriptor.entries.size(); ++j) {
-            if (!session_history_entry_matches_descriptor_ignoring_document_state_id(*nested_history.entries[j], descriptor.entries[j]))
-                return false;
-        }
-    }
-
-    return true;
-}
-
-static bool session_history_document_state_descriptor_matches_document_state_ignoring_id(SessionHistoryDocumentStateDescriptor const& descriptor, DocumentState const& document_state, MatchNestedHistories match_nested_histories)
-{
-    if (!(history_policy_containers_match(descriptor.history_policy_container, document_state.history_policy_container())
-            && descriptor.request_referrer == document_state.request_referrer()
-            && descriptor.request_referrer_policy == document_state.request_referrer_policy()
-            && descriptor.initiator_origin == document_state.initiator_origin()
-            && descriptor.origin == document_state.origin()
-            && descriptor.about_base_url == document_state.about_base_url()
-            && descriptor.resource == document_state.resource()
-            && descriptor.reload_pending == document_state.reload_pending()
-            && descriptor.ever_populated == document_state.ever_populated()
-            && descriptor.navigable_target_name == document_state.navigable_target_name()))
-        return false;
-
-    if (match_nested_histories == MatchNestedHistories::No)
-        return true;
-
-    return session_history_nested_history_descriptors_match_document_state_nested_histories(descriptor.nested_histories, document_state.nested_histories());
-}
-
-bool session_history_entry_matches_descriptor_ignoring_document_state_id(SessionHistoryEntry const& entry, SessionHistoryEntryDescriptor const& descriptor, MatchNestedHistories match_nested_histories)
-{
-    auto entry_step = entry.step_value();
-    if (!entry_step.has_value() || *entry_step != descriptor.step)
-        return false;
-    if (entry.url() != descriptor.url)
-        return false;
-    auto document_state = entry.document_state();
-    if (!document_state || !session_history_document_state_descriptor_matches_document_state_ignoring_id(descriptor.document_state, *document_state, match_nested_histories))
-        return false;
-    if (entry.classic_history_api_state() != descriptor.classic_history_api_state)
-        return false;
-    if (entry.navigation_api_state() != descriptor.navigation_api_state || entry.navigation_api_key() != descriptor.navigation_api_key || entry.navigation_api_id() != descriptor.navigation_api_id)
-        return false;
-    if (entry.scroll_restoration_mode() != descriptor.scroll_restoration_mode)
-        return false;
-    if (entry.scroll_position_data() != descriptor.scroll_position_data)
-        return false;
-    return true;
-}
-
+    return Web::HTML::SessionHistoryEntryIdentity {
+        .document_state_id = TRY(decoder.decode<Web::HTML::CrossProcessId>()),
+        .navigation_api_id = TRY(decoder.decode<Utf16String>()),
+    };
 }
 
 template<>
@@ -327,6 +330,35 @@ ErrorOr<Web::HTML::SessionHistoryEntryDescriptor> IPC::decode(Decoder& decoder)
         .navigation_api_id = move(navigation_api_id),
         .scroll_restoration_mode = scroll_restoration_mode,
         .scroll_position_data = move(scroll_position_data),
+    };
+}
+
+template<>
+ErrorOr<void> IPC::encode(Encoder& encoder, Web::HTML::PendingSessionHistoryEntryDescriptor const& entry)
+{
+    TRY(encoder.encode(entry.url));
+    TRY(encoder.encode(entry.document_state));
+    TRY(encoder.encode(entry.classic_history_api_state));
+    TRY(encoder.encode(entry.navigation_api_state));
+    TRY(encoder.encode(entry.navigation_api_key));
+    TRY(encoder.encode(entry.navigation_api_id));
+    TRY(encoder.encode(entry.scroll_restoration_mode));
+    TRY(encoder.encode(entry.scroll_position_data));
+    return {};
+}
+
+template<>
+ErrorOr<Web::HTML::PendingSessionHistoryEntryDescriptor> IPC::decode(Decoder& decoder)
+{
+    return Web::HTML::PendingSessionHistoryEntryDescriptor {
+        .url = TRY(decoder.decode<URL::URL>()),
+        .document_state = TRY(decoder.decode<Web::HTML::SessionHistoryDocumentStateDescriptor>()),
+        .classic_history_api_state = TRY(decoder.decode<Web::HTML::StorageSerializationRecord>()),
+        .navigation_api_state = TRY(decoder.decode<Web::HTML::StorageSerializationRecord>()),
+        .navigation_api_key = TRY(decoder.decode<Utf16String>()),
+        .navigation_api_id = TRY(decoder.decode<Utf16String>()),
+        .scroll_restoration_mode = TRY(decoder.decode<Web::HTML::ScrollRestorationMode>()),
+        .scroll_position_data = TRY(decoder.decode<Web::HTML::SessionHistoryEntryScrollPositionData>()),
     };
 }
 
@@ -376,6 +408,23 @@ ErrorOr<Web::HTML::SessionHistoryEntryScrollPositionData> IPC::decode(Decoder& d
 }
 
 template<>
+ErrorOr<void> IPC::encode(Encoder& encoder, Web::HTML::SessionHistoryEntryPersistedState const& persisted_state)
+{
+    TRY(encoder.encode(persisted_state.entry_identity));
+    TRY(encoder.encode(persisted_state.scroll_position_data));
+    return {};
+}
+
+template<>
+ErrorOr<Web::HTML::SessionHistoryEntryPersistedState> IPC::decode(Decoder& decoder)
+{
+    return Web::HTML::SessionHistoryEntryPersistedState {
+        .entry_identity = TRY(decoder.decode<Web::HTML::SessionHistoryEntryIdentity>()),
+        .scroll_position_data = TRY(decoder.decode<Web::HTML::SessionHistoryEntryScrollPositionData>()),
+    };
+}
+
+template<>
 ErrorOr<void> IPC::encode(Encoder& encoder, Web::HTML::SessionHistoryDocumentStateDescriptor const& document_state)
 {
     TRY(encoder.encode(document_state.id));
@@ -388,7 +437,6 @@ ErrorOr<void> IPC::encode(Encoder& encoder, Web::HTML::SessionHistoryDocumentSta
     TRY(encoder.encode(document_state.resource));
     TRY(encoder.encode(document_state.reload_pending));
     TRY(encoder.encode(document_state.ever_populated));
-    TRY(encoder.encode(document_state.is_provisional));
     TRY(encoder.encode(document_state.navigable_target_name));
     TRY(encoder.encode(document_state.nested_histories));
     return {};
@@ -407,7 +455,6 @@ ErrorOr<Web::HTML::SessionHistoryDocumentStateDescriptor> IPC::decode(Decoder& d
     auto resource = TRY(decoder.decode<Web::HTML::DocumentResource>());
     auto reload_pending = TRY(decoder.decode<bool>());
     auto ever_populated = TRY(decoder.decode<bool>());
-    auto is_provisional = TRY(decoder.decode<bool>());
     auto navigable_target_name = TRY(decoder.decode<Utf16String>());
     auto nested_histories = TRY(decoder.decode<Vector<Web::HTML::SessionHistoryNestedHistoryDescriptor>>());
 
@@ -422,7 +469,6 @@ ErrorOr<Web::HTML::SessionHistoryDocumentStateDescriptor> IPC::decode(Decoder& d
         .resource = move(resource),
         .reload_pending = reload_pending,
         .ever_populated = ever_populated,
-        .is_provisional = is_provisional,
         .navigable_target_name = move(navigable_target_name),
         .nested_histories = move(nested_histories),
     };

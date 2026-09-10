@@ -106,9 +106,11 @@ impl Parser<'_> {
 
         self.consume_token(TokenType::CurlyClose);
         let scope = self.make_scope(children);
+        let range = self.range_from(start);
+        self.arena.scopes[scope].source_range = Some(range);
         self.scope_collector.set_scope_node(scope);
         self.scope_collector.close_scope();
-        self.statement(start, StatementKind::Block(scope))
+        Statement::new(range, StatementKind::Block(scope))
     }
 
     fn parse_expression_statement(&mut self) -> Statement {
@@ -1041,7 +1043,7 @@ impl Parser<'_> {
                 if Self::is_array_expression(&expression) || Self::is_object_expression(&expression) {
                     let pattern = self.synthesize_binding_pattern(init_start);
 
-                    let bound_names: Vec<_> = self.pattern_bound_names.drain(..).collect();
+                    let bound_names = std::mem::take(&mut self.pattern_bound_names);
                     for (name, _id) in &bound_names {
                         let name_str = self.arena.strings[*name].clone();
                         self.check_identifier_name_for_assignment_validity(name_str.as_slice(), false);

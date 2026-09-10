@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
+include("Meta/CMake/environment.cmake")
+
 if (VCPKG_TARGET_ANDROID)
     # If we are building for Android, we must load vcpkg_android.cmake before the project() declaration.
     # This ensures that the CMAKE_TOOLCHAIN_FILE is set correctly.
@@ -55,9 +57,9 @@ endif()
 set(LADYBIRD_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${LADYBIRD_SOURCE_DIR}/Meta/CMake")
 
+include(cmake_options)
 include(compile_options)
 include(check_for_dependencies)
-include(cmake_options)
 include(ladybird_helper_processes)
 
 if(ENABLE_ALL_THE_DEBUG_MACROS)

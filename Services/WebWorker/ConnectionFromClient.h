@@ -21,6 +21,12 @@
 #include <WebWorker/Forward.h>
 #include <WebWorker/PageHost.h>
 
+namespace Gfx {
+
+class SharedFontProvider;
+
+}
+
 namespace WebWorker {
 
 class ConnectionFromClient final
@@ -33,6 +39,7 @@ public:
     virtual void die() override;
 
     virtual Messages::WebWorkerServer::InitTransportResponse init_transport(int peer_pid) override;
+    virtual void set_font_catalog(IPC::File, u64 size, u64 generation) override;
     virtual void close_worker() override;
 
     void request_file(Web::FileRequest);
@@ -44,6 +51,9 @@ public:
 
     Function<void(IPC::TransportHandle const&)> on_request_server_connection;
     Function<void(IPC::TransportHandle const&)> on_image_decoder_connection;
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    Function<void(IPC::TransportHandle)> on_wasm_compiler_connection;
+#endif
 
 private:
     explicit ConnectionFromClient(NonnullOwnPtr<IPC::Transport>);
@@ -52,8 +62,11 @@ private:
     Web::Page const& page() const;
 
     virtual void connect_to_request_server(IPC::TransportHandle handle) override;
+    virtual void simulate_request_server_connection_loss_and_reconnect_for_testing(IPC::TransportHandle replacement_handle) override;
     virtual void connect_to_image_decoder(IPC::TransportHandle handle) override;
+    virtual void connect_to_wasm_compiler(IPC::TransportHandle handle) override;
     virtual void connect_to_compositor(IPC::TransportHandle handle) override;
+    virtual void set_site_compatibility_data(JsonValue data) override;
     virtual void set_system_font_family(String family) override;
     virtual void start_worker(URL::URL url, Web::HTML::WorkerType type, Web::HTML::RequestCredentials credentials, String name, Web::HTML::TransferDataEncoder, Web::HTML::SerializedEnvironmentSettingsObject, Web::HTML::AgentType) override;
     virtual void connect_shared_worker(Web::HTML::TransferDataEncoder, Web::HTML::SerializedEnvironmentSettingsObject) override;
@@ -74,6 +87,8 @@ private:
     int last_id { 0 };
 
     RefPtr<WorkerHost> m_worker_host;
+    Function<void()> m_request_server_died_callback_for_testing;
+    Gfx::SharedFontProvider* m_font_provider { nullptr };
 };
 
 }

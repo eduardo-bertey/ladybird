@@ -9,6 +9,7 @@
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/History.h>
+#include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Navigation.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -99,7 +100,8 @@ WebIDL::ExceptionOr<void> History::delta_traverse(WebIDL::Long delta)
 
     // 4. Traverse the history by a delta given document's node navigable's traversable navigable, delta, and with
     //    sourceDocument set to document.
-    document.navigable()->traversable_navigable()->traverse_the_history_by_delta(delta, document);
+    // NB: The UI process queues the operation on the traversable that hosts this page.
+    document.page().history_executor().traverse_the_history_by_delta(delta, document);
 
     return {};
 }
@@ -246,7 +248,12 @@ WebIDL::ExceptionOr<void> History::set_scroll_restoration(Bindings::ScrollRestor
         return WebIDL::SecurityError::create("Cannot set scroll restoration mode for a document that isn't fully active."_utf16);
 
     // 2. Set this's relevant global object's navigable's active session history entry's scroll restoration mode to the given value.
-    m_document->navigable()->active_session_history_entry()->set_scroll_restoration_mode(scroll_restoration == Bindings::ScrollRestoration::Auto ? ScrollRestorationMode::Auto : ScrollRestorationMode::Manual);
+    auto navigable = m_document->navigable();
+    auto active_session_history_entry = navigable->active_session_history_entry();
+    active_session_history_entry->set_scroll_restoration_mode(scroll_restoration == Bindings::ScrollRestoration::Auto ? ScrollRestorationMode::Auto : ScrollRestorationMode::Manual);
+
+    navigable->page().client().page_did_update_session_history_entry_scroll_restoration_mode(navigable->id(), session_history_entry_identity(*active_session_history_entry), active_session_history_entry->scroll_restoration_mode());
+
     return {};
 }
 

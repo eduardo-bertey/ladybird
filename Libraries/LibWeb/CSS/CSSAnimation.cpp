@@ -56,6 +56,17 @@ int CSSAnimation::class_specific_composite_order(GC::Ref<Animations::Animation> 
     return global_animation_list_order() - other->global_animation_list_order();
 }
 
+void CSSAnimation::set_animation_name_index(size_t index)
+{
+    if (m_animation_name_index == index)
+        return;
+    m_animation_name_index = index;
+    if (auto effect = this->effect(); effect && is<Animations::KeyframeEffect>(*effect)) {
+        if (auto target = static_cast<Animations::KeyframeEffect&>(*effect).target())
+            target->invalidate_associated_animation_composite_order();
+    }
+}
+
 Animations::AnimationClass CSSAnimation::animation_class() const
 {
     if (owning_element().has_value())
@@ -67,6 +78,9 @@ Animations::AnimationClass CSSAnimation::animation_class() const
 //     between two equivalent anonymous timelines.
 static bool should_update_timeline(GC::Ptr<Animations::AnimationTimeline> old_timeline, GC::Ptr<Animations::AnimationTimeline> new_timeline)
 {
+    if (old_timeline == new_timeline)
+        return false;
+
     if (!old_timeline || !new_timeline)
         return true;
 
@@ -91,7 +105,25 @@ void CSSAnimation::apply_css_properties(AnimationProperties const& animation_pro
 
     auto& effect = as<Animations::KeyframeEffect>(*this->effect());
 
-    if (!m_ignored_css_properties.contains(PropertyID::AnimationTimeline) && should_update_timeline(timeline(), animation_properties.timeline)) {
+    auto const update_timeline = !m_ignored_css_properties.contains(PropertyID::AnimationTimeline)
+        && should_update_timeline(timeline(), animation_properties.timeline);
+    AppliedCSSProperties applied_properties {
+        .duration = animation_properties.duration,
+        .timing_function = animation_properties.timing_function,
+        .iteration_count = animation_properties.iteration_count,
+        .direction = animation_properties.direction,
+        .play_state = animation_properties.play_state,
+        .delay = animation_properties.delay,
+        .fill_mode = animation_properties.fill_mode,
+        .composition = animation_properties.composition,
+    };
+    // NB: Style feedback can recompute an animation's owning element. Reapplying unchanged
+    //     properties would invalidate the effect and turn that feedback into an endless cycle.
+    if (!update_timeline && m_applied_css_properties == applied_properties)
+        return;
+    m_applied_css_properties = applied_properties;
+
+    if (update_timeline) {
         HTML::TemporaryExecutionContext context(relevant_settings_object());
         set_timeline(animation_properties.timeline);
     }

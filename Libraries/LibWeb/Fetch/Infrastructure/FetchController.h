@@ -49,6 +49,7 @@ public:
     void set_next_manual_redirect_steps(Function<void()> next_manual_redirect_steps);
 
     [[nodiscard]] State state() const { return m_state; }
+    [[nodiscard]] GC::Ptr<FetchTimingInfo> timing_info() const;
 
     void report_timing(JS::Object&) const;
     void process_next_manual_redirect() const;
@@ -62,6 +63,8 @@ public:
     void set_pending_preloaded_response(GC::Ptr<Fetching::PendingResponse> pending_preloaded_response) { m_pending_preloaded_response = pending_preloaded_response; }
 
     void set_pending_request(RefPtr<Requests::Request> const&);
+    bool requires_network() const { return m_requires_network; }
+    bool has_started_request() const { return m_has_started_request; }
     void set_inner_fetch_controller(GC::Ref<FetchController>);
 
     void stop_fetch();
@@ -107,6 +110,8 @@ private:
     GC::Ptr<Fetching::PendingResponse> m_pending_preloaded_response;
 
     WeakPtr<Requests::Request> m_pending_request;
+    bool m_requires_network { false };
+    bool m_has_started_request { false };
 
     HashMap<u64, HTML::TaskID> m_ongoing_fetch_tasks;
     u64 m_next_fetch_task_id { 0 };

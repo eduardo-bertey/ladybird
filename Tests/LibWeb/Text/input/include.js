@@ -52,6 +52,28 @@ function timeout(ms) {
     return promise;
 }
 
+async function waitForCondition(condition, attempts = 600, interval = 25) {
+    while (!condition()) {
+        if (attempts-- === 0) return false;
+        await timeout(interval);
+    }
+    return true;
+}
+
+async function setSystemVisibilityState(state) {
+    // Tests assume that the document reflects the UI process's system visibility state and that
+    // no previous visibility state change is still pending.
+    if (document.visibilityState === state) {
+        return;
+    }
+
+    const visibilityChanged = new Promise(resolve =>
+        document.addEventListener("visibilitychange", resolve, { once: true })
+    );
+    internals.setSystemVisibilityState(state);
+    await visibilityChanged;
+}
+
 function withCollectedWrapper(makeAndMark, reacquire, verify) {
     let wasPreserved = false;
     (() => {
@@ -65,6 +87,28 @@ function withCollectedWrapper(makeAndMark, reacquire, verify) {
 
     internals.gc();
     verify(reacquire());
+}
+
+function scrollendEvent(target) {
+    const { promise, resolve } = Promise.withResolvers();
+    target.addEventListener("scrollend", resolve, { once: true });
+    return promise;
+}
+
+async function scrollSettled(target, action) {
+    const scrollend = scrollendEvent(target);
+    await action();
+    await scrollend;
+}
+
+async function scrollOffsetStopsChanging(readScrollOffset) {
+    let previousScrollOffset = null;
+    while (previousScrollOffset !== readScrollOffset()) {
+        previousScrollOffset = readScrollOffset();
+        for (let frame = 0; frame < 5; frame++) {
+            await animationFrame();
+        }
+    }
 }
 
 async function waitForImageAnimationState(url, predicate, targetWindow = window) {
@@ -181,3 +225,5 @@ function httpTestServer() {
 function uniqueLocalhostHostname(prefix) {
     return `${prefix}-${crypto.randomUUID()}.localhost`;
 }
+
+const remoteFrameCount = () => (internals.dumpSiteIsolationProcessTree().match(/remote/g) || []).length;

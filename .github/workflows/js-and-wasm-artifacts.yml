@@ -13,7 +13,6 @@ on:
 env:
   LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
   CCACHE_DIR: ${{ github.workspace }}/.ccache
-  VCPKG_ROOT: ${{ github.workspace }}/Build/vcpkg
 
 jobs:
   build-and-package:
@@ -30,7 +29,7 @@ jobs:
         toolchain: ['Clang']
         package_type: ['Linux-x86_64']
         runner_labels: ['["blacksmith-8vcpu-ubuntu-2404"]']
-        container: [&ci_container '{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.07.29"}']
+        container: [&ci_container '{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.08.28"}']
 
         include:
           - os_name: 'macOS'
@@ -72,6 +71,7 @@ jobs:
         with:
           os: ${{ matrix.os_name }}
           arch: ${{ matrix.arch }}
+          build_preset: 'Distribution'
 
       - name: Restore Caches
         uses: ./.github/actions/cache-restore

@@ -10,21 +10,16 @@
 //! module so the same struct layout is emitted into each header's namespace,
 //! the same arrangement `display.rs` uses for `FfiDisplay`.
 
-use crate::css::style_value::{retained_list_drop, retained_list_partial_eq};
-
-unsafe extern "C" {
-    fn ladybird_utf16_fly_string_unref(raw: usize);
-    fn ladybird_utf16_fly_string_ref(raw: usize);
-}
-
-/// A retained AK::Utf16FlyString, stored as its one-word raw representation. Owns one reference
-/// to the underlying string data unless it is a short string, which needs none; the C++ bridge
-/// handles both cases.
+use crate::css::style_value::retained_list_partial_eq;
+/// A retained `AK::Utf16FlyString` with the same one-word representation.
 #[repr(C)]
-#[derive(PartialEq)]
 pub struct RetainedUtf16FlyString {
     raw: usize,
+    _not_send_or_sync: std::marker::PhantomData<*const ()>,
 }
+
+const _: () = assert!(size_of::<RetainedUtf16FlyString>() == size_of::<usize>());
+const _: () = assert!(align_of::<RetainedUtf16FlyString>() == align_of::<usize>());
 
 impl RetainedUtf16FlyString {
     /// The raw one-word representation; fly strings are interned, so equal raw
@@ -33,25 +28,39 @@ impl RetainedUtf16FlyString {
         self.raw
     }
 
+    pub(crate) fn raw_word(&self) -> &usize {
+        &self.raw
+    }
+
     /// The no-string sentinel; holds no reference. No real fly string uses the
     /// zero raw representation.
     pub(crate) fn none() -> Self {
-        Self { raw: 0 }
+        Self {
+            raw: 0,
+            _not_send_or_sync: std::marker::PhantomData,
+        }
     }
 
     /// Assumes ownership of one leaked reference to the underlying string data.
     pub(crate) unsafe fn from_leaked_raw(raw: usize) -> Self {
-        Self { raw }
+        if raw == 0 {
+            return Self::none();
+        }
+        Self {
+            raw,
+            _not_send_or_sync: std::marker::PhantomData,
+        }
     }
 
-    /// Retains a new reference to the underlying string data.
+    /// Retains a borrowed raw fly-string reference.
     ///
     /// # Safety
-    /// `raw` must be the raw representation of a live fly string.
+    /// `raw` must be zero or a live AK::Utf16FlyString raw representation.
     pub(crate) unsafe fn from_borrowed_raw(raw: usize) -> Self {
-        crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::StringRetainReleaseCallback);
-        unsafe { ladybird_utf16_fly_string_ref(raw) };
-        Self { raw }
+        if raw != 0 {
+            unsafe { ak::reference_utf16_string(raw) };
+        }
+        unsafe { Self::from_leaked_raw(raw) }
     }
 }
 
@@ -60,8 +69,12 @@ impl Clone for RetainedUtf16FlyString {
         if self.raw == 0 {
             return Self::none();
         }
-        // SAFETY: A non-zero raw is a live fly string this value retains.
-        unsafe { Self::from_borrowed_raw(self.raw) }
+        // SAFETY: Every non-zero value owns one reference to a valid fly string.
+        unsafe { ak::reference_utf16_string(self.raw) };
+        Self {
+            raw: self.raw,
+            _not_send_or_sync: std::marker::PhantomData,
+        }
     }
 }
 
@@ -70,8 +83,34 @@ impl Drop for RetainedUtf16FlyString {
         if self.raw == 0 {
             return;
         }
-        crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::StringRetainReleaseCallback);
-        unsafe { ladybird_utf16_fly_string_unref(self.raw) };
+        // SAFETY: Every non-zero value owns one reference to a valid fly string.
+        unsafe { ak::release_utf16_string_with(self.raw, crate::css::ffi_stats::release_utf16_fly_string) };
+    }
+}
+
+impl PartialEq for RetainedUtf16FlyString {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl Eq for RetainedUtf16FlyString {}
+
+impl<'a> From<&'a RetainedUtf16FlyString> for crate::css::css_tokenizer::TokenizerInput<'a> {
+    fn from(string: &'a RetainedUtf16FlyString) -> Self {
+        match unsafe { ak::utf16_string_units(string.raw_word()) } {
+            ak::Utf16StringUnits::Ascii(bytes) => Self::Ascii(bytes),
+            ak::Utf16StringUnits::Utf16(units) => Self::Utf16(units),
+        }
+    }
+}
+
+impl std::fmt::Debug for RetainedUtf16FlyString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("RetainedUtf16FlyString")
+            .field(&self.raw)
+            .finish()
     }
 }
 
@@ -90,28 +129,8 @@ impl RetainedUtf16FlyStringList {
         Self { pointer, length }
     }
 
-    /// Takes ownership of one leaked reference to each string.
-    ///
-    /// # Safety
-    /// `strings` must point to `length` valid leaked string raws.
-    pub(crate) unsafe fn from_raw(strings: *const usize, length: usize) -> Self {
-        let slice: Box<[RetainedUtf16FlyString]> = (0..length)
-            .map(|i| RetainedUtf16FlyString {
-                raw: unsafe { *strings.add(i) },
-            })
-            .collect();
-        let length = slice.len();
-        let pointer = Box::into_raw(slice) as *mut RetainedUtf16FlyString;
-        Self { pointer, length }
-    }
-
     pub(crate) fn clone_retained(&self) -> Self {
-        Self::from_retained_strings(
-            self.as_slice()
-                .iter()
-                .map(|string| unsafe { RetainedUtf16FlyString::from_borrowed_raw(string.raw()) })
-                .collect(),
-        )
+        Self::from_retained_strings(self.as_slice().to_vec())
     }
 
     pub(crate) fn as_slice(&self) -> &[RetainedUtf16FlyString] {
@@ -127,8 +146,7 @@ impl RetainedUtf16FlyStringList {
         if self.pointer.is_null() {
             return &[];
         }
-        // SAFETY: RetainedUtf16FlyString is a repr(C) struct of one usize, so
-        // a slice of it has the layout of a usize slice.
+        // SAFETY: `RetainedUtf16FlyString` is represented by its single raw word.
         unsafe { std::slice::from_raw_parts(self.pointer.cast::<usize>(), self.length) }
     }
 }
@@ -139,5 +157,11 @@ impl Clone for RetainedUtf16FlyStringList {
     }
 }
 
-retained_list_drop!(RetainedUtf16FlyStringList);
+impl Drop for RetainedUtf16FlyStringList {
+    fn drop(&mut self) {
+        if !self.pointer.is_null() {
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.pointer, self.length)) });
+        }
+    }
+}
 retained_list_partial_eq!(RetainedUtf16FlyStringList, RetainedUtf16FlyString);

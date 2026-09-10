@@ -21,13 +21,8 @@ public:
     }
     virtual ~CustomIdentStyleValue() override = default;
 
-    Utf16FlyString custom_ident() const { return Utf16FlyString::from_raw(m_value->custom_ident.custom_ident.raw); }
-
-    void serialize(StringBuilder& builder, SerializationMode) const { builder.append(serialize_an_identifier(custom_ident())); }
-    Vector<Parser::ComponentValue> tokenize() const;
+    Utf16FlyString custom_ident() const { return css_string_from_rust(&m_value->custom_ident.custom_ident); }
     GC::Ref<CSSStyleValue> reify(Utf16FlyString const&) const;
-
-    bool properties_equal(CustomIdentStyleValue const& other) const { return custom_ident() == other.custom_ident(); }
 
 private:
     friend class StyleValue;

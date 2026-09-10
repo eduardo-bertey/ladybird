@@ -8,7 +8,6 @@
 #pragma once
 
 #include <AK/ByteString.h>
-#include <AK/Function.h>
 #include <AK/HashTable.h>
 #include <LibCore/EventReceiver.h>
 #include <LibCore/ImmutableBytes.h>
@@ -22,6 +21,7 @@
 #include <LibURL/URL.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Loader/NavigatorCompatibilityMode.h>
+#include <LibWeb/Loader/SiteCompatibility.h>
 
 namespace Web {
 
@@ -40,22 +40,22 @@ public:
     using OnCachedBodyAvailable = GC::Function<void(Core::ImmutableBytes data)>;
     using OnComplete = GC::Function<void(bool success, Requests::RequestTimingInfo const& timing_info, Optional<StringView> error_message)>;
 
-    RefPtr<Requests::Request> load(LoadRequest&, GC::Root<OnHeadersReceived>, GC::Root<OnDataReceived>, GC::Root<OnCachedBodyAvailable>, GC::Root<OnComplete>, Requests::RequestClient::KeepAliveForTransfer = Requests::RequestClient::KeepAliveForTransfer::No);
+    RefPtr<Requests::Request> load(LoadRequest&, GC::Root<OnHeadersReceived>, GC::Root<OnDataReceived>, GC::Root<OnCachedBodyAvailable>, GC::Root<OnComplete>, Requests::RequestClient::TransferLease = Requests::RequestClient::TransferLease::No);
 
     RefPtr<Requests::RequestClient>& request_client() { return m_request_client; }
 
     void prefetch_dns(URL::URL const&, URL::URL const& source_url);
     void preconnect(URL::URL const&, URL::URL const& source_url);
 
-    Function<void()> on_load_counter_change;
-
-    int pending_loads() const { return m_pending_loads; }
-
     static void try_store_hsts_policy_for_url(Page&, URL::URL const&, StringView header_value);
     static bool is_known_hsts_host(Page&, String const& host);
 
     String const& user_agent() const { return m_user_agent; }
+    String user_agent_for_url(URL::URL const& url) const { return m_site_compatibility_data.user_agent_for_url(url, m_user_agent); }
+    String user_agent_for_websocket_url(URL::URL const& url) const { return m_site_compatibility_data.user_agent_for_websocket_url(url, m_user_agent); }
     void set_user_agent(String user_agent) { m_user_agent = move(user_agent); }
+    void set_site_compatibility_data(SiteCompatibilityData data) { m_site_compatibility_data = move(data); }
+    bool site_compatibility_exposes_experimental_interface(URL::URL const& url, StringView name) const { return m_site_compatibility_data.exposes_experimental_interface(url, name); }
 
     String const& platform() const { return m_platform; }
     void set_platform(String platform) { m_platform = move(platform); }
@@ -88,17 +88,16 @@ private:
     template<typename ResourceHandler, typename ErrorHandler>
     void handle_resource_load_request(LoadRequest const& request, ResourceHandler on_resource, ErrorHandler on_error);
 
-    RefPtr<Requests::Request> start_network_request(LoadRequest const&, Requests::RequestClient::KeepAliveForTransfer);
+    RefPtr<Requests::Request> start_network_request(LoadRequest const&, Requests::RequestClient::TransferLease);
     void handle_network_response_headers(LoadRequest const&, HTTP::HeaderList const&);
     void finish_network_request(NonnullRefPtr<Requests::Request>);
-
-    int m_pending_loads { 0 };
 
     GC::Heap& m_heap;
     RefPtr<Requests::RequestClient> m_request_client;
     HashTable<NonnullRefPtr<Requests::Request>> m_active_requests;
 
     String m_user_agent;
+    SiteCompatibilityData m_site_compatibility_data;
     String m_platform;
     Vector<String> m_preferred_languages = { "en"_string };
     NavigatorCompatibilityMode m_navigator_compatibility_mode;

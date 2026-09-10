@@ -15,7 +15,6 @@
 #include <AK/Span.h>
 #include <LibGfx/Color.h>
 #include <LibGfx/DecodedImageFrame.h>
-#include <LibGfx/Filter.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/PaintStyle.h>
 #include <LibGfx/TextLayout.h>
@@ -24,7 +23,6 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/DisplayListCommand.h>
-#include <LibWeb/Painting/DisplayListCommandRange.h>
 #include <LibWeb/Painting/DisplayListResourceStorage.h>
 #include <LibWeb/Painting/ScrollState.h>
 
@@ -57,21 +55,32 @@ protected:
         return { reinterpret_cast<T const*>(bytes.data()), bytes.size() / sizeof(T) };
     }
     void execute_impl(DisplayList const&, ScrollStateSnapshot const& scroll_state);
-    void execute_impl(DisplayList const&, ScrollStateSnapshot const& scroll_state, ReadonlyBytes command_bytes);
+    void execute_run_commands(DisplayListCommandRun const&, ScrollStateSnapshot const& scroll_state);
+    void execute_command_bytes(ReadonlyBytes, ScrollStateSnapshot const& scroll_state);
+    ScrollStateSnapshot const& active_scroll_state() const { return *m_active_scroll_state; }
     void execute_display_list_into_surface(DisplayList const&, AccumulatedVisualContextTree const&, Gfx::PaintingSurface&);
-    void execute_nested_display_list(DisplayList const&, AccumulatedVisualContextTree const&, ScrollStateSnapshot const&, ReadonlyBytes command_bytes);
+    void execute_command_bytes_into_surface(ReadonlyBytes, Gfx::PaintingSurface&);
+    void declare_mask_content(EffectNodeIndex, ReadonlyBytes content);
+    Optional<ReadonlyBytes> declared_mask_content(EffectNodeIndex) const;
+    void execute_nested_display_list(DisplayList const&, AccumulatedVisualContextTree const&, ScrollStateSnapshot const&);
 
 private:
 #define DECLARE_PLAY_COMMAND(command_type, player_method) \
     virtual void play_command(command_type const&) = 0;
     ENUMERATE_DISPLAY_LIST_COMMANDS(DECLARE_PLAY_COMMAND)
 #undef DECLARE_PLAY_COMMAND
-    virtual void play_command(ApplyEffects const&, Gfx::Filter const*) = 0;
     virtual void set_matrix(Gfx::FloatMatrix4x4 const&) = 0;
     virtual Gfx::FloatMatrix4x4 canvas_matrix() const = 0;
     virtual bool would_be_fully_clipped_by_painter(Gfx::IntRect) const = 0;
 
-    virtual void add_clip_path(Gfx::Path const&, Gfx::WindingRule) = 0;
+    virtual void push_clip(ReplayClip const&) = 0;
+    virtual void push_clip_path(Gfx::Path const&, Gfx::WindingRule) = 0;
+    virtual void push_transform(Gfx::AffineTransform const&) = 0;
+    virtual void push_layer(ReplayLayer const&) = 0;
+    virtual void push_mask(ReplayMask const&) = 0;
+    virtual void pop_mask(ReplayMask const&, EffectNodeIndex) = 0;
+    virtual void pop() = 0;
+    virtual void push_device_space_plane_clip(Gfx::Path const&) = 0;
 
     DisplayList const* m_active_display_list { nullptr };
     AccumulatedVisualContextTree const* m_active_visual_context_tree { nullptr };
@@ -79,17 +88,8 @@ private:
     CanvasSurfaceRegistry const* m_canvas_surface_registry { nullptr };
     RefPtr<Gfx::PaintingSurface> m_surface;
     ReadonlyBytes m_current_command_payload;
-
-    // Scratch for the per-replay transform palette, retained so steady-state replays reuse warm
-    // capacity; execute_impl moves it out for the duration of a replay, letting re-entrant nested
-    // replays build their own palettes without clobbering the outer one.
-    struct ReplayPaletteStorage {
-        Vector<Gfx::FloatMatrix4x4> to_root_matrices;
-        Vector<VisualContextIndex> nearest_spatial_nodes;
-        Vector<VisualContextIndex> nearest_frame_nodes;
-        Vector<bool> backface_culled;
-    };
-    ReplayPaletteStorage m_replay_palette_storage;
+    ScrollStateSnapshot const* m_active_scroll_state { nullptr };
+    HashMap<u32, ReadonlyBytes> m_declared_mask_contents;
 };
 
 class DisplayList : public AtomicRefCounted<DisplayList> {
@@ -103,34 +103,21 @@ public:
 
     static NonnullRefPtr<DisplayList> create(AccumulatedVisualContextTree const& visual_context_tree)
     {
-        return adopt_ref(*new DisplayList(visual_context_tree.version()));
+        return adopt_ref(*new DisplayList(visual_context_tree.structural_epoch()));
     }
 
-    template<DisplayListCommand Command>
-    bool append(Command const& command, AccumulatedVisualContextTree const& visual_context_tree, VisualContextIndex context_index, bool context_geometry_only, ReadonlyBytes inline_data = {})
-    {
-        return append_bytes(
-            Command::command_type,
-            display_list_object_bytes(command),
-            inline_data,
-            visual_context_tree,
-            context_index,
-            context_geometry_only,
-            command_bounding_rectangle(command),
-            command_is_clip(command));
-    }
+    static WEB_API NonnullRefPtr<DisplayList> create_from_command_bytes(AccumulatedVisualContextTree const&, ByteBuffer&& command_bytes, Vector<DisplayListCommandRun>&& command_runs);
 
-    u64 compatible_visual_context_tree_version() const { return m_compatible_visual_context_tree_version; }
+    u64 compatible_visual_context_tree_structural_epoch() const { return m_compatible_visual_context_tree_structural_epoch; }
     u64 id() const { return m_id; }
 
     ReadonlyBytes command_bytes() const { return m_command_bytes.span(); }
+    ReadonlySpan<DisplayListCommandRun> command_runs() const { return m_command_runs.span(); }
+    ReadonlyBytes command_bytes_of_run(DisplayListCommandRun const& run) const { return command_bytes().slice(run.offset, run.size); }
     void set_surface_clear_color(Gfx::Color color) { m_surface_clear_color = color; }
     Optional<Gfx::Color> surface_clear_color() const { return m_surface_clear_color; }
     void set_async_scrolling_metadata(AsyncScrollingMetadata metadata) { m_async_scrolling_metadata = metadata; }
     Optional<AsyncScrollingMetadata> const& async_scrolling_metadata() const { return m_async_scrolling_metadata; }
-    Optional<DisplayListResourceId> mask_display_list_id(VisualContextIndex context_index) const { return m_mask_display_lists.get(context_index); }
-    void set_mask_display_list_id(VisualContextIndex context_index, DisplayListResourceId display_list_id) { m_mask_display_lists.set(context_index, display_list_id); }
-    HashMap<VisualContextIndex, DisplayListResourceId> const& mask_display_lists() const { return m_mask_display_lists; }
 
     static constexpr size_t command_alignment = 16;
 
@@ -155,51 +142,30 @@ public:
         for_each_command_header(command_bytes(), move(callback));
     }
 
-    u32 append_command_range_from(DisplayList const& source_display_list, DisplayListCommandRange, AccumulatedVisualContextTree const&, VisualContextIndex recorded_context_index, VisualContextIndex current_context_index);
-    size_t command_byte_size() const { return m_command_bytes.size(); }
-
 private:
-    explicit DisplayList(u64 compatible_visual_context_tree_version);
-    DisplayList(u64 compatible_visual_context_tree_version, u64 id, ByteBuffer&& command_bytes, Optional<Gfx::Color> surface_clear_color, Optional<AsyncScrollingMetadata>, HashMap<VisualContextIndex, DisplayListResourceId>&& mask_display_lists);
+    explicit DisplayList(u64 compatible_visual_context_tree_structural_epoch);
+    DisplayList(u64 compatible_visual_context_tree_structural_epoch, u64 id, ByteBuffer&& command_bytes, Vector<DisplayListCommandRun>&& command_runs, Optional<Gfx::Color> surface_clear_color, Optional<AsyncScrollingMetadata>);
 
-    static Optional<Gfx::IntRect> command_bounding_rectangle(auto const& command)
-    {
-        if constexpr (requires { command.bounding_rect(); })
-            return command.bounding_rect();
-        else
-            return {};
-    }
-
-    static bool command_is_clip(auto const& command)
-    {
-        if constexpr (requires { command.is_clip(); })
-            return command.is_clip();
-        else
-            return false;
-    }
-
-    bool append_bytes(
-        DisplayListCommandType,
-        ReadonlyBytes payload,
-        ReadonlyBytes inline_data,
-        AccumulatedVisualContextTree const&,
-        VisualContextIndex context_index,
-        bool context_geometry_only,
-        Optional<Gfx::IntRect> bounding_rect,
-        bool is_clip);
-
-    u64 m_compatible_visual_context_tree_version { 0 };
+    u64 m_compatible_visual_context_tree_structural_epoch { 0 };
     u64 m_id { 0 };
     ByteBuffer m_command_bytes;
+    Vector<DisplayListCommandRun> m_command_runs;
     Optional<Gfx::Color> m_surface_clear_color;
     Optional<AsyncScrollingMetadata> m_async_scrolling_metadata;
-    HashMap<VisualContextIndex, DisplayListResourceId> m_mask_display_lists;
 
     template<typename T>
     friend ErrorOr<void> IPC::encode(IPC::Encoder&, T const&);
     template<typename T>
     friend ErrorOr<T> IPC::decode(IPC::Decoder&);
 };
+
+// The run table the Rust builder records while it writes the tape, derived from the tape alone;
+// tests build tapes by hand and debug builds check that both agree.
+WEB_API Vector<DisplayListCommandRun> compute_display_list_command_runs(ReadonlyBytes command_bytes);
+// Runs must start at offset zero, follow each other without gaps, stay aligned, end at the tape's
+// end, and under DISPLAY_LIST_RUNS_DEBUG match the table recomputed from the tape.
+WEB_API ErrorOr<void> validate_display_list_command_runs(ReadonlyBytes command_bytes, ReadonlySpan<DisplayListCommandRun>);
+WEB_API ErrorOr<void> validate_display_list_references_live_visual_context_nodes(DisplayList const&, AccumulatedVisualContextTree const&);
 
 }
 

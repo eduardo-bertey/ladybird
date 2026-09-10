@@ -6,7 +6,6 @@
  */
 
 #include "RatioStyleValue.h"
-#include <LibWeb/CSS/Parser/ComponentValue.h>
 #include <LibWeb/CSS/Ratio.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 
@@ -26,33 +25,6 @@ ValueComparingNonnullRefPtr<StyleValue const> RatioStyleValue::absolutized(Compu
         return *this;
 
     return RatioStyleValue::create(move(absolutized_numerator), move(absolutized_denominator));
-}
-
-void RatioStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    numerator()->serialize(builder, mode);
-    builder.append(" / "sv);
-    denominator()->serialize(builder, mode);
-}
-
-void RatioStyleValue::serialize(Utf16StringBuilder& builder, SerializationMode mode) const
-{
-    numerator()->serialize(builder, mode);
-    builder.append_ascii(" / "sv);
-    denominator()->serialize(builder, mode);
-}
-
-Vector<Parser::ComponentValue> RatioStyleValue::tokenize() const
-{
-    Vector<Parser::ComponentValue> component_values;
-
-    component_values.extend(numerator()->tokenize());
-    component_values.empend(Parser::Token::create_whitespace(" "_string));
-    component_values.empend(Parser::Token::create_delim('/'));
-    component_values.empend(Parser::Token::create_whitespace(" "_string));
-    component_values.extend(denominator()->tokenize());
-
-    return component_values;
 }
 
 }

@@ -155,6 +155,7 @@ static Optional<String> origin_url_for_history_entry(HistoryEntry const& entry)
 static void add_aggregated_origin_entries(StringView folded_query, Vector<HistoryEntry>& history_entries, UnixDateTime now)
 {
     HashMap<String, HistoryEntry> origins;
+    HashMap<String, UnixDateTime> favicon_last_visited_times;
 
     for (auto const& entry : history_entries) {
         auto origin_url = origin_url_for_history_entry(entry);
@@ -170,7 +171,7 @@ static void add_aggregated_origin_entries(StringView folded_query, Vector<Histor
             return HistoryEntry {
                 .url = *origin_url,
                 .title = {},
-                .favicon_base64_png = {},
+                .favicon_png = {},
                 .visit_count = 0,
                 .direct_visit_count = 0,
                 .last_visited_time = entry.last_visited_time,
@@ -186,21 +187,27 @@ static void add_aggregated_origin_entries(StringView folded_query, Vector<Histor
         // one direct visit and a small amount of page quality, so one frequently reloaded page cannot
         // claim the whole host.
         auto is_origin_entry = entry.url == *origin_url;
-        auto visit_count_contribution = min(entry.visit_count, is_origin_entry ? 8u : 2u);
-        auto direct_visit_count_contribution = min(entry.direct_visit_count, is_origin_entry ? 3u : 1u);
-        origin.visit_count = min(100u, origin.visit_count + visit_count_contribution);
-        origin.direct_visit_count = min(10u, origin.direct_visit_count + direct_visit_count_contribution);
+        auto visit_count_contribution = clamp<i64>(entry.visit_count, 0, is_origin_entry ? 8 : 2);
+        auto direct_visit_count_contribution = clamp<i64>(entry.direct_visit_count, 0, is_origin_entry ? 3 : 1);
+        origin.visit_count = min<i64>(100, origin.visit_count + visit_count_contribution);
+        origin.direct_visit_count = min<i64>(10, origin.direct_visit_count + direct_visit_count_contribution);
 
         auto visit_score = decayed_score_at(entry.decayed_visit_score, entry.score_updated_at, now, 30.0);
         auto direct_score = decayed_score_at(entry.decayed_direct_score, entry.score_updated_at, now, 60.0);
         origin.decayed_visit_score = min(50.0, origin.decayed_visit_score + min(visit_score, is_origin_entry ? 8.0 : 2.0));
         origin.decayed_direct_score = min(12.0, origin.decayed_direct_score + min(direct_score, is_origin_entry ? 3.0 : 1.0));
-        if (entry.favicon_base64_png.has_value()
-            && (!origin.favicon_base64_png.has_value() || entry.last_visited_time >= origin.last_visited_time))
-            origin.favicon_base64_png = entry.favicon_base64_png;
         origin.last_visited_time = max(origin.last_visited_time, entry.last_visited_time);
         origin.last_qualifying_visit_time = max(origin.last_qualifying_visit_time, entry.last_qualifying_visit_time);
         origin.last_direct_visit_time = max(origin.last_direct_visit_time, entry.last_direct_visit_time);
+
+        if (entry.favicon_png.has_value()) {
+            auto favicon_last_visited_time = favicon_last_visited_times.get(*origin_url);
+
+            if (!favicon_last_visited_time.has_value() || entry.last_visited_time >= *favicon_last_visited_time) {
+                favicon_last_visited_times.set(*origin_url, entry.last_visited_time);
+                origin.favicon_png = entry.favicon_png;
+            }
+        }
     }
 
     for (auto& origin : origins) {
@@ -209,7 +216,6 @@ static void add_aggregated_origin_entries(StringView folded_query, Vector<Histor
         });
         if (existing_origin != history_entries.end()) {
             origin.value.title = move(existing_origin->title);
-            origin.value.favicon_base64_png = move(existing_origin->favicon_base64_png);
             *existing_origin = move(origin.value);
         } else {
             history_entries.append(move(origin.value));
@@ -270,7 +276,7 @@ Vector<AutocompleteSuggestion> rank_history_suggestions(StringView query, Vector
         auto relevance = adjusted_match_relevance + history_relevance;
 
         auto is_url_prefix = match_class == AutocompleteMatchClass::ExactURL || match_class == AutocompleteMatchClass::URLPrefix;
-        auto has_strong_intent = entry.direct_visit_count >= (query_is_url ? 1u : 2u);
+        auto has_strong_intent = entry.direct_visit_count >= (query_is_url ? 1 : 2);
         auto can_be_automatically_selected = is_url_prefix
             && has_strong_intent
             && query_length >= 2
@@ -285,7 +291,7 @@ Vector<AutocompleteSuggestion> rank_history_suggestions(StringView query, Vector
             .text = move(entry.url),
             .title = move(entry.title),
             .subtitle = {},
-            .favicon_base64_png = move(entry.favicon_base64_png),
+            .favicon_png = move(entry.favicon_png),
             .highlight_input = {},
             .match_class = match_class,
             .relevance = relevance,
@@ -381,7 +387,7 @@ Vector<AutocompleteSuggestion> rank_bookmark_suggestions(StringView query, Vecto
             .text = bookmark.url,
             .title = bookmark.title,
             .subtitle = bookmark.folder,
-            .favicon_base64_png = bookmark.favicon_base64_png,
+            .favicon_png = bookmark.favicon_png,
             .highlight_input = {},
             .match_class = match_class,
             .relevance = adjusted_match_relevance + bookmark_relevance,
@@ -458,7 +464,7 @@ Vector<AutocompleteSuggestion> rank_engagement_suggestions(StringView query, Vec
             auto is_deep_page_without_path_input = parsed_url.has_value()
                 && url_has_non_origin_components(*parsed_url)
                 && !query_contains_url_suffix(query);
-            auto short_deep_prefix_explicit_threshold = query_length == 1 ? 3u : 2u;
+            auto short_deep_prefix_explicit_threshold = query_length == 1 ? 3 : 2;
             auto short_deep_prefix_has_evidence = query_length <= 2
                 && engagement.explicit_use_count >= short_deep_prefix_explicit_threshold;
             if (query_length <= 2 && is_deep_page_without_path_input && !exact_association && !short_deep_prefix_has_evidence)
@@ -493,7 +499,7 @@ Vector<AutocompleteSuggestion> rank_engagement_suggestions(StringView query, Vec
             .text = move(engagement.destination),
             .title = {},
             .subtitle = {},
-            .favicon_base64_png = {},
+            .favicon_png = {},
             .highlight_input = {},
             .match_class = match_class,
             .relevance = adjusted_match_relevance + adaptive_relevance,

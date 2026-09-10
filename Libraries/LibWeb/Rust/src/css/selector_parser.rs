@@ -1,0 +1,1693 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+//! CSS selector parsing.
+
+use std::sync::Arc;
+
+use super::css_tokenizer::{CssNumberType, ParserTokenKind, TokenizerInput, tokenize_for_parser};
+use super::ffi_support::FfiUtf16View;
+use super::ffi_support::ascii_lowercase;
+use super::parser::component_value::{ComponentKind, ComponentValue, consume_a_list_of_component_values};
+use super::parser::token_stream::TokenStream as Stream;
+use super::retained_fly_string::RetainedUtf16FlyString;
+use super::selector as bound;
+use super::selector::parsed::{
+    AttributeSelector, CompiledSelector, CompoundSelector, NameSelector, PseudoClassSelector, PseudoElementSelector,
+    PseudoElementValue, QualifiedName, SelectorList, SimpleSelector,
+};
+use super::selector::{
+    AnPlusBPattern, AttributeCaseType, AttributeMatchType, Combinator, Direction, LanguageRange, NamespaceType,
+    PseudoClassParameterType, PseudoClassType, PseudoElementParameterType, PseudoElementType, SelectorString,
+};
+use super::selector::{FfiStringView, RustSelector};
+
+const MAXIMUM_SELECTOR_NESTING_DEPTH: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectorType {
+    Standalone,
+    Relative,
+}
+
+pub use super::ffi_support::StyleNestingParent;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectorParsingMode {
+    Standard,
+    Forgiving,
+}
+
+fn ascii_eq(value: &[u16], expected: &str) -> bool {
+    value.len() == expected.len()
+        && value
+            .iter()
+            .zip(expected.bytes())
+            .all(|(&unit, byte)| ascii_lowercase(unit) == u16::from(byte.to_ascii_lowercase()))
+}
+
+fn ascii_starts_with(value: &[u16], expected: &str) -> bool {
+    value.len() >= expected.len() && ascii_eq(&value[..expected.len()], expected)
+}
+
+fn lowercase(value: &[u16]) -> SelectorString {
+    value
+        .iter()
+        .map(|&unit| ascii_lowercase(unit))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn selector_name(value: &[u16]) -> NameSelector {
+    NameSelector {
+        name: value.into(),
+        interned_name: None,
+        interned_lowercase_name: None,
+    }
+}
+
+fn pseudo_class_selector(pseudo_class: PseudoClassType) -> PseudoClassSelector {
+    PseudoClassSelector {
+        pseudo_class,
+        an_plus_b_pattern: AnPlusBPattern::default(),
+        argument_selector_list: Box::new([]),
+        languages: Box::new([]),
+        direction: None,
+        identifier: None,
+        identifier_identity: None,
+        identifier_lowercase_identity: None,
+        levels: Box::new([]),
+        is_forgiving: false,
+    }
+}
+
+fn split_on_commas(values: &[ComponentValue]) -> Vec<&[ComponentValue]> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    loop {
+        let end = values[start..]
+            .iter()
+            .position(ComponentValue::is_comma)
+            .map_or(values.len(), |offset| start + offset);
+        result.push(&values[start..end]);
+        if end == values.len() {
+            break;
+        }
+        start = end + 1;
+    }
+    result
+}
+
+fn is_css_wide_keyword(value: &[u16]) -> bool {
+    ["initial", "inherit", "unset", "revert", "revert-layer"]
+        .iter()
+        .any(|keyword| ascii_eq(value, keyword))
+}
+
+fn clamp_integer(value: f64) -> i32 {
+    value.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+fn integer(value: &ComponentValue) -> Option<(i32, bool)> {
+    let ComponentKind::Token(ParserTokenKind::Number { value, number_type }) = value.kind else {
+        return None;
+    };
+    if !matches!(
+        number_type,
+        CssNumberType::Integer | CssNumberType::IntegerWithExplicitSign
+    ) {
+        return None;
+    }
+    Some((
+        clamp_integer(value),
+        number_type == CssNumberType::IntegerWithExplicitSign,
+    ))
+}
+
+fn dimension(value: &ComponentValue) -> Option<(i32, &[u16])> {
+    let ComponentKind::Token(ParserTokenKind::Dimension {
+        value,
+        number_type,
+        unit,
+    }) = &value.kind
+    else {
+        return None;
+    };
+    if !matches!(
+        number_type,
+        CssNumberType::Integer | CssNumberType::IntegerWithExplicitSign
+    ) {
+        return None;
+    }
+    Some((clamp_integer(*value), unit))
+}
+
+fn ascii_i32_saturating(value: &[u16]) -> Option<i32> {
+    let (negative, digits) = match value {
+        [sign, digits @ ..] if *sign == b'-' as u16 => (true, digits),
+        [sign, digits @ ..] if *sign == b'+' as u16 => (false, digits),
+        _ => (false, value),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    digits.iter().try_fold(0i32, |result, &unit| {
+        let digit = i32::from(u8::try_from(unit).ok()?.checked_sub(b'0')?);
+        if digit > 9 {
+            return None;
+        }
+        Some(if negative {
+            result.saturating_mul(10).saturating_sub(digit)
+        } else {
+            result.saturating_mul(10).saturating_add(digit)
+        })
+    })
+}
+
+fn digits(value: &[u16]) -> bool {
+    !value.is_empty() && value.iter().all(|unit| (b'0' as u16..=b'9' as u16).contains(unit))
+}
+
+fn parse_an_plus_b_tail(stream: &mut Stream<'_>, step_size: i32) -> AnPlusBPattern {
+    let after_step = stream.position;
+    stream.discard_whitespace();
+    if let Some((offset, true)) = stream.peek().and_then(integer) {
+        stream.position += 1;
+        return AnPlusBPattern { step_size, offset };
+    }
+    let sign = if stream.peek().is_some_and(|value| value.is_delim(b'+')) {
+        1
+    } else if stream.peek().is_some_and(|value| value.is_delim(b'-')) {
+        -1
+    } else {
+        stream.position = after_step;
+        return AnPlusBPattern { step_size, offset: 0 };
+    };
+    stream.position += 1;
+    stream.discard_whitespace();
+    if let Some((offset, false)) = stream.peek().and_then(integer) {
+        stream.position += 1;
+        return AnPlusBPattern {
+            step_size,
+            offset: offset.saturating_mul(sign),
+        };
+    }
+    stream.position = after_step;
+    AnPlusBPattern { step_size, offset: 0 }
+}
+
+// https://drafts.csswg.org/css-syntax-3/#anb-microsyntax
+fn parse_an_plus_b(stream: &mut Stream<'_>) -> Option<AnPlusBPattern> {
+    let original = stream.position;
+    stream.discard_whitespace();
+    if stream
+        .peek()
+        .and_then(ComponentValue::ident)
+        .is_some_and(|ident| ascii_eq(ident, "odd"))
+    {
+        stream.position += 1;
+        return Some(AnPlusBPattern {
+            step_size: 2,
+            offset: 1,
+        });
+    }
+    if stream
+        .peek()
+        .and_then(ComponentValue::ident)
+        .is_some_and(|ident| ascii_eq(ident, "even"))
+    {
+        stream.position += 1;
+        return Some(AnPlusBPattern {
+            step_size: 2,
+            offset: 0,
+        });
+    }
+    if let Some((offset, _)) = stream.peek().and_then(integer) {
+        stream.position += 1;
+        return Some(AnPlusBPattern { step_size: 0, offset });
+    }
+    if let Some((step_size, unit)) = stream.peek().and_then(dimension) {
+        if ascii_eq(unit, "n") {
+            stream.position += 1;
+            return Some(parse_an_plus_b_tail(stream, step_size));
+        }
+        if ascii_eq(unit, "n-") {
+            stream.position += 1;
+            if let Some((offset, false)) = stream.peek().and_then(integer) {
+                stream.position += 1;
+                return Some(AnPlusBPattern {
+                    step_size,
+                    offset: offset.saturating_neg(),
+                });
+            }
+            stream.position = original;
+            return None;
+        }
+        if unit.len() > 2 && ascii_starts_with(unit, "n-") && digits(&unit[2..]) {
+            let offset = ascii_i32_saturating(&unit[1..])?;
+            stream.position += 1;
+            return Some(AnPlusBPattern { step_size, offset });
+        }
+    }
+    if let Some(ident) = stream.peek().and_then(ComponentValue::ident) {
+        if ident.len() > 3 && ascii_starts_with(ident, "-n-") && digits(&ident[3..]) {
+            let offset = ascii_i32_saturating(&ident[2..])?;
+            stream.position += 1;
+            return Some(AnPlusBPattern { step_size: -1, offset });
+        }
+        if ascii_eq(ident, "-n") {
+            stream.position += 1;
+            return Some(parse_an_plus_b_tail(stream, -1));
+        }
+        if ascii_eq(ident, "-n-") {
+            stream.position += 1;
+            stream.discard_whitespace();
+            if let Some((offset, false)) = stream.peek().and_then(integer) {
+                stream.position += 1;
+                return Some(AnPlusBPattern {
+                    step_size: -1,
+                    offset: offset.saturating_neg(),
+                });
+            }
+            stream.position = original;
+            return None;
+        }
+    }
+
+    if stream.peek().is_some_and(|value| value.is_delim(b'+')) {
+        stream.position += 1;
+    }
+    let ident = stream.next().and_then(ComponentValue::ident);
+    if ident.is_some_and(|ident| ascii_eq(ident, "n")) {
+        return Some(parse_an_plus_b_tail(stream, 1));
+    }
+    if ident.is_some_and(|ident| ascii_eq(ident, "n-")) {
+        stream.discard_whitespace();
+        if let Some((offset, false)) = stream.peek().and_then(integer) {
+            stream.position += 1;
+            return Some(AnPlusBPattern {
+                step_size: 1,
+                offset: offset.saturating_neg(),
+            });
+        }
+    }
+    if let Some(ident) = ident
+        && ident.len() > 2
+        && ascii_starts_with(ident, "n-")
+        && digits(&ident[2..])
+    {
+        let offset = ascii_i32_saturating(&ident[1..])?;
+        return Some(AnPlusBPattern { step_size: 1, offset });
+    }
+    stream.position = original;
+    None
+}
+
+struct SelectorParser<'a> {
+    declared_namespaces: Option<&'a [TokenizerInput<'a>]>,
+    pseudo_class_context: Vec<PseudoClassType>,
+    nesting_limit_exceeded: bool,
+}
+
+impl<'a> SelectorParser<'a> {
+    fn new(declared_namespaces: Option<&'a [TokenizerInput<'a>]>) -> Self {
+        Self {
+            declared_namespaces,
+            pseudo_class_context: Vec::new(),
+            nesting_limit_exceeded: false,
+        }
+    }
+
+    fn parse_selector_list(
+        &mut self,
+        values: &[ComponentValue],
+        selector_type: SelectorType,
+        parsing_mode: SelectorParsingMode,
+    ) -> Result<SelectorList, ()> {
+        if self.pseudo_class_context.len() > MAXIMUM_SELECTOR_NESTING_DEPTH {
+            self.nesting_limit_exceeded = true;
+            return Err(());
+        }
+        let mut selectors = Vec::new();
+        let mut start = 0;
+        loop {
+            let end = values[start..]
+                .iter()
+                .position(ComponentValue::is_comma)
+                .map_or(values.len(), |offset| start + offset);
+            let selector_values = &values[start..end];
+            let selector = self.parse_complex_selector(selector_values, selector_type);
+            if self.nesting_limit_exceeded {
+                return Err(());
+            }
+            match selector {
+                Ok(selector) => selectors.push(selector),
+                Err(()) if parsing_mode == SelectorParsingMode::Forgiving => {
+                    let mut invalid_values = selector_values;
+                    while invalid_values.first().is_some_and(ComponentValue::is_whitespace) {
+                        invalid_values = &invalid_values[1..];
+                    }
+                    while invalid_values.last().is_some_and(ComponentValue::is_whitespace) {
+                        invalid_values = &invalid_values[..invalid_values.len() - 1];
+                    }
+                    let source = invalid_values
+                        .iter()
+                        .flat_map(|value| value.original_source_text.iter())
+                        .collect::<Vec<_>>();
+                    selectors.push(CompiledSelector::new(
+                        vec![CompoundSelector {
+                            combinator: if selector_type == SelectorType::Standalone {
+                                Combinator::None
+                            } else {
+                                Combinator::Descendant
+                            },
+                            is_implicit_universal_anchor: false,
+                            simple_selectors: vec![SimpleSelector::Invalid(source.into_boxed_slice())]
+                                .into_boxed_slice(),
+                        }]
+                        .into_boxed_slice(),
+                    ));
+                }
+                Err(()) => return Err(()),
+            }
+            if end == values.len() {
+                break;
+            }
+            start = end + 1;
+        }
+        if selectors.is_empty() && parsing_mode != SelectorParsingMode::Forgiving {
+            return Err(());
+        }
+        Ok(selectors.into_boxed_slice())
+    }
+
+    fn parse_complex_selector(
+        &mut self,
+        values: &[ComponentValue],
+        selector_type: SelectorType,
+    ) -> Result<Arc<CompiledSelector>, ()> {
+        let mut stream = Stream::new(values);
+        let mut first_combinator = self.parse_combinator(&mut stream);
+        match selector_type {
+            SelectorType::Standalone => {
+                if first_combinator.is_some_and(|combinator| combinator != Combinator::Descendant) {
+                    return Err(());
+                }
+                first_combinator = Some(Combinator::None);
+            }
+            SelectorType::Relative if first_combinator.is_none() => {
+                first_combinator = Some(Combinator::Descendant);
+            }
+            SelectorType::Relative => {}
+        }
+
+        let mut first = self.parse_compound_selector(&mut stream)?;
+        if first.simple_selectors.is_empty() {
+            return Err(());
+        }
+        first.combinator = first_combinator.unwrap_or(Combinator::None);
+        let mut compounds = vec![first];
+
+        while !stream.is_empty() {
+            let Some(combinator) = self.parse_combinator(&mut stream) else {
+                break;
+            };
+            let mut compound = self.parse_compound_selector(&mut stream)?;
+            if compound.simple_selectors.is_empty() {
+                if !stream.is_empty() || combinator != Combinator::Descendant {
+                    return Err(());
+                }
+                break;
+            }
+            compound.combinator = combinator;
+            compounds.push(compound);
+        }
+        if !stream.is_empty() {
+            return Err(());
+        }
+
+        let compounds = normalize_pseudo_element_transitions(compounds);
+        let mut pseudo_elements = Vec::new();
+        let mut saw_pseudo_element_transition = false;
+        for compound in &compounds {
+            if saw_pseudo_element_transition && compound.combinator != Combinator::PseudoElement {
+                return Err(());
+            }
+            saw_pseudo_element_transition |= compound.combinator == Combinator::PseudoElement;
+            if let Some(SimpleSelector::PseudoElement(pseudo_element)) = compound.simple_selectors.first() {
+                pseudo_elements.push(pseudo_element.pseudo_element);
+            }
+        }
+        if pseudo_elements.len() > 1
+            && !(pseudo_elements.len() == 2
+                && pseudo_elements[0] == PseudoElementType::Part
+                && pseudo_elements[1] != PseudoElementType::Part)
+        {
+            return Err(());
+        }
+        Ok(CompiledSelector::new(compounds.into_boxed_slice()))
+    }
+
+    fn parse_qualified_name(&self, stream: &mut Stream<'_>, allow_wildcard: bool) -> Option<QualifiedName> {
+        fn name(value: &ComponentValue) -> Option<SelectorString> {
+            if value.is_delim(b'*') {
+                return Some(Box::new([b'*' as u16]));
+            }
+            value.ident().map(Into::into)
+        }
+
+        let original = stream.position;
+        let first = stream.next()?;
+        if first.is_delim(b'|') {
+            let parsed_name = stream.next().and_then(name)?;
+            if !allow_wildcard && parsed_name.as_ref() == [b'*' as u16] {
+                stream.position = original;
+                return None;
+            }
+            return Some(QualifiedName {
+                namespace_type: NamespaceType::None,
+                namespace: Box::new([]),
+                lowercase_name: lowercase(&parsed_name),
+                name: parsed_name,
+                interned_name: None,
+                interned_lowercase_name: None,
+                interned_namespace: None,
+            });
+        }
+
+        let Some(first_name) = name(first) else {
+            stream.position = original;
+            return None;
+        };
+        if stream.peek().is_some_and(|value| value.is_delim(b'|')) && stream.peek_n(1).and_then(name).is_some() {
+            stream.position += 1;
+            let parsed_name = name(stream.next().unwrap()).unwrap();
+            if !allow_wildcard && parsed_name.as_ref() == [b'*' as u16] {
+                stream.position = original;
+                return None;
+            }
+            let namespace_type = if first_name.as_ref() == [b'*' as u16] {
+                NamespaceType::Any
+            } else {
+                NamespaceType::Named
+            };
+            if namespace_type == NamespaceType::Named
+                && self.declared_namespaces.is_some_and(|declared_namespaces| {
+                    !declared_namespaces.iter().any(|namespace| {
+                        namespace.len() == first_name.len()
+                            && first_name
+                                .iter()
+                                .enumerate()
+                                .all(|(index, code_unit)| namespace.code_unit_at(index) == *code_unit)
+                    })
+                })
+            {
+                stream.position = original;
+                return None;
+            }
+            return Some(QualifiedName {
+                namespace_type,
+                namespace: first_name,
+                lowercase_name: lowercase(&parsed_name),
+                name: parsed_name,
+                interned_name: None,
+                interned_lowercase_name: None,
+                interned_namespace: None,
+            });
+        }
+        if !allow_wildcard && first_name.as_ref() == [b'*' as u16] {
+            stream.position = original;
+            return None;
+        }
+        Some(QualifiedName {
+            namespace_type: NamespaceType::Default,
+            namespace: Box::new([]),
+            lowercase_name: lowercase(&first_name),
+            name: first_name,
+            interned_name: None,
+            interned_lowercase_name: None,
+            interned_namespace: None,
+        })
+    }
+
+    fn next_is_pseudo_element(&self, stream: &Stream<'_>) -> bool {
+        if !stream.peek().is_some_and(ComponentValue::is_colon) {
+            return false;
+        }
+        if stream.peek_n(1).is_some_and(ComponentValue::is_colon) {
+            return true;
+        }
+        let Some(name) = stream.peek_n(1).and_then(ComponentValue::ident) else {
+            return false;
+        };
+        PseudoElementType::from_name(name).is_some_and(|(pseudo_element, _)| {
+            matches!(
+                pseudo_element,
+                PseudoElementType::After
+                    | PseudoElementType::Before
+                    | PseudoElementType::FirstLetter
+                    | PseudoElementType::FirstLine
+            )
+        })
+    }
+
+    fn parse_simple_selector(&mut self, stream: &mut Stream<'_>) -> Result<Option<SimpleSelector>, ()> {
+        if stream
+            .peek()
+            .is_none_or(|value| value.is_whitespace() || value.is_comma())
+        {
+            return Ok(None);
+        }
+
+        let original = stream.position;
+        if let Some(qualified_name) = self.parse_qualified_name(stream, true) {
+            return Ok(Some(if qualified_name.name.as_ref() == [b'*' as u16] {
+                SimpleSelector::Universal(qualified_name)
+            } else {
+                SimpleSelector::TagName(qualified_name)
+            }));
+        }
+        stream.position = original;
+
+        if self.next_is_pseudo_element(stream) {
+            return self.parse_pseudo_element(stream).map(Some);
+        }
+        if stream.peek().is_some_and(ComponentValue::is_colon) {
+            return self.parse_pseudo_class(stream).map(Some);
+        }
+        if stream.peek().is_some_and(|value| {
+            value.is_delim(b'>') || value.is_delim(b'+') || value.is_delim(b'~') || value.is_delim(b'|')
+        }) {
+            return Ok(None);
+        }
+
+        let first = stream.next().ok_or(())?;
+        if first.is_delim(b'&') {
+            return Ok(Some(SimpleSelector::Nesting));
+        }
+        if first.is_delim(b'.') {
+            let class_name = stream.next().and_then(ComponentValue::ident).ok_or(())?;
+            return Ok(Some(SimpleSelector::Class(selector_name(class_name))));
+        }
+        if let ComponentKind::Token(ParserTokenKind::Hash { value, is_id: true }) = &first.kind {
+            return Ok(Some(SimpleSelector::Id(selector_name(value))));
+        }
+        if let Some(values) = first.square_block() {
+            return self.parse_attribute(values).map(Some);
+        }
+        Err(())
+    }
+
+    fn parse_attribute(&self, values: &[ComponentValue]) -> Result<SimpleSelector, ()> {
+        let mut stream = Stream::new(values);
+        stream.discard_whitespace();
+        let qualified_name = self.parse_qualified_name(&mut stream, false).ok_or(())?;
+        stream.discard_whitespace();
+        if stream.is_empty() {
+            return Ok(SimpleSelector::Attribute(AttributeSelector {
+                match_type: AttributeMatchType::HasAttribute,
+                qualified_name,
+                value: Box::new([]),
+                value_identity: None,
+                case_type: AttributeCaseType::Default,
+            }));
+        }
+
+        let first = stream.next().ok_or(())?;
+        let match_type = if first.is_delim(b'=') {
+            AttributeMatchType::ExactValue
+        } else {
+            let second = stream.next().ok_or(())?;
+            if !second.is_delim(b'=') {
+                return Err(());
+            }
+            if first.is_delim(b'~') {
+                AttributeMatchType::ContainsWord
+            } else if first.is_delim(b'*') {
+                AttributeMatchType::ContainsString
+            } else if first.is_delim(b'|') {
+                AttributeMatchType::StartsWithSegment
+            } else if first.is_delim(b'^') {
+                AttributeMatchType::StartsWithString
+            } else if first.is_delim(b'$') {
+                AttributeMatchType::EndsWithString
+            } else {
+                return Err(());
+            }
+        };
+        stream.discard_whitespace();
+        let value = stream
+            .next()
+            .and_then(|value| value.ident().or_else(|| value.string()))
+            .ok_or(())?
+            .into();
+        stream.discard_whitespace();
+        let case_type = match stream.next() {
+            None => AttributeCaseType::Default,
+            Some(value) if value.ident().is_some_and(|ident| ascii_eq(ident, "i")) => AttributeCaseType::Insensitive,
+            Some(value) if value.ident().is_some_and(|ident| ascii_eq(ident, "s")) => AttributeCaseType::Sensitive,
+            Some(_) => return Err(()),
+        };
+        stream.discard_whitespace();
+        if !stream.is_empty() {
+            return Err(());
+        }
+        Ok(SimpleSelector::Attribute(AttributeSelector {
+            match_type,
+            qualified_name,
+            value,
+            value_identity: None,
+            case_type,
+        }))
+    }
+
+    fn parse_pseudo_class(&mut self, stream: &mut Stream<'_>) -> Result<SimpleSelector, ()> {
+        if !stream.next().is_some_and(ComponentValue::is_colon) {
+            return Err(());
+        }
+        let value = stream.next().ok_or(())?;
+        if let Some(name) = value.ident() {
+            let pseudo_class = PseudoClassType::from_name(name).ok_or(())?;
+            if !pseudo_class.metadata().is_valid_as_identifier {
+                return Err(());
+            }
+            return Ok(SimpleSelector::PseudoClass(pseudo_class_selector(pseudo_class)));
+        }
+
+        let (name, function_values) = value.function().ok_or(())?;
+        let pseudo_class = PseudoClassType::from_name(name).ok_or(())?;
+        let metadata = pseudo_class.metadata();
+        if !metadata.is_valid_as_function || function_values.is_empty() {
+            return Err(());
+        }
+        if pseudo_class == PseudoClassType::Has && self.pseudo_class_context.contains(&PseudoClassType::Has) {
+            return Err(());
+        }
+        if self.pseudo_class_context.len() >= MAXIMUM_SELECTOR_NESTING_DEPTH {
+            self.nesting_limit_exceeded = true;
+            return Err(());
+        }
+
+        self.pseudo_class_context.push(pseudo_class);
+        let result = self.parse_pseudo_class_function(pseudo_class, metadata.parameter_type, function_values);
+        self.pseudo_class_context.pop();
+        result.map(SimpleSelector::PseudoClass)
+    }
+
+    fn parse_pseudo_class_function(
+        &mut self,
+        pseudo_class: PseudoClassType,
+        parameter_type: PseudoClassParameterType,
+        values: &[ComponentValue],
+    ) -> Result<PseudoClassSelector, ()> {
+        if self.pseudo_class_context.len() > MAXIMUM_SELECTOR_NESTING_DEPTH {
+            self.nesting_limit_exceeded = true;
+            return Err(());
+        }
+        let mut selector = pseudo_class_selector(pseudo_class);
+        match parameter_type {
+            PseudoClassParameterType::AnPlusB | PseudoClassParameterType::AnPlusBOf => {
+                let mut stream = Stream::new(values);
+                selector.an_plus_b_pattern = parse_an_plus_b(&mut stream).ok_or(())?;
+                stream.discard_whitespace();
+                if stream.is_empty() {
+                    return Ok(selector);
+                }
+                if parameter_type != PseudoClassParameterType::AnPlusBOf
+                    || !stream
+                        .next()
+                        .and_then(ComponentValue::ident)
+                        .is_some_and(|ident| ascii_eq(ident, "of"))
+                {
+                    return Err(());
+                }
+                stream.discard_whitespace();
+                selector.argument_selector_list = self.parse_selector_list(
+                    &stream.values[stream.position..],
+                    SelectorType::Standalone,
+                    SelectorParsingMode::Standard,
+                )?;
+            }
+            PseudoClassParameterType::CompoundSelector => {
+                let mut stream = Stream::new(values);
+                let mut compound = self.parse_compound_selector(&mut stream)?;
+                stream.discard_whitespace();
+                if !stream.is_empty() || compound.simple_selectors.is_empty() {
+                    return Err(());
+                }
+                compound.combinator = Combinator::None;
+                selector.argument_selector_list = Box::new([CompiledSelector::new(Box::new([compound]))]);
+            }
+            PseudoClassParameterType::ForgivingSelectorList
+            | PseudoClassParameterType::ForgivingRelativeSelectorList => {
+                let selector_type = if parameter_type == PseudoClassParameterType::ForgivingSelectorList {
+                    SelectorType::Standalone
+                } else {
+                    SelectorType::Relative
+                };
+                selector.argument_selector_list =
+                    self.parse_selector_list(values, selector_type, SelectorParsingMode::Forgiving)?;
+                selector.is_forgiving = true;
+            }
+            PseudoClassParameterType::Ident => {
+                let mut stream = Stream::new(values);
+                stream.discard_whitespace();
+                let ident = stream.next().and_then(ComponentValue::ident).ok_or(())?;
+                stream.discard_whitespace();
+                if !stream.is_empty() {
+                    return Err(());
+                }
+                selector.direction = Some(if ascii_eq(ident, "ltr") {
+                    Direction::LeftToRight
+                } else if ascii_eq(ident, "rtl") {
+                    Direction::RightToLeft
+                } else {
+                    Direction::Other
+                });
+                selector.identifier = Some(ident.into());
+            }
+            PseudoClassParameterType::LanguageRanges => {
+                let mut languages = Vec::new();
+                for values in split_on_commas(values) {
+                    let mut stream = Stream::new(values);
+                    stream.discard_whitespace();
+                    let (value, is_string) = match &stream.next().ok_or(())?.kind {
+                        ComponentKind::Token(ParserTokenKind::Ident(value)) => {
+                            (value.to_vec().into_boxed_slice(), false)
+                        }
+                        ComponentKind::Token(ParserTokenKind::String(value)) => {
+                            (value.to_vec().into_boxed_slice(), true)
+                        }
+                        _ => return Err(()),
+                    };
+                    stream.discard_whitespace();
+                    if !stream.is_empty() {
+                        return Err(());
+                    }
+                    languages.push(LanguageRange { value, is_string });
+                }
+                selector.languages = languages.into_boxed_slice();
+            }
+            PseudoClassParameterType::LevelList => {
+                let mut levels = Vec::new();
+                for values in split_on_commas(values) {
+                    let mut stream = Stream::new(values);
+                    stream.discard_whitespace();
+                    let Some(ComponentValue {
+                        kind:
+                            ComponentKind::Token(ParserTokenKind::Number {
+                                value,
+                                number_type: CssNumberType::Integer | CssNumberType::IntegerWithExplicitSign,
+                            }),
+                        ..
+                    }) = stream.next()
+                    else {
+                        return Err(());
+                    };
+                    if !value.is_finite()
+                        || value.fract() != 0.0
+                        || *value < i64::MIN as f64
+                        || *value > i64::MAX as f64
+                    {
+                        return Err(());
+                    }
+                    stream.discard_whitespace();
+                    if !stream.is_empty() {
+                        return Err(());
+                    }
+                    levels.push(*value as i64);
+                }
+                selector.levels = levels.into_boxed_slice();
+            }
+            PseudoClassParameterType::SelectorList | PseudoClassParameterType::RelativeSelectorList => {
+                let selector_type = if parameter_type == PseudoClassParameterType::SelectorList {
+                    SelectorType::Standalone
+                } else {
+                    SelectorType::Relative
+                };
+                selector.argument_selector_list =
+                    self.parse_selector_list(values, selector_type, SelectorParsingMode::Standard)?;
+            }
+            PseudoClassParameterType::None => return Err(()),
+        }
+        Ok(selector)
+    }
+
+    fn parse_pseudo_element(&mut self, stream: &mut Stream<'_>) -> Result<SimpleSelector, ()> {
+        if !stream.next().is_some_and(ComponentValue::is_colon) {
+            return Err(());
+        }
+        let double_colon = stream.peek().is_some_and(ComponentValue::is_colon);
+        if double_colon {
+            stream.position += 1;
+        }
+        let name_value = stream.next().ok_or(())?;
+        let (name, function_values) = if let Some(name) = name_value.ident() {
+            (name, None)
+        } else if let Some((name, values)) = name_value.function() {
+            (name, Some(values))
+        } else {
+            return Err(());
+        };
+
+        let Some((pseudo_element, alias)) = PseudoElementType::from_name(name) else {
+            if function_values.is_none() && ascii_starts_with(name, "-webkit-") && !self.inside_has() {
+                return Ok(SimpleSelector::PseudoElement(PseudoElementSelector {
+                    pseudo_element: PseudoElementType::UnknownWebKit,
+                    serialized_name: Some(lowercase(name)),
+                    value: PseudoElementValue::None,
+                    identifier_identities: Box::new([]),
+                }));
+            }
+            return Err(());
+        };
+        if self.inside_has() {
+            return Err(());
+        }
+        if !double_colon {
+            if function_values.is_some()
+                || !matches!(
+                    pseudo_element,
+                    PseudoElementType::After
+                        | PseudoElementType::Before
+                        | PseudoElementType::FirstLetter
+                        | PseudoElementType::FirstLine
+                )
+            {
+                return Err(());
+            }
+            return Ok(SimpleSelector::PseudoElement(PseudoElementSelector {
+                pseudo_element,
+                serialized_name: alias.map(|alias| alias.encode_utf16().collect::<Vec<_>>().into_boxed_slice()),
+                value: PseudoElementValue::None,
+                identifier_identities: Box::new([]),
+            }));
+        }
+
+        let metadata = pseudo_element.metadata();
+        let value = match function_values {
+            Some(_) if !metadata.is_valid_as_function => return Err(()),
+            None if !metadata.is_valid_as_identifier => return Err(()),
+            None => PseudoElementValue::None,
+            Some(values) => self.parse_pseudo_element_function(metadata.parameter_type, values)?,
+        };
+        Ok(SimpleSelector::PseudoElement(PseudoElementSelector {
+            pseudo_element,
+            serialized_name: alias.map(|alias| alias.encode_utf16().collect::<Vec<_>>().into_boxed_slice()),
+            value,
+            identifier_identities: Box::new([]),
+        }))
+    }
+
+    fn inside_has(&self) -> bool {
+        self.pseudo_class_context.contains(&PseudoClassType::Has)
+    }
+
+    fn parse_pseudo_element_function(
+        &mut self,
+        parameter_type: PseudoElementParameterType,
+        values: &[ComponentValue],
+    ) -> Result<PseudoElementValue, ()> {
+        let mut stream = Stream::new(values);
+        stream.discard_whitespace();
+        match parameter_type {
+            PseudoElementParameterType::None => {
+                if !stream.is_empty() {
+                    return Err(());
+                }
+                Ok(PseudoElementValue::None)
+            }
+            PseudoElementParameterType::CompoundSelector => {
+                let mut compound = self.parse_compound_selector(&mut stream)?;
+                stream.discard_whitespace();
+                if !stream.is_empty() || compound.simple_selectors.is_empty() {
+                    return Err(());
+                }
+                compound.combinator = Combinator::None;
+                Ok(PseudoElementValue::CompoundSelector(CompiledSelector::new(Box::new([
+                    compound,
+                ]))))
+            }
+            PseudoElementParameterType::IdentList => {
+                let mut identifiers = Vec::new();
+                while !stream.is_empty() {
+                    identifiers.push(stream.next().and_then(ComponentValue::ident).ok_or(())?.into());
+                    stream.discard_whitespace();
+                }
+                if identifiers.is_empty() {
+                    return Err(());
+                }
+                Ok(PseudoElementValue::Identifiers(identifiers.into_boxed_slice()))
+            }
+            PseudoElementParameterType::PTNameSelector => {
+                let (is_universal, value) = if stream.peek().is_some_and(|value| value.is_delim(b'*')) {
+                    stream.position += 1;
+                    (true, Box::new([]) as SelectorString)
+                } else {
+                    let ident = stream.next().and_then(ComponentValue::ident).ok_or(())?;
+                    if is_css_wide_keyword(ident) || ascii_eq(ident, "default") {
+                        return Err(());
+                    }
+                    (false, ident.into())
+                };
+                stream.discard_whitespace();
+                if !stream.is_empty() {
+                    return Err(());
+                }
+                Ok(PseudoElementValue::TransitionName { is_universal, value })
+            }
+        }
+    }
+
+    fn parse_compound_selector(&mut self, stream: &mut Stream<'_>) -> Result<CompoundSelector, ()> {
+        let mut simple_selectors = Vec::new();
+        while let Some(simple_selector) = self.parse_simple_selector(stream)? {
+            if matches!(simple_selector, SimpleSelector::TagName(_)) && !simple_selectors.is_empty() {
+                return Err(());
+            }
+            simple_selectors.push(simple_selector);
+        }
+        Ok(CompoundSelector {
+            combinator: Combinator::None,
+            is_implicit_universal_anchor: false,
+            simple_selectors: simple_selectors.into_boxed_slice(),
+        })
+    }
+
+    fn parse_combinator(&self, stream: &mut Stream<'_>) -> Option<Combinator> {
+        let original = stream.position;
+        let had_whitespace = stream.peek().is_some_and(ComponentValue::is_whitespace);
+        stream.discard_whitespace();
+        let combinator = if stream.peek().is_some_and(|value| value.is_delim(b'>')) {
+            stream.position += 1;
+            Some(Combinator::ImmediateChild)
+        } else if stream.peek().is_some_and(|value| value.is_delim(b'+')) {
+            stream.position += 1;
+            Some(Combinator::NextSibling)
+        } else if stream.peek().is_some_and(|value| value.is_delim(b'~')) {
+            stream.position += 1;
+            Some(Combinator::SubsequentSibling)
+        } else if stream.peek().is_some_and(|value| value.is_delim(b'|'))
+            && stream.peek_n(1).is_some_and(|value| value.is_delim(b'|'))
+        {
+            stream.position += 2;
+            Some(Combinator::Column)
+        } else if had_whitespace {
+            Some(Combinator::Descendant)
+        } else {
+            stream.position = original;
+            None
+        };
+        if combinator.is_some() {
+            stream.discard_whitespace();
+        }
+        combinator
+    }
+}
+
+fn normalize_pseudo_element_transitions(compounds: Vec<CompoundSelector>) -> Vec<CompoundSelector> {
+    if !compounds.iter().any(|compound| {
+        compound
+            .simple_selectors
+            .iter()
+            .any(|simple| matches!(simple, SimpleSelector::PseudoElement(_)))
+    }) {
+        return compounds;
+    }
+
+    let mut normalized = Vec::new();
+    for compound in compounds {
+        let mut combinator = compound.combinator;
+        let mut current = Vec::new();
+        for simple in compound.simple_selectors {
+            if matches!(simple, SimpleSelector::PseudoElement(_)) {
+                if current.is_empty() {
+                    normalized.push(CompoundSelector {
+                        combinator,
+                        is_implicit_universal_anchor: true,
+                        simple_selectors: vec![SimpleSelector::Universal(QualifiedName {
+                            namespace_type: NamespaceType::Any,
+                            namespace: Box::new([]),
+                            name: Box::new([b'*' as u16]),
+                            lowercase_name: Box::new([b'*' as u16]),
+                            interned_name: None,
+                            interned_lowercase_name: None,
+                            interned_namespace: None,
+                        })]
+                        .into_boxed_slice(),
+                    });
+                } else {
+                    normalized.push(CompoundSelector {
+                        combinator,
+                        is_implicit_universal_anchor: false,
+                        simple_selectors: std::mem::take(&mut current).into_boxed_slice(),
+                    });
+                }
+                combinator = Combinator::PseudoElement;
+            }
+            current.push(simple);
+        }
+        if !current.is_empty() {
+            normalized.push(CompoundSelector {
+                combinator,
+                is_implicit_universal_anchor: false,
+                simple_selectors: current.into_boxed_slice(),
+            });
+        }
+    }
+    normalized
+}
+
+pub(crate) fn parse_selector_list<'a>(
+    input: impl Into<TokenizerInput<'a>>,
+    declared_namespaces: &[TokenizerInput<'_>],
+    selector_type: SelectorType,
+    parsing_mode: SelectorParsingMode,
+) -> Result<SelectorList, ()> {
+    let tokens = tokenize_for_parser(input);
+    let values = consume_a_list_of_component_values(tokens.as_slice())?;
+    SelectorParser::new(Some(declared_namespaces)).parse_selector_list(&values, selector_type, parsing_mode)
+}
+
+pub(crate) fn parse_selector_list_from_component_values(
+    values: &[ComponentValue],
+    declared_namespaces: &[TokenizerInput<'_>],
+    selector_type: SelectorType,
+) -> Result<RustParsedSelectorList, ()> {
+    let selectors = SelectorParser::new(Some(declared_namespaces)).parse_selector_list(
+        values,
+        selector_type,
+        SelectorParsingMode::Standard,
+    )?;
+    Ok(RustParsedSelectorList::new(selectors))
+}
+
+fn parse_pseudo_element_selector(input: TokenizerInput<'_>) -> Result<(Arc<CompiledSelector>, PseudoElementType), ()> {
+    let tokens = tokenize_for_parser(input);
+    let values = consume_a_list_of_component_values(tokens.as_slice())?;
+    let mut stream = Stream::new(&values);
+    let simple = SelectorParser::new(Some(&[])).parse_pseudo_element(&mut stream)?;
+    if !stream.is_empty() {
+        return Err(());
+    }
+    let SimpleSelector::PseudoElement(pseudo_element) = &simple else {
+        unreachable!();
+    };
+    let pseudo_element_type = pseudo_element.pseudo_element;
+    Ok((
+        CompiledSelector::new(
+            normalize_pseudo_element_transitions(vec![CompoundSelector {
+                combinator: Combinator::None,
+                is_implicit_universal_anchor: false,
+                simple_selectors: Box::new([simple]),
+            }])
+            .into_boxed_slice(),
+        ),
+        pseudo_element_type,
+    ))
+}
+
+fn append_unique(names: &mut Vec<SelectorString>, name: &[u16]) {
+    if !names.iter().any(|existing| existing.as_ref() == name) {
+        names.push(name.into());
+    }
+}
+
+fn collect_qualified_name(names: &mut Vec<SelectorString>, qualified_name: &QualifiedName) {
+    append_unique(names, &qualified_name.name);
+    append_unique(names, &qualified_name.lowercase_name);
+    if qualified_name.namespace_type == NamespaceType::Named {
+        append_unique(names, &qualified_name.namespace);
+    }
+}
+
+fn collect_interned_names_from_selector(names: &mut Vec<SelectorString>, selector: &CompiledSelector) {
+    for compound in &selector.compound_selectors {
+        for simple in &compound.simple_selectors {
+            match simple {
+                SimpleSelector::Universal(qualified_name) | SimpleSelector::TagName(qualified_name) => {
+                    collect_qualified_name(names, qualified_name);
+                }
+                SimpleSelector::Id(name) | SimpleSelector::Class(name) => {
+                    append_unique(names, &name.name);
+                    append_unique(names, &lowercase(&name.name));
+                }
+                SimpleSelector::Attribute(attribute) => {
+                    collect_qualified_name(names, &attribute.qualified_name);
+                    append_unique(names, &attribute.value);
+                }
+                SimpleSelector::PseudoClass(pseudo_class) => {
+                    if let Some(identifier) = &pseudo_class.identifier {
+                        append_unique(names, identifier);
+                        append_unique(names, &lowercase(identifier));
+                    }
+                    for selector in &pseudo_class.argument_selector_list {
+                        collect_interned_names_from_selector(names, selector);
+                    }
+                }
+                SimpleSelector::PseudoElement(pseudo_element) => match &pseudo_element.value {
+                    PseudoElementValue::CompoundSelector(selector) => {
+                        collect_interned_names_from_selector(names, selector);
+                    }
+                    PseudoElementValue::Identifiers(identifiers) => {
+                        for identifier in identifiers {
+                            append_unique(names, identifier);
+                        }
+                    }
+                    PseudoElementValue::None | PseudoElementValue::TransitionName { .. } => {}
+                },
+                SimpleSelector::Nesting | SimpleSelector::Invalid(_) => {}
+            }
+        }
+    }
+}
+
+fn identity_for(
+    names: &[SelectorString],
+    identities: &[RetainedUtf16FlyString],
+    name: &[u16],
+) -> Option<RetainedUtf16FlyString> {
+    let index = names.iter().position(|candidate| candidate.as_ref() == name)?;
+    Some(identities[index].clone())
+}
+
+fn bind_qualified_name(
+    qualified_name: &QualifiedName,
+    names: &[SelectorString],
+    identities: &[RetainedUtf16FlyString],
+) -> bound::QualifiedName {
+    bound::QualifiedName {
+        namespace_type: qualified_name.namespace_type,
+        namespace: qualified_name.namespace.clone(),
+        name: qualified_name.name.clone(),
+        lowercase_name: qualified_name.lowercase_name.clone(),
+        interned_name: identity_for(names, identities, &qualified_name.name),
+        interned_lowercase_name: identity_for(names, identities, &qualified_name.lowercase_name),
+        interned_namespace: (qualified_name.namespace_type == NamespaceType::Named)
+            .then(|| identity_for(names, identities, &qualified_name.namespace))
+            .flatten(),
+    }
+}
+
+fn bind_interned_names_in_selector(
+    selector: &CompiledSelector,
+    names: &[SelectorString],
+    identities: &[RetainedUtf16FlyString],
+) -> Arc<bound::CompiledSelector> {
+    let compound_selectors = selector
+        .compound_selectors
+        .iter()
+        .map(|compound| bound::CompoundSelector {
+            combinator: compound.combinator,
+            is_implicit_universal_anchor: compound.is_implicit_universal_anchor,
+            simple_selectors: compound
+                .simple_selectors
+                .iter()
+                .map(|simple| {
+                    match simple {
+                        SimpleSelector::Universal(name) => {
+                            bound::SimpleSelector::Universal(bind_qualified_name(name, names, identities))
+                        }
+                        SimpleSelector::TagName(name) => {
+                            bound::SimpleSelector::TagName(bind_qualified_name(name, names, identities))
+                        }
+                        SimpleSelector::Id(name) | SimpleSelector::Class(name) => {
+                            let name = bound::NameSelector {
+                                name: name.name.clone(),
+                                interned_name: identity_for(names, identities, &name.name),
+                                interned_lowercase_name: identity_for(names, identities, &lowercase(&name.name)),
+                            };
+                            if matches!(simple, SimpleSelector::Id(_)) {
+                                bound::SimpleSelector::Id(name)
+                            } else {
+                                bound::SimpleSelector::Class(name)
+                            }
+                        }
+                        SimpleSelector::Attribute(attribute) => {
+                            bound::SimpleSelector::Attribute(bound::AttributeSelector {
+                                match_type: attribute.match_type,
+                                qualified_name: bind_qualified_name(&attribute.qualified_name, names, identities),
+                                value: attribute.value.clone(),
+                                value_identity: identity_for(names, identities, &attribute.value),
+                                case_type: attribute.case_type,
+                            })
+                        }
+                        SimpleSelector::PseudoClass(pseudo_class) => {
+                            bound::SimpleSelector::PseudoClass(bound::PseudoClassSelector {
+                                pseudo_class: pseudo_class.pseudo_class,
+                                an_plus_b_pattern: pseudo_class.an_plus_b_pattern,
+                                argument_selector_list: pseudo_class
+                                    .argument_selector_list
+                                    .iter()
+                                    .map(|selector| bind_interned_names_in_selector(selector, names, identities))
+                                    .collect(),
+                                languages: pseudo_class.languages.clone(),
+                                direction: pseudo_class.direction,
+                                identifier: pseudo_class.identifier.clone(),
+                                identifier_identity: pseudo_class
+                                    .identifier
+                                    .as_ref()
+                                    .and_then(|identifier| identity_for(names, identities, identifier)),
+                                identifier_lowercase_identity: pseudo_class
+                                    .identifier
+                                    .as_ref()
+                                    .and_then(|identifier| identity_for(names, identities, &lowercase(identifier))),
+                                levels: pseudo_class.levels.clone(),
+                                is_forgiving: pseudo_class.is_forgiving,
+                            })
+                        }
+                        SimpleSelector::PseudoElement(pseudo_element) => {
+                            let mut identifier_identities = Box::default();
+                            let value = match &pseudo_element.value {
+                                PseudoElementValue::CompoundSelector(selector) => {
+                                    bound::PseudoElementValue::CompoundSelector(bind_interned_names_in_selector(
+                                        selector, names, identities,
+                                    ))
+                                }
+                                PseudoElementValue::Identifiers(identifiers) => {
+                                    // NB: Restricted pseudo-element parsing has no atom bindings.
+                                    if !names.is_empty() {
+                                        identifier_identities = identifiers
+                                            .iter()
+                                            .map(|identifier| identity_for(names, identities, identifier).unwrap())
+                                            .collect();
+                                    }
+                                    bound::PseudoElementValue::Identifiers(identifiers.clone())
+                                }
+                                PseudoElementValue::None => bound::PseudoElementValue::None,
+                                PseudoElementValue::TransitionName { is_universal, value } => {
+                                    bound::PseudoElementValue::TransitionName {
+                                        is_universal: *is_universal,
+                                        value: value.clone(),
+                                    }
+                                }
+                            };
+                            bound::SimpleSelector::PseudoElement(bound::PseudoElementSelector {
+                                pseudo_element: pseudo_element.pseudo_element,
+                                serialized_name: pseudo_element.serialized_name.clone(),
+                                value,
+                                identifier_identities,
+                            })
+                        }
+                        SimpleSelector::Nesting => bound::SimpleSelector::Nesting,
+                        SimpleSelector::Invalid(source) => bound::SimpleSelector::Invalid(source.clone()),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+    bound::CompiledSelector::new(compound_selectors)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RustParsedSelectorList {
+    selectors: SelectorList,
+    pub(crate) interned_names: Box<[SelectorString]>,
+}
+
+// Keep worker-parsed selectors free of document-thread atoms, including nested selectors.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<RustParsedSelectorList>();
+};
+
+/// Document-thread selectors with interned names, owned independently of the parsed list.
+pub struct RustBoundSelectorList {
+    pub(crate) selectors: bound::SelectorList,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_bound_selector_list_length(list: &RustBoundSelectorList) -> usize {
+    list.selectors.len()
+}
+
+impl RustParsedSelectorList {
+    /// Bind immutable parsed names to the document's atom table without a host-side list.
+    ///
+    /// # Safety
+    /// Call only on the document thread: AK's Utf16FlyString table is not thread-safe.
+    pub(crate) unsafe fn bind(&self) -> RustBoundSelectorList {
+        let names = self
+            .interned_names
+            .iter()
+            .map(|name| {
+                crate::css::ffi_stats::bump_cpp_callback(crate::css::ffi_stats::FfiOp::InternUtf16FlyStringCallback);
+                let name = ak::Utf16FlyString::from_utf16(name);
+                unsafe { RetainedUtf16FlyString::from_leaked_raw(name.into_raw()) }
+            })
+            .collect::<Vec<_>>();
+        RustBoundSelectorList {
+            selectors: self
+                .selectors
+                .iter()
+                .map(|selector| bind_interned_names_in_selector(selector, &self.interned_names, &names))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn adapt_for_nesting(mut self, parent: StyleNestingParent) -> Self {
+        if parent == StyleNestingParent::None {
+            return self;
+        }
+        for selector in &mut self.selectors {
+            let first = selector
+                .compound_selectors
+                .first()
+                .map_or(Combinator::None, |compound| compound.combinator);
+            let insert_nesting = parent == StyleNestingParent::Style
+                && (!matches!(first, Combinator::None | Combinator::Descendant)
+                    || !super::selector_operations::contains_nesting(selector));
+            if insert_nesting {
+                *selector = super::selector_operations::relative_to(selector, SimpleSelector::Nesting);
+            } else if first == Combinator::Descendant {
+                let mut compounds = selector.compound_selectors.clone();
+                compounds[0].combinator = Combinator::None;
+                *selector = CompiledSelector::new(compounds);
+            }
+        }
+        // Adding an implicit nesting selector does not introduce any names to bind.
+        self
+    }
+
+    pub(crate) fn new(selectors: SelectorList) -> Self {
+        let mut interned_names = Vec::new();
+        for selector in &selectors {
+            collect_interned_names_from_selector(&mut interned_names, selector);
+        }
+        Self {
+            selectors,
+            interned_names: interned_names.into_boxed_slice(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selectors(&self) -> &SelectorList {
+        &self.selectors
+    }
+
+    pub(crate) fn contains_pseudo_element(&self) -> bool {
+        self.selectors
+            .iter()
+            .any(|selector| selector.target_pseudo_element.is_some())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.selectors.is_empty()
+    }
+}
+
+/// # Safety
+/// `input` and each namespace view must point to readable storage for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_selector_parse(
+    input: FfiUtf16View,
+    namespaces: *const FfiStringView,
+    namespace_count: usize,
+    is_relative: bool,
+    is_forgiving: bool,
+    nesting_parent: StyleNestingParent,
+) -> *mut RustParsedSelectorList {
+    unsafe {
+        parse_selector_list_from_ffi(
+            input,
+            namespaces,
+            namespace_count,
+            is_relative,
+            is_forgiving,
+            nesting_parent,
+        )
+    }
+    .map_or(std::ptr::null_mut(), |selectors| Box::into_raw(Box::new(selectors)))
+}
+
+/// # Safety
+/// Input and the optional immutable namespace context must be readable for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_selector_parse_with_namespace_context(
+    input: FfiUtf16View,
+    namespaces: *const std::ffi::c_void,
+    is_relative: bool,
+    is_forgiving: bool,
+) -> *mut RustParsedSelectorList {
+    let Some(input) = (unsafe { input.units() }) else {
+        return std::ptr::null_mut();
+    };
+    let namespaces = unsafe { namespaces.cast::<crate::css::rule::NativeNamespaceContext>().as_ref() };
+    let namespaces: Vec<_> = namespaces
+        .into_iter()
+        .flat_map(|namespaces| namespaces.prefixes.iter())
+        .map(|namespace| TokenizerInput::Utf16(namespace.units()))
+        .collect();
+    parse_selector_list(
+        input,
+        &namespaces,
+        if is_relative {
+            SelectorType::Relative
+        } else {
+            SelectorType::Standalone
+        },
+        if is_forgiving {
+            SelectorParsingMode::Forgiving
+        } else {
+            SelectorParsingMode::Standard
+        },
+    )
+    .map_or(std::ptr::null_mut(), |selectors| {
+        Box::into_raw(Box::new(RustParsedSelectorList::new(selectors)))
+    })
+}
+
+pub(crate) unsafe fn parse_selector_list_from_ffi(
+    input: FfiUtf16View,
+    namespaces: *const FfiStringView,
+    namespace_count: usize,
+    is_relative: bool,
+    is_forgiving: bool,
+    nesting_parent: StyleNestingParent,
+) -> Option<RustParsedSelectorList> {
+    unsafe {
+        let input = input.units()?;
+        let namespace_views = if namespace_count == 0 {
+            &[]
+        } else {
+            assert!(!namespaces.is_null());
+            std::slice::from_raw_parts(namespaces, namespace_count)
+        };
+        let namespace_storage = namespace_views
+            .iter()
+            .map(|namespace| {
+                if namespace.length == 0 {
+                    TokenizerInput::Utf16(&[])
+                } else {
+                    assert!(!namespace.data.is_null());
+                    TokenizerInput::Utf16(std::slice::from_raw_parts(namespace.data, namespace.length))
+                }
+            })
+            .collect::<Vec<_>>();
+        let Ok(selectors) = parse_selector_list(
+            input,
+            &namespace_storage,
+            if is_relative {
+                SelectorType::Relative
+            } else {
+                SelectorType::Standalone
+            },
+            if is_forgiving {
+                SelectorParsingMode::Forgiving
+            } else {
+                SelectorParsingMode::Standard
+            },
+        ) else {
+            return None;
+        };
+        Some(RustParsedSelectorList::new(selectors).adapt_for_nesting(nesting_parent))
+    }
+}
+
+#[repr(C)]
+pub struct FfiParsedPseudoElement {
+    pub selector: *mut RustSelector,
+    pub pseudo_element: u8,
+}
+
+/// Parses the restricted pseudo-element syntax accepted by `getComputedStyle()` and animation APIs.
+///
+/// # Safety
+/// `input` must contain readable storage for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_selector_parse_pseudo_element(input: FfiUtf16View) -> FfiParsedPseudoElement {
+    unsafe {
+        let Some(input) = input.units() else {
+            return FfiParsedPseudoElement {
+                selector: std::ptr::null_mut(),
+                pseudo_element: u8::MAX,
+            };
+        };
+        let Ok((selector, pseudo_element)) = parse_pseudo_element_selector(input) else {
+            return FfiParsedPseudoElement {
+                selector: std::ptr::null_mut(),
+                pseudo_element: u8::MAX,
+            };
+        };
+        FfiParsedPseudoElement {
+            selector: Box::into_raw(Box::new(RustSelector {
+                selector: bind_interned_names_in_selector(&selector, &[], &[]),
+            })),
+            pseudo_element: pseudo_element as u8,
+        }
+    }
+}
+
+/// # Safety
+/// `list` must be null or a pointer returned by `rust_selector_parse` that has not been destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_parsed_selector_list_destroy(list: *mut RustParsedSelectorList) {
+    unsafe {
+        if !list.is_null() {
+            drop(Box::from_raw(list));
+        }
+    }
+}
+
+/// # Safety
+/// `list` must point to a live parsed selector list.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_parsed_selector_list_length(list: *const RustParsedSelectorList) -> usize {
+    unsafe { (&*list).selectors.len() }
+}
+
+/// # Safety
+/// `list` must point to a live bound selector list and `index` must be in bounds.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_bound_selector_list_selector(
+    list: *const RustBoundSelectorList,
+    index: usize,
+) -> *mut RustSelector {
+    unsafe {
+        Box::into_raw(Box::new(RustSelector {
+            selector: (&(*list).selectors)[index].clone(),
+        }))
+    }
+}
+
+/// # Safety
+/// `list` must be null or an undestroyed pointer returned by `rust_parsed_selector_list_bind`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_bound_selector_list_destroy(list: *mut RustBoundSelectorList) {
+    if !list.is_null() {
+        unsafe { drop(Box::from_raw(list)) };
+    }
+}
+
+/// # Safety
+/// `list` must be live. Call only on the document thread, and destroy the returned list there.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_parsed_selector_list_bind(list: &RustParsedSelectorList) -> *mut RustBoundSelectorList {
+    Box::into_raw(Box::new(unsafe { list.bind() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(source: &str) -> Box<RustParsedSelectorList> {
+        let units: Vec<_> = source.encode_utf16().collect();
+        let prefix: Vec<_> = "é".encode_utf16().collect();
+        let prefix = FfiStringView {
+            data: prefix.as_ptr(),
+            length: prefix.len(),
+        };
+        unsafe {
+            let parsed = rust_selector_parse(
+                FfiUtf16View {
+                    utf16: units.as_ptr(),
+                    length: units.len(),
+                    ..Default::default()
+                },
+                &prefix,
+                1,
+                false,
+                false,
+                StyleNestingParent::None,
+            );
+            assert!(!parsed.is_null());
+            Box::from_raw(parsed)
+        }
+    }
+
+    fn serialize(selector: &Arc<bound::CompiledSelector>) -> Vec<u16> {
+        use crate::css::selector_serialization::{rust_selector_serialize, rust_selector_serialized_text_release};
+        unsafe {
+            let text = rust_selector_serialize(
+                &RustSelector {
+                    selector: selector.clone(),
+                },
+                false,
+                std::ptr::null(),
+                0,
+            );
+            let units = std::slice::from_raw_parts(text.data, text.length).to_vec();
+            rust_selector_serialized_text_release(text.storage);
+            units
+        }
+    }
+
+    #[test]
+    fn independent_bindings_outlive_the_parsed_list_and_each_other() {
+        for source in [
+            "DIV#test.item[data-name=\"value\"]",
+            ":is(.first, :not(#second))",
+            ":nth-child(2n+1 of .item)",
+            "::slotted(.item)",
+            "::part(label)",
+        ] {
+            let parsed = parse(source);
+            let first = unsafe { parsed.bind() };
+            let second = unsafe { parsed.bind() };
+            drop(parsed);
+            let expected = serialize(&first.selectors[0]);
+            assert_eq!(serialize(&second.selectors[0]), expected);
+            assert_eq!(first.selectors[0].specificity(), second.selectors[0].specificity());
+            drop(first);
+            assert_eq!(serialize(&second.selectors[0]), expected);
+        }
+    }
+
+    #[test]
+    fn worker_parsing_reading_and_release_do_not_touch_the_interner() {
+        use crate::css::ffi_stats::CPP_CALLBACK_COUNT;
+        let parsed = std::thread::spawn(|| {
+            let parsed = parse("é|DIV#😀:is(.é, :not([data-name='😀'])):nth-child(2n+1 of .item)::part(label)");
+            assert_eq!(CPP_CALLBACK_COUNT.get(), 0);
+            parsed
+        })
+        .join()
+        .unwrap();
+        let bound = std::thread::scope(|scope| {
+            let parsed = &parsed;
+            scope.spawn(move || {
+                for _ in 0..100 {
+                    assert_eq!(parsed.selectors.len(), 1);
+                    assert!(parsed.interned_names.iter().all(|name| !name.is_empty()));
+                }
+                assert_eq!(CPP_CALLBACK_COUNT.get(), 0);
+            });
+            unsafe { parsed.bind() }
+        });
+        std::thread::spawn(move || {
+            drop(parsed);
+            assert_eq!(CPP_CALLBACK_COUNT.get(), 0);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            serialize(&bound.selectors[0]),
+            "é|DIV#😀:is(.é, :not([data-name=\"😀\"])):nth-child(2n+1 of .item)::part(label)"
+                .encode_utf16()
+                .collect::<Vec<_>>()
+        );
+    }
+}

@@ -6,140 +6,86 @@
 
 #pragma once
 
+#include <AK/DistinctNumeric.h>
+#include <AK/NumericLimits.h>
+#include <AK/Types.h>
+#include <AK/Vector.h>
 #include <LibGfx/Point.h>
 #include <LibIPC/Forward.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/Painting/ScrollNodeState.h>
+#include <LibWeb/Forward.h>
+#include <LibWeb/Painting/ContextRef.h>
+#include <LibWeb/PixelUnits.h>
 
 namespace Web::Painting {
 
-// Device-pixel scroll offsets keyed by the scroll node's VisualContextIndex. Stored dense in
-// process so display list replay and hit testing index it directly; indices that are not scroll
-// nodes read as zero offsets. The IPC representation is sparse (index, offset) pairs.
+// Device-pixel offsets keyed by SpatialNodeIndex: the scroll containers' offsets as produced by
+// the document, plus the sticky nodes' offsets that resolve_sticky_offsets() derives from them
+// and the tree. Stored dense in process so display list replay and hit testing index it directly;
+// indices that are not scroll-like nodes read as zero offsets. The IPC representation is sparse
+// (index, offset) pairs.
+//
+// The dense store must never grow past the spatial node count. A compromised WebContent renderer controls the
+// indices that reach it — both as decoded wire pairs and as scroll-node indices replayed from the display list. So,
+// set_device_offset_for_index() drops any index at or past m_node_count. The compositor supplies that bound from the
+// AccumulatedVisualContextTree that owns these nodes. Until it does, the bound is unlimited — which is what the
+// trusted in-process snapshot built from live scroll nodes needs.
 class ScrollStateSnapshot {
 public:
     ReadonlySpan<Gfx::FloatPoint> device_offsets() const { return m_device_offsets; }
 
-    Gfx::FloatPoint device_offset_for_index(VisualContextIndex index) const
+    // The latest publication of the compositor's async scroll updates that WebContent had adopted
+    // when it took this snapshot; the compositor keeps reapplying its later scrolls over it.
+    u64 adopted_async_scroll_sequence() const { return m_adopted_async_scroll_sequence; }
+    void set_adopted_async_scroll_sequence(u64 sequence) { m_adopted_async_scroll_sequence = sequence; }
+
+    Gfx::FloatPoint device_offset_for_index(SpatialNodeIndex index) const
     {
         if (index.value() >= m_device_offsets.size())
             return {};
         return m_device_offsets[index.value()];
     }
 
-    void set_device_offset_for_index(VisualContextIndex index, Gfx::FloatPoint offset)
+    void set_device_offset_for_index(SpatialNodeIndex index, Gfx::FloatPoint offset)
     {
+        if (index.value() >= m_node_count)
+            return;
         if (index.value() >= m_device_offsets.size())
             m_device_offsets.resize(index.value() + 1);
         m_device_offsets[index.value()] = offset;
     }
 
+    // Bind the snapshot to the authoritative node count from the AccumulatedVisualContextTree that owns these nodes.
+    // Wire-decoded offsets are staged rather than densified. So, this is where a decoded index is first validated:
+    // staged pairs are applied through the bounded setter above, dropping any whose index is at or past the node count.
+    // And any offset already stored past the count is discarded. Every later mutation stays bounded by the count.
+    void set_node_count(size_t node_count)
+    {
+        m_node_count = node_count;
+        if (m_device_offsets.size() > node_count)
+            m_device_offsets.resize(node_count);
+        auto staged_offsets = move(m_staged_offsets);
+        for (auto const& staged : staged_offsets)
+            set_device_offset_for_index(SpatialNodeIndex { staged.index }, staged.offset);
+    }
+
 private:
+    template<typename T>
+    friend ErrorOr<void> IPC::encode(IPC::Encoder&, T const&);
+    template<typename T>
+    friend ErrorOr<T> IPC::decode(IPC::Decoder&);
+
+    // A sparse wire pair captured by the decoder before the node count is known. Held apart from the dense store — so
+    // that a single decoded pair cannot grow the store to an arbitrary size.
+    struct StagedOffset {
+        u32 index { 0 };
+        Gfx::FloatPoint offset;
+    };
+
     Vector<Gfx::FloatPoint> m_device_offsets;
-};
-
-// Value store for the scroll and sticky nodes of the accumulated visual context tree: the tree
-// owns structure and identity, entries here carry the offsets, sticky constraints, and the
-// containing-block-derived scroll-parent references. Registration returns the entry's slot, which
-// the tree walk stamps into the node's ScrollData, so resolving a node to its entry is a direct
-// index in both directions. Rebuilt together with the tree; offsets are refreshed in place
-// between rebuilds.
-class ScrollState {
-public:
-    ScrollStateSlot register_scroll_node(VisualContextIndex node_index, Paintable const& paintable_box, ScrollStateSlot parent_slot)
-    {
-        return append_state(ScrollNodeState { node_index, paintable_box, false, parent_slot });
-    }
-
-    ScrollStateSlot register_sticky_node(VisualContextIndex node_index, Paintable const& paintable_box, ScrollStateSlot parent_slot)
-    {
-        return append_state(ScrollNodeState { node_index, paintable_box, true, parent_slot });
-    }
-
-    ScrollNodeState const& state_at_slot(ScrollStateSlot slot) const { return m_states_by_slot[slot.value()]; }
-    ScrollNodeState& state_at_slot(ScrollStateSlot slot) { return m_states_by_slot[slot.value()]; }
-
-    VisualContextIndex node_index_for_slot(ScrollStateSlot slot) const
-    {
-        if (slot == NO_SCROLL_STATE_SLOT)
-            return {};
-        return state_at_slot(slot).node_index();
-    }
-
-    CSSPixelPoint cumulative_offset(ScrollStateSlot slot) const
-    {
-        CSSPixelPoint offset;
-        while (slot != NO_SCROLL_STATE_SLOT) {
-            auto const& state = state_at_slot(slot);
-            offset += state.own_offset();
-            slot = state.parent_slot();
-        }
-        return offset;
-    }
-
-    CSSPixelPoint cumulative_sticky_offset(ScrollStateSlot slot) const
-    {
-        CSSPixelPoint offset;
-        while (slot != NO_SCROLL_STATE_SLOT) {
-            auto const& state = state_at_slot(slot);
-            if (!state.is_sticky())
-                break;
-            offset += state.own_offset();
-            slot = state.parent_slot();
-        }
-        return offset;
-    }
-
-    ScrollStateSlot nearest_scrolling_ancestor_slot(ScrollStateSlot slot) const
-    {
-        auto ancestor_slot = state_at_slot(slot).parent_slot();
-        while (ancestor_slot != NO_SCROLL_STATE_SLOT) {
-            auto const& state = state_at_slot(ancestor_slot);
-            if (!state.is_sticky())
-                return ancestor_slot;
-            ancestor_slot = state.parent_slot();
-        }
-        return NO_SCROLL_STATE_SLOT;
-    }
-
-    // Iteration follows registration order, which is the tree's append order, so parent nodes are
-    // always visited before their descendants.
-    template<typename Callback>
-    void for_each_scroll_node(Callback callback)
-    {
-        for (size_t slot_value = 0; slot_value < m_states_by_slot.size(); ++slot_value) {
-            if (!m_states_by_slot[slot_value].is_sticky())
-                callback(ScrollStateSlot { slot_value }, m_states_by_slot[slot_value]);
-        }
-    }
-
-    template<typename Callback>
-    void for_each_sticky_node(Callback callback)
-    {
-        for (size_t slot_value = 0; slot_value < m_states_by_slot.size(); ++slot_value) {
-            if (m_states_by_slot[slot_value].is_sticky())
-                callback(ScrollStateSlot { slot_value }, m_states_by_slot[slot_value]);
-        }
-    }
-
-    void clear()
-    {
-        m_states_by_slot.clear_with_capacity();
-    }
-
-private:
-    friend class ViewportPaintable;
-
-    ScrollStateSlot append_state(ScrollNodeState state)
-    {
-        auto slot = ScrollStateSlot { m_states_by_slot.size() };
-        m_states_by_slot.append(move(state));
-        return slot;
-    }
-
-    ScrollStateSnapshot snapshot(double device_pixels_per_css_pixel) const;
-
-    Vector<ScrollNodeState> m_states_by_slot;
+    Vector<StagedOffset> m_staged_offsets;
+    size_t m_node_count { NumericLimits<size_t>::max() };
+    u64 m_adopted_async_scroll_sequence { 0 };
 };
 
 }

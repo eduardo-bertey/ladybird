@@ -33,12 +33,22 @@ GC::Ref<HTMLFormControlsCollection> HTMLFormControlsCollection::create(DOM::Pare
 }
 
 HTMLFormControlsCollection::HTMLFormControlsCollection(DOM::ParentNode& root, Scope scope, HTMLFormElement& form, Function<bool(DOM::Element const&)> filter)
-    : DOM::HTMLCollection(root, scope, move(filter))
+    : DOM::HTMLCollection(root, scope, move(filter), AttributeInvalidationType::FormControls, nullptr, Kind::FormControls)
     , m_form(form)
 {
 }
 
 HTMLFormControlsCollection::~HTMLFormControlsCollection() = default;
+
+void HTMLFormControlsCollection::collect_elements_into(Vector<GC::RawPtr<DOM::Element>>& elements) const
+{
+    // OPTIMIZATION: A form keeps its associated elements in tree order, so the collection is filtered from those
+    //               rather than from a walk of the whole tree the form is in.
+    for (auto const& element : m_form->associated_elements_in_tree_order({})) {
+        if (element_matches_filter(*element))
+            elements.append(*element);
+    }
+}
 
 void HTMLFormControlsCollection::visit_edges(GC::Cell::Visitor& visitor)
 {
@@ -79,13 +89,15 @@ Variant<Empty, GC::Ref<DOM::Element>, GC::Ref<RadioNodeList>> HTMLFormControlsCo
     //    RadioNodeList object are those that have either an id attribute or a name attribute equal to name. The nodes in the RadioNodeList object must be sorted in tree
     //    order. Return that RadioNodeList object.
     auto name_copy = Utf16String::from_utf16(name);
-    return RadioNodeList::create(root(), DOM::LiveNodeList::Scope::Descendants, [name = move(name_copy)](auto const& node) {
+    auto filter = [collection = GC::Ref { *this }, name = move(name_copy)](auto const& node) {
         if (!is<DOM::Element>(node))
             return false;
 
         auto const& element = as<DOM::Element>(node);
-        return radio_node_list_element_matches_name(element, radio_node_list_name_view(name));
-    });
+        return collection->element_matches_filter(element)
+            && radio_node_list_element_matches_name(element, radio_node_list_name_view(name));
+    };
+    return RadioNodeList::create(root(), DOM::LiveNodeList::Scope::Descendants, move(filter), DOM::LiveNodeList::Kind::FormControls);
 }
 
 }

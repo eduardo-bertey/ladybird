@@ -141,7 +141,7 @@ define_interpreter_registers! {
     Values => "values", Type::Sequence(Box::new(Type::Value)), true;
     ExecutionContext => "exec_ctx", Type::ExecutionContext, true;
     DispatchTable => "dispatch", Type::U64, true;
-    Int32TagShifted => "int32_tag_shifted", Type::U64, false;
+    HeapRegionBase => "heap_region_base", Type::U64, false;
     StackPointer => "sp", Type::U64, true;
     FramePointer => "fp", Type::U64, true;
 }
@@ -213,9 +213,11 @@ define_named_types! {
         ObjectPropertyIteratorCacheData => "ObjectPropertyIteratorCacheData", Some(8), true;
         ObjectPropertyIteratorCache => "ObjectPropertyIteratorCache", Some(8), true;
         PrototypeChainValidity => "PrototypeChainValidity", Some(8), true;
+        Accessor => "Accessor", Some(8), true;
         FunctionObject => "FunctionObject", Some(8), true;
         ECMAScriptFunctionObject => "ECMAScriptFunctionObject", Some(8), true;
         RawNativeFunction => "RawNativeFunction", Some(8), true;
+        DirectGetterFunction => "DirectGetterFunction", Some(8), true;
         SharedFunctionInstanceData => "SharedFunctionInstanceData", Some(8), true;
         ScriptOrModule => "ScriptOrModule", Some(8), true;
         PropertyStorage => "PropertyStorage", Some(8), true;
@@ -411,7 +413,7 @@ mod tests {
         );
         assert_eq!(InterpreterRegister::from_name("pc").unwrap().value_type(), Type::U32);
         assert_eq!(InterpreterRegister::ProgramBase.as_str(), "pb");
-        assert_eq!(InterpreterRegister::Int32TagShifted.source_value_type(), None);
+        assert_eq!(InterpreterRegister::HeapRegionBase.source_value_type(), None);
         assert_eq!(InterpreterRegister::from_name("temporary"), None);
         assert_eq!(
             RegisterReference::new("pb"),

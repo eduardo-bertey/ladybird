@@ -19,34 +19,25 @@ class CSSMediaRule final : public CSSConditionRule {
     GC_DECLARE_ALLOCATOR(CSSMediaRule);
 
 public:
-    [[nodiscard]] static GC::Ref<CSSMediaRule> create(MediaList& media_queries, CSSRuleList&);
+    [[nodiscard]] static GC::Ref<CSSMediaRule> create(RustRule, CSSRuleList&);
 
     virtual ~CSSMediaRule() = default;
 
     virtual Utf16String serialized_condition_text() const override;
-    bool matches() const { return condition_matches(); }
+    bool matches() const { return m_media_list.matches(); }
 
-    virtual bool condition_matches() const override { return m_media->matches(); }
-
-    MediaList* media() const { return m_media.ptr(); }
-
-    bool evaluate(DOM::Document const& document)
-    {
-        m_did_evaluate = true;
-        return m_media->evaluate(document);
-    }
-
-    bool did_evaluate() const { return m_did_evaluate; }
+    MediaList* media() const;
+    RustMediaList const& native_media_list() const { return m_media_list; }
 
 private:
-    CSSMediaRule(MediaList&, CSSRuleList&);
+    CSSMediaRule(RustRule, CSSRuleList&);
 
     virtual void visit_edges(Cell::Visitor&) override;
     virtual Utf16String serialized() const override;
     virtual void dump(StringBuilder&, int indent_levels) const override;
 
-    GC::Ref<MediaList> m_media;
-    bool m_did_evaluate { false };
+    RustMediaList m_media_list;
+    mutable GC::Ptr<MediaList> m_media;
 };
 
 template<>

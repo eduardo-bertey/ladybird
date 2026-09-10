@@ -8,7 +8,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Geometry/DOMPoint.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGTextContentElement.h>
 
 namespace Web::SVG {
@@ -23,7 +23,7 @@ Optional<TextAnchor> SVGTextContentElement::text_anchor() const
 {
     if (!unsafe_layout_node())
         return {};
-    switch (unsafe_layout_node()->computed_values().text_anchor()) {
+    switch (unsafe_layout_node()->text_anchor()) {
     case CSS::TextAnchor::Start:
         return TextAnchor::Start;
     case CSS::TextAnchor::Middle:

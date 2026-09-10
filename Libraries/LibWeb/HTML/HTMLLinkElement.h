@@ -30,6 +30,7 @@ public:
 
     virtual void inserted() override;
     virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
+    virtual void moved_from(IsSubtreeRoot, GC::Ptr<Node> old_ancestor) override;
 
     Utf16String rel() const { return get_attribute_value(HTML::AttributeNames::rel); }
     void set_rel(Utf16View value) { set_attribute_value(HTML::AttributeNames::rel, value); }
@@ -53,7 +54,8 @@ public:
     void set_media(Utf16View);
     Utf16String media() const;
 
-    GC::Ptr<CSS::CSSStyleSheet> sheet() const;
+    RefPtr<CSS::StyleSheetState> sheet() const;
+    CSS::CSSStyleSheet* cssom_sheet() const;
 
     enum class AnyFailed : u8 {
         No,
@@ -160,6 +162,7 @@ private:
     void fetch_and_process_linked_dns_prefetch_resource();
     void fetch_and_process_linked_preconnect_resource();
     void fetch_and_process_linked_preload_resource();
+    void fetch_and_process_linked_modulepreload_resource();
 
     bool linked_resource_fetch_setup_steps(Fetch::Infrastructure::Request&);
     bool icon_linked_resource_fetch_setup_steps(Fetch::Infrastructure::Request&);
@@ -171,6 +174,8 @@ private:
     void process_linked_resource(bool success, Fetch::Infrastructure::Response const&, Core::ImmutableBytes const*);
     void process_icon_resource(bool success, Fetch::Infrastructure::Response const&, ByteBuffer);
     void process_stylesheet_resource(bool success, Fetch::Infrastructure::Response const&, ReadonlyBytes);
+    void finish_processing_stylesheet_resource(u64 fetch_generation);
+    void cancel_pending_stylesheet_processing();
 
     bool should_fetch_and_process_resource_type() const;
 
@@ -182,6 +187,7 @@ private:
             DNSPrefetch = 1 << 3,
             Preconnect = 1 << 4,
             Icon = 1 << 5,
+            ModulePreload = 1 << 6,
         };
     };
 
@@ -194,12 +200,13 @@ private:
     };
 
     Optional<LoadedIcon> m_loaded_icon;
-    GC::Ptr<CSS::CSSStyleSheet> m_loaded_style_sheet;
+    RefPtr<CSS::StyleSheetState> m_loaded_style_sheet;
 
     GC::Ptr<DOM::DOMTokenList> m_rel_list;
     GC::Ptr<DOM::DOMTokenList> m_sizes;
     unsigned m_relationship { 0 };
     u64 m_current_fetch_generation { 0 };
+    bool m_stylesheet_processing_pending { false };
 
     // https://html.spec.whatwg.org/multipage/semantics.html#explicitly-enabled
     bool m_explicitly_enabled { false };

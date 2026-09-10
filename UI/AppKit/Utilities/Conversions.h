@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/ByteString.h>
+#include <AK/Span.h>
 #include <AK/String.h>
 #include <AK/StringView.h>
 #include <AK/Utf16String.h>
@@ -15,6 +16,7 @@
 #include <LibGfx/Point.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/Size.h>
+#include <LibURL/URL.h>
 
 #import <Cocoa/Cocoa.h>
 
@@ -30,7 +32,7 @@ ByteString ns_string_to_byte_string(NSString*);
 
 ByteString ns_data_to_string(NSData*);
 NSData* string_to_ns_data(StringView);
-NSImage* image_from_base64_png(StringView, NSSize size);
+NSImage* image_from_png(ReadonlyBytes, NSSize size);
 
 NSDictionary* deserialize_json_to_dictionary(StringView);
 
@@ -49,5 +51,7 @@ NSColor* gfx_color_to_ns_color(Gfx::Color);
 Gfx::IntPoint compute_origin_relative_to_window(NSWindow*, Gfx::IntPoint);
 
 NSImage* gfx_bitmap_to_ns_image(Gfx::Bitmap const&);
+
+NSURL* url_to_ns_url(URL::URL const&);
 
 }

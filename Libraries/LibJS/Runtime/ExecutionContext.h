@@ -11,6 +11,7 @@
 
 #include <AK/Checked.h>
 #include <AK/Span.h>
+#include <LibJS/Bytecode/Register.h>
 #include <LibJS/Export.h>
 #include <LibJS/Forward.h>
 #include <LibJS/Module.h>
@@ -36,16 +37,16 @@ private:
 
 public:
     // NB: The layout is: [registers | locals | constants | arguments]
-    ALWAYS_INLINE ExecutionContext(u32 registers_and_locals_count, ReadonlySpan<Value> constants, u32 arguments_count_)
+    ALWAYS_INLINE ExecutionContext(u32 registers_and_locals_count, ReadonlySpan<Value> constants, u32 arguments_count_, u64 frame_id_ = 0)
+        : frame_id(frame_id_)
     {
         VERIFY(!Checked<u32>::addition_would_overflow(registers_and_locals_count, constants.size(), arguments_count_));
         registers_and_constants_and_locals_and_arguments_count = registers_and_locals_count + constants.size() + arguments_count_;
         argument_count = arguments_count_;
         auto* values = registers_and_constants_and_locals_and_arguments();
-        for (size_t i = 0; i < registers_and_locals_count; ++i)
+        // NB: Enter initializes the remaining registers, locals, and constants.
+        for (size_t i = 0; i < min(registers_and_locals_count, Bytecode::Register::reserved_register_count); ++i)
             values[i] = js_special_empty_value();
-        for (size_t i = 0; i < constants.size(); ++i)
-            values[registers_and_locals_count + i] = constants[i];
     }
 
     void operator delete(void* ptr);
@@ -57,6 +58,7 @@ public:
     GC::Ptr<Environment> variable_environment;       // [[VariableEnvironment]]
     GC::Ptr<PrivateEnvironment> private_environment; // [[PrivateEnvironment]]
 
+    u64 frame_id { 0 };
     u32 program_counter { 0 };
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#skip-when-determining-incumbent-counter
@@ -72,6 +74,7 @@ public:
     bool yield_is_await { false };
     bool yield_value_is_iterator_result { false };
     bool caller_is_construct { false };
+    bool frame_initialized { false };
 
     Optional<Value> this_value;
 
@@ -103,6 +106,9 @@ public:
     {
         return { arguments_data(), argument_count };
     }
+
+    Span<Value> local_variables();
+    ReadonlySpan<Value> local_variables() const;
 
     Value* arguments_data()
     {

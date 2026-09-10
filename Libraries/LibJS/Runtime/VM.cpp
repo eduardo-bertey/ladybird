@@ -16,6 +16,7 @@
 #include <AK/Time.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibFileSystem/FileSystem.h>
+#include <LibGC/BlockAllocator.h>
 #include <LibGC/Heap.h>
 #include <LibGC/PrimitiveStorage.h>
 #include <LibJS/Bytecode/Executable.h>
@@ -62,7 +63,7 @@ NonnullRefPtr<VM> VM::create()
 
     WellKnownSymbols well_known_symbols {
 #define __JS_ENUMERATE(SymbolName, snake_name) \
-    Symbol::create(*vm, "Symbol." #SymbolName##_utf16, false),
+    Symbol::create(*vm, "Symbol." #SymbolName##_utf16),
         JS_ENUMERATE_WELL_KNOWN_SYMBOLS
 #undef __JS_ENUMERATE
     };
@@ -88,9 +89,13 @@ VM::VM(ErrorMessages error_messages)
     MUST(GC::PrimitiveStorage::the().ensure_cage());
     m_primitive_storage_cage_base = js_primitive_storage_cage_base;
     VERIFY(m_primitive_storage_cage_base != 0);
+    m_heap_region_base = GC::BlockAllocator::heap_region_start();
+    VERIFY(m_heap_region_base != 0);
 
-    m_heap.register_sweep_callback([] {
+    m_keyed_property_lookup_cache = make<Bytecode::KeyedPropertyLookupCache>();
+    m_heap.register_sweep_callback([this] {
         Bytecode::StaticPropertyLookupCache::sweep_all();
+        m_keyed_property_lookup_cache->remove_dead_entries();
     });
 
     m_empty_string = m_heap.allocate<PrimitiveString>(Utf16String {});

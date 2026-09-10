@@ -8,9 +8,10 @@
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/CSS/CSSKeyframesRule.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/StyleSheetState.h>
+#include <LibWeb/CSS/TransformFunctions.h>
+#include <LibWeb/CSS/Units.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/LocalNavigable.h>
@@ -19,12 +20,25 @@
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/ViewTransition/ViewTransition.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/Promise.h>
 
 namespace Web::ViewTransition {
+
+CSS::RustStyleValueHandle make_translation_transform(CSSPixels x, CSSPixels y)
+{
+    CSS::StyleValueFFI::StyleValueData const* values[] = {
+        CSS::StyleValueFFI::rust_style_value_create_length(x.to_double(), to_underlying(CSS::LengthUnit::Px)),
+        CSS::StyleValueFFI::rust_style_value_create_length(y.to_double(), to_underlying(CSS::LengthUnit::Px)),
+    };
+    return CSS::RustStyleValueHandle { CSS::StyleValueFFI::rust_style_value_create_transformation(
+        to_underlying(CSS::PropertyID::Transform),
+        static_cast<u8>(to_underlying(CSS::TransformFunction::Translate)),
+        values,
+        array_size(values)) };
+}
 
 GC_DEFINE_ALLOCATOR(NamedViewTransitionPseudoElement);
 GC_DEFINE_ALLOCATOR(ReplacedNamedViewTransitionPseudoElement);
@@ -299,7 +313,9 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
 
         // 3. Let originalRect be snapshot containing block if element is the document element, otherwise, the
         //    element's border box.
-        auto original_rect = element.is_document_element() ? snapshot_containing_block : element.paintable_box()->absolute_border_box_rect();
+        auto const* layout_node = element.layout_node();
+        VERIFY(element.is_document_element() || (layout_node && Painting::has_committed_box(*layout_node)));
+        auto original_rect = element.is_document_element() ? snapshot_containing_block : Painting::absolute_border_box_rect(*layout_node);
 
         // 4. Set capture’s old width to originalRect’s width.
         capture->old_width = original_rect.width();
@@ -310,32 +326,28 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
         // 6. Set capture’s old transform to a <transform-function> that would map element’s border box from the
         //    snapshot containing block origin to its current visual position.
         // FIXME: Actually compute the right transform here.
-        capture->old_transform = CSS::TransformationStyleValue::create(CSS::PropertyID::Transform, CSS::TransformFunction::Translate,
-            CSS::StyleValueVector {
-                CSS::LengthStyleValue::create(CSS::Length(0, CSS::LengthUnit::Px)),
-                CSS::LengthStyleValue::create(CSS::Length(0, CSS::LengthUnit::Px)),
-            });
+        capture->old_transform = make_translation_transform(0, 0);
 
         // 7. Set capture’s old writing-mode to the computed value of writing-mode on element.
-        capture->old_writing_mode = element.layout_node()->computed_values().writing_mode();
+        capture->old_writing_mode = element.layout_node()->writing_mode();
 
         // 8. Set capture’s old direction to the computed value of direction on element.
-        capture->old_direction = element.layout_node()->computed_values().direction();
+        capture->old_direction = element.layout_node()->direction();
 
         // 9. Set capture’s old text-orientation to the computed value of text-orientation on element.
         // FIXME: Implement this once we have text-orientation.
 
         // 10. Set capture’s old mix-blend-mode to the computed value of mix-blend-mode on element.
-        capture->old_mix_blend_mode = element.layout_node()->computed_values().mix_blend_mode();
+        capture->old_mix_blend_mode = element.layout_node()->mix_blend_mode();
 
         // 11. Set capture’s old backdrop-filter to the computed value of backdrop-filter on element.
-        capture->old_backdrop_filter = element.layout_node()->computed_values().backdrop_filter();
+        capture->old_backdrop_filter = element.layout_node()->backdrop_filter().materialize();
 
         // 12. Set capture’s old color-scheme to the computed value of color-scheme on element.
-        capture->old_color_scheme = element.layout_node()->computed_values().color_scheme();
+        capture->old_color_scheme = element.layout_node()->color_scheme();
 
         // 13. Let transitionName be the computed value of view-transition-name for element.
-        auto transition_name = element.layout_node()->computed_values().view_transition_name();
+        auto transition_name = element.layout_node()->view_transition_name();
 
         // 14. Set namedElements[transitionName] to capture.
         named_elements.set(transition_name.value(), capture);
@@ -480,7 +492,7 @@ void ViewTransition::setup_transition_pseudo_elements()
                 }}
             )",
                                                               transition_name),
-                stylesheet->rules().length()));
+                stylesheet->native_rules().size()));
             captured_element->image_animation_name_rule = as<CSS::CSSStyleRule>(stylesheet->css_rules()->item(index));
         }
 
@@ -501,7 +513,7 @@ void ViewTransition::setup_transition_pseudo_elements()
                 }}
             )",
                                                               transition_name),
-                stylesheet->rules().length()));
+                stylesheet->native_rules().size()));
             captured_element->image_animation_name_rule = as<CSS::CSSStyleRule>(stylesheet->css_rules()->item(index));
         }
 
@@ -545,7 +557,7 @@ void ViewTransition::setup_transition_pseudo_elements()
                 }}
             )",
                                                               transition_name, "transform", width, height, "backdrop_filter"),
-                stylesheet->rules().length()));
+                stylesheet->native_rules().size()));
             // FIXME: all the strings above should be the identically named variables, serialized somehow.
             captured_element->group_keyframes = as<CSS::CSSKeyframesRule>(stylesheet->css_rules()->item(index));
 
@@ -561,7 +573,7 @@ void ViewTransition::setup_transition_pseudo_elements()
                 }}
             )",
                                                      transition_name),
-                stylesheet->rules().length()));
+                stylesheet->native_rules().size()));
             captured_element->group_animation_name_rule = as<CSS::CSSStyleRule>(stylesheet->css_rules()->item(index));
 
             // 7. Set capturedElement’s image pair isolation rule to a new CSSStyleRule representing the
@@ -576,7 +588,7 @@ void ViewTransition::setup_transition_pseudo_elements()
                 }}
             )",
                                                      transition_name),
-                stylesheet->rules().length()));
+                stylesheet->native_rules().size()));
             captured_element->image_pair_isolation_rule = as<CSS::CSSStyleRule>(stylesheet->css_rules()->item(index));
 
             // 8. Set capturedElement’s image animation name rule to a new CSSStyleRule representing the
@@ -604,7 +616,7 @@ void ViewTransition::setup_transition_pseudo_elements()
                 }}
             )",
                                                      transition_name),
-                stylesheet->rules().length()));
+                stylesheet->native_rules().size()));
             captured_element->image_animation_name_rule = as<CSS::CSSStyleRule>(stylesheet->css_rules()->item(index));
         }
     }
@@ -820,7 +832,7 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
         //    colorScheme be null.
         Optional<CSSPixels> width = {};
         Optional<CSSPixels> height = {};
-        RefPtr<CSS::TransformationStyleValue const> transform = {};
+        CSS::RustStyleValueHandle transform;
         Optional<CSS::WritingMode> writing_mode = {};
         Optional<CSS::Direction> direction = {};
         // FIXME: Implement this once we have text-orientation.
@@ -882,7 +894,9 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
 
             // 2. Let newRect be the snapshot containing block if capturedElement’s new element is the
             //    document element, otherwise, capturedElement’s border box.
-            auto new_rect = captured_element->new_element->is_document_element() ? captured_element->new_element->navigable()->snapshot_containing_block() : captured_element->new_element->paintable_box()->absolute_border_box_rect();
+            auto const* layout_node = captured_element->new_element->layout_node();
+            VERIFY(captured_element->new_element->is_document_element() || (layout_node && Painting::has_committed_box(*layout_node)));
+            auto new_rect = captured_element->new_element->is_document_element() ? captured_element->new_element->navigable()->snapshot_containing_block() : Painting::absolute_border_box_rect(*layout_node);
 
             // 3. Set width to the current width of newRect.
             width = new_rect.width();
@@ -893,16 +907,13 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
             // 5. Set transform to a transform that would map newRect from the snapshot containing block origin
             //    to its current visual position.
             auto offset = new_rect.location() - captured_element->new_element->navigable()->snapshot_containing_block().location();
-            CSS::StyleValueVector transform_values;
-            transform_values.append(CSS::LengthStyleValue::create(CSS::Length::make_px(offset.x())));
-            transform_values.append(CSS::LengthStyleValue::create(CSS::Length::make_px(offset.y())));
-            transform = CSS::TransformationStyleValue::create(CSS::PropertyID::Transform, CSS::TransformFunction::Translate, move(transform_values));
+            transform = make_translation_transform(offset.x(), offset.y());
 
             // 6. Set writingMode to the computed value of writing-mode on capturedElement’s new element.
-            writing_mode = captured_element->new_element->layout_node()->computed_values().writing_mode();
+            writing_mode = captured_element->new_element->layout_node()->writing_mode();
 
             // 7. Set direction to the computed value of direction on capturedElement’s new element.
-            direction = captured_element->new_element->layout_node()->computed_values().direction();
+            direction = captured_element->new_element->layout_node()->direction();
 
             // 8. Set textOrientation to the computed value of text-orientation on capturedElement’s new
             //    element.
@@ -910,13 +921,13 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
 
             // 9. Set mixBlendMode to the computed value of mix-blend-mode on capturedElement’s new
             //    element.
-            mix_blend_mode = captured_element->new_element->layout_node()->computed_values().mix_blend_mode();
+            mix_blend_mode = captured_element->new_element->layout_node()->mix_blend_mode();
 
             // 10. Set backdropFilter to the computed value of backdrop-filter on capturedElement’s new element.
-            backdrop_filter = captured_element->new_element->layout_node()->computed_values().backdrop_filter();
+            backdrop_filter = captured_element->new_element->layout_node()->backdrop_filter().materialize();
 
             // 11. Set colorScheme to the computed value of color-scheme on capturedElement’s new element.
-            color_scheme = captured_element->new_element->layout_node()->computed_values().color_scheme();
+            color_scheme = captured_element->new_element->layout_node()->color_scheme();
         }
 
         // 4. If capturedElement’s group styles rule is null, then set capturedElement’s group styles rule to a new
@@ -950,7 +961,7 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
                 }}
             )",
                                                               transition_name, width, height, "transform", "writing_mode", "direction", "text_orientation", "mix_blend_mode", "backdrop_filter", "color_scheme"),
-                stylesheet->rules().length()));
+                stylesheet->native_rules().size()));
             // FIXME: all the strings above should be the identically named variables, serialized somehow.
             captured_element->group_styles_rule = as<CSS::CSSStyleRule>(stylesheet->css_rules()->item(index));
         }

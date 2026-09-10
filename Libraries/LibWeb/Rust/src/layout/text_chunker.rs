@@ -4,13 +4,22 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use libgfx_rust::font::{EmojiPresentation, FontCascadeListRef, FontRef, emoji_presentation_for_code_point};
+use super::*;
+
+use libgfx_rust::font::{EmojiPresentation, FontCascadeListHandle, FontHandle, emoji_presentation_for_code_point};
 
 unsafe extern "C" {
     fn unicode_layout_grapheme_segmenter_create(text: *const u16, length_in_code_units: usize) -> *mut c_void;
     fn unicode_layout_line_segmenter_create(text: *const u16, length_in_code_units: usize) -> *mut c_void;
     fn unicode_layout_segmenter_next_boundary(handle: *mut c_void, index: usize, inclusive: bool) -> i64;
     fn unicode_layout_segmenter_destroy(handle: *mut c_void);
+    fn unicode_layout_word_boundaries(
+        text: *const u16,
+        length: usize,
+        offset: usize,
+        start: *mut usize,
+        end: *mut usize,
+    );
     fn ladybird_layout_text_type_for_code_point(code_point: u32) -> u8;
     fn ladybird_layout_code_point_has_break_all_line_break_class(code_point: u32) -> bool;
     fn ladybird_layout_code_point_has_keep_all_line_break_class(code_point: u32) -> bool;
@@ -18,11 +27,11 @@ unsafe extern "C" {
     fn ladybird_layout_code_point_has_emoji_property(code_point: u32) -> bool;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextChunk {
     pub start: usize,
     pub length: usize,
-    pub font: *const c_void,
+    pub font: FontHandle,
     pub has_breaking_newline: bool,
     pub has_breaking_tab: bool,
     pub is_all_whitespace: bool,
@@ -32,7 +41,7 @@ pub(crate) struct TextChunk {
 
 pub(crate) struct TextChunkInputs<'text> {
     pub text: &'text [u16],
-    pub font_cascade_list: *const c_void,
+    pub font_cascade_list: &'text FontCascadeListHandle,
     pub white_space_collapse: u8,
     pub word_break: u8,
     pub font_variant_emoji: u8,
@@ -50,7 +59,16 @@ pub(crate) fn chunk_text(inputs: TextChunkInputs<'_>) -> Vec<TextChunk> {
     chunks
 }
 
-struct IcuSegmenterHandle {
+pub(super) fn word_boundaries(text: &[u16], offset: usize) -> std::ops::Range<usize> {
+    let mut start = 0;
+    let mut end = text.len();
+    // SAFETY: The Unicode service borrows the buffer only for this call and
+    // writes its boundaries into the two live output slots.
+    unsafe { unicode_layout_word_boundaries(text.as_ptr(), text.len(), offset, &raw mut start, &raw mut end) };
+    start..end
+}
+
+pub(crate) struct IcuSegmenterHandle {
     raw: *mut c_void,
 }
 
@@ -71,13 +89,13 @@ impl Drop for IcuSegmenterHandle {
     }
 }
 
-enum GraphemeSegmenter {
+pub(crate) enum GraphemeSegmenter {
     Ascii { length_in_code_units: usize },
     Icu(IcuSegmenterHandle),
 }
 
 impl GraphemeSegmenter {
-    fn new(text: &[u16]) -> Self {
+    pub(crate) fn new(text: &[u16]) -> Self {
         if text.iter().all(|unit| *unit <= 0x7f) {
             return Self::Ascii {
                 length_in_code_units: text.len(),
@@ -92,7 +110,7 @@ impl GraphemeSegmenter {
 
     /// Mirrors Unicode::AsciiGraphemeSegmenter for the ASCII case: every code
     /// unit index is a boundary.
-    fn next_boundary(&self, index: usize, inclusive: bool) -> Option<usize> {
+    pub(crate) fn next_boundary(&self, index: usize, inclusive: bool) -> Option<usize> {
         match self {
             Self::Ascii { length_in_code_units } => {
                 if inclusive && index <= *length_in_code_units {
@@ -137,7 +155,7 @@ fn is_utf16_low_surrogate(code_unit: u16) -> bool {
 
 /// Mirrors AK::Utf16View::code_point_at, including its lone-surrogate
 /// pass-through behavior.
-fn code_point_at(text: &[u16], index: usize) -> u32 {
+pub(super) fn code_point_at(text: &[u16], index: usize) -> u32 {
     let code_unit = text[index];
     let code_point = u32::from(code_unit);
     if !is_utf16_high_surrogate(code_unit) && !is_utf16_low_surrogate(code_unit) {
@@ -164,7 +182,7 @@ fn previous_code_point_at(text: &[u16], index: &mut usize) -> u32 {
     code_point_at(text, *index)
 }
 
-fn code_unit_length_for_code_point(code_point: u32) -> usize {
+pub(super) fn code_unit_length_for_code_point(code_point: u32) -> usize {
     if code_point >= 0x10000 { 2 } else { 1 }
 }
 
@@ -178,10 +196,10 @@ fn is_interword_space(code_point: u32) -> bool {
 
 // A chunk while it is still being accumulated: where it starts, plus the properties shared by
 // every chunk that can be committed from it.
-#[derive(Clone, Copy)]
-struct PendingChunk<'text> {
+#[derive(Clone)]
+struct PendingChunk {
     start: usize,
-    font: FontRef<'text>,
+    font: FontHandle,
     text_type: u8,
     broken_on_tab: bool,
 }
@@ -195,7 +213,7 @@ struct ChunkBreakFlags {
 
 struct TextChunker<'text> {
     text: &'text [u16],
-    font_cascade_list: FontCascadeListRef<'text>,
+    font_cascade_list: &'text FontCascadeListHandle,
     grapheme_segmenter: GraphemeSegmenter,
     line_segmenter: LineSegmenter,
     word_break: u8,
@@ -205,16 +223,14 @@ struct TextChunker<'text> {
     should_respect_linebreaks: bool,
     unidirectional_ltr: bool,
     current_index: usize,
-    last_non_whitespace_font: Option<FontRef<'text>>,
+    last_non_whitespace_font: Option<FontHandle>,
 }
 
 impl<'text> TextChunker<'text> {
     fn new(inputs: TextChunkInputs<'text>) -> Self {
         Self {
             text: inputs.text,
-            // SAFETY: The caller guarantees the cascade list outlives the
-            // chunking run (layout retains the style that owns it).
-            font_cascade_list: unsafe { FontCascadeListRef::from_raw(inputs.font_cascade_list) },
+            font_cascade_list: inputs.font_cascade_list,
             grapheme_segmenter: GraphemeSegmenter::new(inputs.text),
             line_segmenter: LineSegmenter::new(inputs.text),
             word_break: inputs.word_break,
@@ -237,7 +253,7 @@ impl<'text> TextChunker<'text> {
 
     fn current_text_type(&self) -> u8 {
         if self.unidirectional_ltr {
-            return GLYPH_TEXT_TYPE_LTR;
+            return line_box_fragment::GLYPH_TEXT_TYPE_LTR;
         }
         // SAFETY: Pure Unicode table lookup.
         unsafe { ladybird_layout_text_type_for_code_point(self.current_code_point()) }
@@ -335,15 +351,15 @@ impl<'text> TextChunker<'text> {
         }
     }
 
-    fn font_for_space(&self, at_index: usize, space_code_point: u32) -> FontRef<'text> {
-        let has_glyph = |font: FontRef<'text>| font.contains_glyph(space_code_point);
+    fn font_for_space(&self, at_index: usize, space_code_point: u32) -> FontHandle {
+        let has_glyph = |font: &FontHandle| font.contains_glyph(space_code_point);
 
         // 1. Prefer the last non-whitespace font in this node/run.
-        if let Some(last_font) = self.last_non_whitespace_font
+        if let Some(last_font) = &self.last_non_whitespace_font
             && !last_font.is_emoji_font()
             && has_glyph(last_font)
         {
-            return last_font;
+            return last_font.clone();
         }
 
         // 2. Look ahead to the next non-space to infer the base font of this run.
@@ -351,37 +367,42 @@ impl<'text> TextChunker<'text> {
         while i < self.text.len() {
             let code_point = code_point_at(self.text, i);
             if !is_interword_space(code_point) && code_point != '\t' as u32 && code_point != '\n' as u32 {
-                let font =
-                    self.font_cascade_list
-                        .font_for_code_point(code_point, true, self.emoji_presentation_at(i, code_point));
-                if !font.is_emoji_font() && has_glyph(font) {
+                let font = self.font_cascade_list.font_for_code_point(
+                    code_point,
+                    self.emoji_presentation_at(i, code_point),
+                    self.last_non_whitespace_font.as_ref(),
+                );
+                if !font.is_emoji_font() && has_glyph(&font) {
                     return font;
                 }
                 // Text is coming from an emoji face; we'll fall back to (3).
                 break;
             }
-            i = self.grapheme_segmenter.next_boundary(i, false).unwrap_or(self.text.len());
+            i = self
+                .grapheme_segmenter
+                .next_boundary(i, false)
+                .unwrap_or(self.text.len());
         }
 
         // 3. No text around (leading/trailing/all spaces) — pick a font with the glyph from the cascade.
         self.font_cascade_list.font_for_code_point(
             space_code_point,
-            true,
             EmojiPresentation {
                 is_emoji: false,
                 forced: false,
             },
+            self.last_non_whitespace_font.as_ref(),
         )
     }
 
-    fn expected_font_for(&self, code_point: u32) -> FontRef<'text> {
+    fn expected_font_for(&self, code_point: u32, font_hint: Option<&FontHandle>) -> FontHandle {
         if is_interword_space(code_point) {
             self.font_for_space(self.current_index, code_point)
         } else {
             self.font_cascade_list.font_for_code_point(
                 code_point,
-                true,
                 self.emoji_presentation_at(self.current_index, code_point),
+                font_hint,
             )
         }
     }
@@ -391,7 +412,7 @@ impl<'text> TextChunker<'text> {
         start: usize,
         end: usize,
         break_flags: ChunkBreakFlags,
-        font: FontRef<'text>,
+        font: FontHandle,
         text_type: u8,
     ) -> Option<TextChunk> {
         let length_in_code_units = end - start;
@@ -402,12 +423,12 @@ impl<'text> TextChunker<'text> {
             .iter()
             .all(|unit| *unit <= 0x7f && code_point_is_ascii_space(u32::from(*unit)));
         if !is_all_whitespace {
-            self.last_non_whitespace_font = Some(font);
+            self.last_non_whitespace_font = Some(font.clone());
         }
         Some(TextChunk {
             start,
             length: length_in_code_units,
-            font: font.as_raw(),
+            font,
             has_breaking_newline: break_flags.has_breaking_newline,
             has_breaking_tab: break_flags.has_breaking_tab,
             is_all_whitespace,
@@ -426,7 +447,7 @@ impl<'text> TextChunker<'text> {
             let mut can_break_at_current_position = self.is_at_line_break_opportunity();
             let mut pending = PendingChunk {
                 start: self.current_index,
-                font: self.expected_font_for(code_point),
+                font: self.expected_font_for(code_point, self.last_non_whitespace_font.as_ref()),
                 text_type: self.current_text_type(),
                 broken_on_tab: false,
             };
@@ -435,7 +456,7 @@ impl<'text> TextChunker<'text> {
                 code_point = self.current_code_point();
 
                 if code_point == '\t' as u32 {
-                    if let Some(chunk) = self.try_commit_chunk_at_cursor(pending, false) {
+                    if let Some(chunk) = self.try_commit_chunk_at_cursor(&pending, false) {
                         return Some(chunk);
                     }
 
@@ -447,10 +468,10 @@ impl<'text> TextChunker<'text> {
                     can_break_at_current_position = self.is_at_line_break_opportunity();
                 }
 
-                let expected_font = self.expected_font_for(code_point);
+                let expected_font = self.expected_font_for(code_point, Some(&pending.font));
 
                 if pending.font != expected_font
-                    && let Some(chunk) = self.try_commit_chunk_at_cursor(pending, can_break_at_current_position)
+                    && let Some(chunk) = self.try_commit_chunk_at_cursor(&pending, can_break_at_current_position)
                 {
                     return Some(chunk);
                 }
@@ -459,7 +480,7 @@ impl<'text> TextChunker<'text> {
                     // Newline encountered, and we're supposed to preserve them.
                     // If we have accumulated some code points in the current chunk, commit them now and continue with
                     // the newline next time.
-                    if let Some(chunk) = self.try_commit_chunk_at_cursor(pending, false) {
+                    if let Some(chunk) = self.try_commit_chunk_at_cursor(&pending, false) {
                         return Some(chunk);
                     }
 
@@ -473,7 +494,7 @@ impl<'text> TextChunker<'text> {
                             has_breaking_tab: pending.broken_on_tab,
                             can_break_after: false,
                         },
-                        pending.font,
+                        pending.font.clone(),
                         pending.text_type,
                     );
                     return Some(chunk.expect("newline chunk must be non-empty"));
@@ -485,7 +506,7 @@ impl<'text> TextChunker<'text> {
                     && self.current_index > 0
                     && self.is_collapsible(code_point_at(self.text, self.current_index - 1))
                 {
-                    let chunk = self.try_commit_chunk_at_cursor(pending, false);
+                    let chunk = self.try_commit_chunk_at_cursor(&pending, false);
 
                     while self.current_index < self.text.len() && self.is_collapsible(self.current_code_point()) {
                         self.current_index = self.next_grapheme_boundary();
@@ -504,7 +525,7 @@ impl<'text> TextChunker<'text> {
                 if self.should_wrap_lines
                     && self.current_index < self.text.len()
                     && pending.text_type != self.current_text_type()
-                    && let Some(chunk) = self.try_commit_chunk_at_cursor(pending, can_break_at_current_position)
+                    && let Some(chunk) = self.try_commit_chunk_at_cursor(&pending, can_break_at_current_position)
                 {
                     return Some(chunk);
                 }
@@ -514,7 +535,7 @@ impl<'text> TextChunker<'text> {
                         // Whitespace encountered, and we're allowed to break on whitespace.
                         // If we have accumulated some code points in the current chunk, commit them now and continue
                         // with the whitespace next time.
-                        if let Some(chunk) = self.try_commit_chunk_at_cursor(pending, false) {
+                        if let Some(chunk) = self.try_commit_chunk_at_cursor(&pending, false) {
                             return Some(chunk);
                         }
 
@@ -524,16 +545,16 @@ impl<'text> TextChunker<'text> {
                         let space_font = self.font_for_space(self.current_index, code_point);
                         let space = PendingChunk {
                             font: space_font,
-                            ..pending
+                            ..pending.clone()
                         };
-                        if let Some(chunk) = self.try_commit_chunk_at_cursor(space, false) {
+                        if let Some(chunk) = self.try_commit_chunk_at_cursor(&space, false) {
                             return Some(chunk);
                         }
                         continue;
                     }
 
                     if can_break_at_current_position
-                        && let Some(chunk) = self.try_commit_chunk_at_cursor(pending, true)
+                        && let Some(chunk) = self.try_commit_chunk_at_cursor(&pending, true)
                     {
                         return Some(chunk);
                     }
@@ -553,7 +574,7 @@ impl<'text> TextChunker<'text> {
                         has_breaking_tab: pending.broken_on_tab,
                         can_break_after: false,
                     },
-                    pending.font,
+                    pending.font.clone(),
                     pending.text_type,
                 ) {
                     return Some(chunk);
@@ -565,7 +586,7 @@ impl<'text> TextChunker<'text> {
     }
 
     // Commits everything accumulated since `pending.start` up to the cursor, if that range is non-empty.
-    fn try_commit_chunk_at_cursor(&mut self, pending: PendingChunk<'text>, can_break_after: bool) -> Option<TextChunk> {
+    fn try_commit_chunk_at_cursor(&mut self, pending: &PendingChunk, can_break_after: bool) -> Option<TextChunk> {
         self.try_commit_chunk(
             pending.start,
             self.current_index,
@@ -574,34 +595,34 @@ impl<'text> TextChunker<'text> {
                 has_breaking_tab: pending.broken_on_tab,
                 can_break_after,
             },
-            pending.font,
+            pending.font.clone(),
             pending.text_type,
         )
     }
 }
 
 pub(crate) fn text_chunks(
-    callbacks: &FfiLayoutFcCallbacks,
+    callbacks: &LayoutPass<'_>,
     node: Node,
     should_wrap_lines: bool,
     should_respect_linebreaks: bool,
     unidirectional_ltr: bool,
-) -> &'static [TextChunk] {
+) -> std::rc::Rc<super::rendered_text::CachedTextChunks> {
     let parent_style = StyleValues::for_node(callbacks, callbacks.parent(node));
-    let key = crate::layout::layout_node_arena::TextChunkCacheKey {
+    let key = super::rendered_text::TextChunkCacheKey {
         should_wrap_lines,
         should_respect_linebreaks,
         unidirectional_ltr,
         white_space_collapse: parent_style.white_space_collapse(),
         word_break: parent_style.word_break(),
         font_variant_emoji: parent_style.font_variant_emoji(),
-        font_cascade_list: parent_style.font_cascade_list(),
+        font_cascade_list: parent_style.font_cascade_list().clone(),
     };
     let text = &callbacks.text_content(node).text;
-    callbacks.arena().text_chunks(node, key, || {
+    callbacks.text_content(node).text_chunks(&key, || {
         chunk_text(TextChunkInputs {
             text,
-            font_cascade_list: key.font_cascade_list,
+            font_cascade_list: &key.font_cascade_list,
             white_space_collapse: key.white_space_collapse,
             word_break: key.word_break,
             font_variant_emoji: key.font_variant_emoji,

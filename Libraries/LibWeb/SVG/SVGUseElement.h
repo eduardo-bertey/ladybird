@@ -8,7 +8,6 @@
 
 #include <AK/IntrusiveList.h>
 #include <AK/Utf16String.h>
-#include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/DOM/DocumentObserver.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
@@ -38,20 +37,20 @@ public:
     //         https://github.com/w3c/svgwg/issues/1153
 
     // https://w3c.github.io/svgwg/svg2-draft/struct.html#__svg__SVGUseElement__x
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, SVGLengthValue::number(0));
 
     // https://w3c.github.io/svgwg/svg2-draft/struct.html#__svg__SVGUseElement__y
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, SVGLengthValue::number(0));
 
     // https://w3c.github.io/svgwg/svg2-draft/struct.html#__svg__SVGUseElement__width
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, SVGLengthValue::number(0));
 
     // https://w3c.github.io/svgwg/svg2-draft/struct.html#__svg__SVGUseElement__height
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, CSS::NumberStyleValue::create(0));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, SVGLengthValue::number(0));
 
     GC::Ptr<SVGElement> instance_root() const;
 
-    virtual Gfx::AffineTransform element_transform() const override;
+    virtual Gfx::AffineTransform additional_element_transform() const override;
 
 private:
     SVGUseElement(DOM::Document&, DOM::QualifiedName);
@@ -66,7 +65,7 @@ private:
 
     virtual bool is_svg_use_element() const override { return true; }
 
-    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
+    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
 
     void process_the_url(Optional<Utf16String> const& href);
     Optional<Utf16String> href_value() const;

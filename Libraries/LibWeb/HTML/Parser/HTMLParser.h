@@ -8,6 +8,7 @@
 
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <LibGC/Function.h>
 #include <LibGfx/Color.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibURL/Forward.h>
@@ -16,23 +17,16 @@
 #include <LibWeb/DOM/FragmentSerializationMode.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLTokenizer.h>
 #include <LibWeb/HTML/Parser/ParserScriptingMode.h>
 #include <LibWeb/MimeSniff/MimeType.h>
 #include <LibWeb/Platform/Timer.h>
 
 struct RustFfiHtmlParserHandle;
-
-namespace Web::SVG {
-
-class SVGScriptElement;
-
-}
+struct RustFfiHtmlParserAttribute;
 
 namespace Web::HTML {
-
-class HTMLScriptElement;
-class HTMLFormElement;
 
 class WEB_API HTMLParser final : public JS::Cell {
     GC_CELL(HTMLParser, JS::Cell);
@@ -44,7 +38,7 @@ public:
     virtual ~HTMLParser() override;
 
     static GC::Ref<HTMLParser> create_for_scripting(DOM::Document&);
-    static GC::Ref<HTMLParser> create_with_open_input_stream(DOM::Document&);
+    static GC::Ref<HTMLParser> create_with_open_input_stream(DOM::Document&, EncodingConfidence = EncodingConfidence::Irrelevant);
     static GC::Ref<HTMLParser> create_with_uncertain_encoding(DOM::Document&, ByteBuffer const& input, Optional<MimeSniff::MimeType> maybe_mime_type = {});
     static GC::Ref<HTMLParser> create_from_byte_string(DOM::Document&, StringView input, ParserScriptingMode, StringView encoding);
     static GC::Ref<HTMLParser> create_for_decoded_string(DOM::Document&, Utf16View input, ParserScriptingMode, Utf16View encoding);
@@ -81,10 +75,11 @@ public:
     void set_allow_declarative_shadow_roots(AllowDeclarativeShadowRoots allow) { m_allow_declarative_shadow_roots = allow; }
 
     void configure_element_created_by_rust_parser(DOM::Element&);
-    GC::Ref<DOM::Element> create_element_for_rust_parser(HTMLToken const&, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent, bool had_duplicate_attribute, GC::Ptr<HTMLFormElement>, bool has_template_element_on_stack);
+    GC::Ref<DOM::Element> create_element_for_rust_parser(Utf16FlyString const&, ReadonlySpan<RustFfiHtmlParserAttribute>, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent, bool had_duplicate_attribute, GC::Ptr<HTMLFormElement>, bool has_template_element_on_stack);
     void prepare_svg_script_for_rust_parser(SVG::SVGScriptElement&, size_t source_line_number);
     void set_script_source_line_from_rust_parser(DOM::Element&, size_t source_line_number);
     void mark_script_already_started_from_rust_parser(HTMLScriptElement&);
+    void process_meta_element_from_rust_parser(HTMLMetaElement&);
     void stop_parsing_from_rust_parser();
     bool process_script_end_tag_from_rust_parser(HTMLScriptElement&);
     bool process_svg_script_end_tag_from_rust_parser(SVG::SVGScriptElement&);
@@ -97,6 +92,10 @@ public:
     bool is_paused() const { return m_parser_pause_flag; }
     bool is_script_created() const { return m_script_created; }
 
+    EncodingConfidence encoding_confidence() const { return m_encoding_confidence; }
+    void set_change_encoding_callback(GC::Ref<GC::Function<bool(StringView)>> callback) { m_change_encoding_callback = callback; }
+    void set_parsing_complete_callback(GC::Ref<GC::Function<void()>> callback) { m_parsing_complete_callback = callback; }
+
     size_t script_nesting_level() const { return m_script_nesting_level; }
 
     void schedule_resume_check();
@@ -104,14 +103,22 @@ public:
     void invoke_post_parse_action_for_testing() { invoke_post_parse_action(); }
 
 private:
+    static GC::Ptr<DOM::DocumentFragment> try_parse_html_fragment_fast(DOM::Element&, Utf16View);
+
     enum class ScriptCreatedParser {
         No,
         Yes,
     };
 
-    HTMLParser(DOM::Document&, ParserScriptingMode, StringView input, StringView encoding);
-    HTMLParser(DOM::Document&, ParserScriptingMode, Utf16View input, Utf16View encoding);
-    HTMLParser(DOM::Document&, ParserScriptingMode, ScriptCreatedParser);
+    enum class FragmentParser {
+        No,
+        Yes,
+    };
+
+    HTMLParser(DOM::Document&, ParserScriptingMode, StringView input, StringView encoding, EncodingConfidence);
+    HTMLParser(DOM::Document&, ParserScriptingMode, Utf16View input, Utf16View encoding, EncodingConfidence);
+    HTMLParser(DOM::Document&, ParserScriptingMode, Utf16View input, FragmentParser);
+    HTMLParser(DOM::Document&, ParserScriptingMode, ScriptCreatedParser, EncodingConfidence);
 
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void finalize() override;
@@ -123,9 +130,10 @@ private:
     // https://html.spec.whatwg.org/multipage/parsing.html#stop-the-speculative-html-parser
     void stop_the_speculative_html_parser();
 
-    GC::Ref<DOM::Element> create_element_for(HTMLToken const&, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent);
+    GC::Ref<DOM::Element> create_element_for(Utf16FlyString const&, ReadonlySpan<RustFfiHtmlParserAttribute>, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent);
     void increment_script_nesting_level();
     void decrement_script_nesting_level();
+    void change_the_encoding(StringView new_encoding);
 
     void resume_after_parser_blocking_script();
     void invoke_post_parse_action();
@@ -149,6 +157,11 @@ private:
     bool m_stop_parsing { false };
     bool m_resume_check_pending { false };
     size_t m_script_nesting_level { 0 };
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#concept-encoding-confidence
+    EncodingConfidence m_encoding_confidence;
+    GC::Ptr<GC::Function<bool(StringView)>> m_change_encoding_callback;
+    GC::Ptr<GC::Function<void()>> m_parsing_complete_callback;
 
     Function<void()> m_post_parse_action;
 
@@ -204,5 +217,7 @@ RefPtr<CSS::StyleValue const> parse_dimension_value(Utf16View);
 RefPtr<CSS::StyleValue const> parse_nonzero_dimension_value(Utf16View);
 Optional<Color> parse_legacy_color_value(Utf16View);
 RefPtr<CSS::StyleValue const> parse_table_child_element_align_value(Utf16View);
+
+u64 parser_non_append_insertions();
 
 }

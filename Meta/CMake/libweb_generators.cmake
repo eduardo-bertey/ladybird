@@ -20,30 +20,11 @@ function (generate_css_implementation)
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Enums.json"
     )
 
-    invoke_py_generator(
-        "EnvironmentVariable.cpp"
-        "generate_libweb_css_environment_variables.py"
-        "${LIBWEB_INPUT_FOLDER}/CSS/EnvironmentVariables.json"
-        "CSS/EnvironmentVariable.h"
-        "CSS/EnvironmentVariable.cpp"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/EnvironmentVariables.json"
-    )
-
-    invoke_py_generator(
-        "MathFunctions.cpp"
-        "generate_libweb_css_math_functions.py"
-        "${LIBWEB_INPUT_FOLDER}/CSS/MathFunctions.json"
-        "CSS/MathFunctions.h"
-        "CSS/MathFunctions.cpp"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/MathFunctions.json"
-    )
-
-    invoke_py_generator(
-        "MediaFeatureID.cpp"
+    invoke_py_header_generator(
+        "MediaFeatureID.h"
         "generate_libweb_css_media_feature_id.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/MediaFeatures.json"
         "CSS/MediaFeatureID.h"
-        "CSS/MediaFeatureID.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/MediaFeatures.json"
     )
 
@@ -57,14 +38,14 @@ function (generate_css_implementation)
                   -e "${LIBWEB_INPUT_FOLDER}/CSS/Enums.json"
                   -g "${LIBWEB_INPUT_FOLDER}/CSS/LogicalPropertyGroups.json"
         dependencies "${LIBWEB_INPUT_FOLDER}/CSS/Enums.json" "${LIBWEB_INPUT_FOLDER}/CSS/LogicalPropertyGroups.json"
+                     "${LADYBIRD_SOURCE_DIR}/Meta/Utils/utils.py"
     )
 
-    invoke_py_generator(
-        "PseudoClass.cpp"
+    invoke_py_header_generator(
+        "PseudoClass.h"
         "generate_libweb_css_pseudo_class.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/PseudoClasses.json"
         "CSS/PseudoClass.h"
-        "CSS/PseudoClass.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/PseudoClasses.json"
     )
 
@@ -87,17 +68,6 @@ function (generate_css_implementation)
     )
 
     invoke_py_generator(
-        "GeneratedValueTypesParsing.cpp"
-        "generate_libweb_css_value_types_parsing.py"
-        "${LIBWEB_INPUT_FOLDER}/CSS/ValueTypes.json"
-        "CSS/Parser/GeneratedValueTypesParsing.h"
-        "CSS/Parser/GeneratedValueTypesParsing.cpp"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/ValueTypes.json"
-                  -u "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
-        dependencies "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
-    )
-
-    invoke_py_generator(
         "Units.cpp"
         "generate_libweb_css_units.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
@@ -113,6 +83,7 @@ function (generate_css_implementation)
         "CSS/Keyword.h"
         "CSS/Keyword.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Keywords.json"
+        dependencies "${LADYBIRD_SOURCE_DIR}/Meta/Utils/utils.py"
     )
 
     invoke_py_idl_generator(
@@ -171,11 +142,9 @@ function (generate_css_implementation)
 
     set(CSS_GENERATED_HEADERS
        "CSS/Enums.h"
-       "CSS/EnvironmentVariable.h"
        "CSS/GeneratedCSSStyleProperties.h"
        "CSS/GeneratedCSSNumericFactoryMethods.h"
        "CSS/Keyword.h"
-       "CSS/MathFunctions.h"
        "CSS/MediaFeatureID.h"
        "CSS/PropertyID.h"
        "CSS/PseudoClass.h"
@@ -363,6 +332,7 @@ function (generate_js_bindings target)
     set(exposed_interface_sources
         Forward.h
         IntrinsicDefinitions.cpp IntrinsicDefinitions.h
+        AudioWorkletExposedInterfaces.cpp AudioWorkletExposedInterfaces.h
         DedicatedWorkerExposedInterfaces.cpp DedicatedWorkerExposedInterfaces.h
         SharedWorkerExposedInterfaces.cpp SharedWorkerExposedInterfaces.h
         WindowExposedInterfaces.cpp WindowExposedInterfaces.h

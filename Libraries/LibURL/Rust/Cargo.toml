@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["staticlib"]
+crate-type = ["rlib", "staticlib"]
 
 [dependencies]
-encoding_rs = "0.8.35"
+encoding_rs = "0.8.40"
 libregex_rust = { path = "../../LibRegex/Rust" }
 libunicode_rust = { path = "../../LibUnicode/Rust", features = ["idna"] }
 

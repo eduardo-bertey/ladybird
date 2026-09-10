@@ -1,0 +1,744 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+use super::builder::{for_each_command, inline_transform_of, read_command};
+use super::commands::*;
+use super::nested_records::{NestedRecordsRole, for_each_nested_record_span, span_bytes};
+use crate::css::color_resolution::format_to_8bit_compatible;
+use crate::layout::LayoutNodeArena;
+use crate::layout::node_data::NodeSlotId;
+use crate::painting::dump::{
+    format_float_like_ak, push_affine_transform, push_float_like_ak, push_float_point, push_float_rect,
+    push_float_size, push_int_point, push_int_rect, push_int_size,
+};
+#[cfg(test)]
+use crate::painting::visual_context::VisualContextTree;
+use crate::painting::visual_context::dump::SlotKind;
+use libgfx_rust::path::OwnedPath;
+use libgfx_rust::{
+    Color, CompositingAndBlendingOperator, CornerRadii, FloatPoint, FloatRect, FloatSize, IntPoint, IntRect, IntSize,
+    LineStyle, ScalingMode,
+};
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::fmt::Write;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiPaintingDumpCallbacks {
+    pub context: *mut c_void,
+    pub debug_description:
+        unsafe extern "C" fn(context: *mut c_void, layout_node_shell: *mut c_void, description_sink: *mut c_void),
+    pub command_bytes:
+        unsafe extern "C" fn(context: *mut c_void, display_list: *const c_void, byte_count: *mut usize) -> *const u8,
+    pub nested_display_list: unsafe extern "C" fn(context: *mut c_void, display_list_id: u64) -> *const c_void,
+    pub append_text: unsafe extern "C" fn(context: *mut c_void, bytes: *const u8, byte_count: usize),
+}
+
+impl FfiPaintingDumpCallbacks {
+    fn debug_description(&self, layout_node_shell: *mut c_void) -> String {
+        let mut description = Vec::new();
+        // SAFETY: The C++ host fills the description sink synchronously through the exported push
+        // function.
+        unsafe { (self.debug_description)(self.context, layout_node_shell, (&raw mut description).cast()) };
+        String::from_utf8_lossy(&description).into_owned()
+    }
+
+    fn command_bytes(&self, display_list: *const c_void) -> &[u8] {
+        let mut byte_count = 0;
+        // SAFETY: The host owns the display list for the duration of the dump and returns a span
+        // that stays live for this call.
+        let bytes = unsafe { (self.command_bytes)(self.context, display_list, &raw mut byte_count) };
+        if byte_count == 0 {
+            return &[];
+        }
+        assert!(!bytes.is_null());
+        // SAFETY: The host reported `byte_count` readable bytes at `bytes`.
+        unsafe { std::slice::from_raw_parts(bytes, byte_count) }
+    }
+
+    fn nested_display_list(&self, display_list_id: DisplayListResourceId) -> *const c_void {
+        // SAFETY: Nested ids come from records the host produced, so they resolve in its storage.
+        let display_list = unsafe { (self.nested_display_list)(self.context, display_list_id.0) };
+        assert!(!display_list.is_null());
+        display_list
+    }
+
+    fn append_text(&self, text: &str) {
+        // SAFETY: The C++ sink copies the completed dump synchronously.
+        unsafe { (self.append_text)(self.context, text.as_ptr(), text.len()) };
+    }
+}
+
+struct VisualContextNodeOwners {
+    spatial: HashMap<u32, NodeSlotId>,
+    clip: HashMap<u32, NodeSlotId>,
+    effect: HashMap<u32, NodeSlotId>,
+}
+
+impl VisualContextNodeOwners {
+    fn collect(arena: &LayoutNodeArena, viewport: NodeSlotId) -> Self {
+        let paintable_rows = arena.paintable_rows();
+        let mut owners = Self {
+            spatial: HashMap::new(),
+            clip: HashMap::new(),
+            effect: HashMap::new(),
+        };
+        owners.spatial.insert(VISUAL_VIEWPORT_NODE_INDEX.0, viewport);
+        owners.spatial.insert(
+            paintable_rows.paintable_data(viewport).own_scroll_node_index.0,
+            viewport,
+        );
+        let mut pending = vec![viewport];
+        while let Some(slot) = pending.pop() {
+            arena.with_paintable_visual_context_node_handles(slot, |handles| {
+                for spatial in &handles.spatial {
+                    owners.spatial.insert(spatial.0, slot);
+                }
+                for clip in handles.clip_handles() {
+                    owners.clip.insert(clip.0, slot);
+                }
+                for effect in &handles.effects {
+                    owners.effect.insert(effect.0, slot);
+                }
+            });
+            let mut child = arena.node_first_child_if_live(slot);
+            while let Some(current) = child {
+                pending.push(current);
+                child = arena.node_next_sibling_if_live(current);
+            }
+        }
+        owners
+    }
+
+    fn owner(&self, kind: SlotKind, index: u32) -> Option<NodeSlotId> {
+        match kind {
+            SlotKind::Spatial => self.spatial.get(&index).copied(),
+            SlotKind::Clip => self.clip.get(&index).copied(),
+            SlotKind::Effect => self.effect.get(&index).copied(),
+        }
+    }
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread, and
+/// `visual_context_tree` a live retained tree handle built from it; `command_runs` must address
+/// `command_run_count` runs; `display_list` and every pointer returned by `callbacks` must remain
+/// live for this call. The callback byte spans must contain display-list records produced by this
+/// build of LibWeb. `debug_description` is called synchronously with a `Vec<u8>` sink the host
+/// fills through `layout_arena_paint_push_bytes`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn painting_dump(
+    arena: *mut c_void,
+    viewport: NodeSlotId,
+    visual_context_tree: *const c_void,
+    command_runs: *const DisplayListCommandRun,
+    command_run_count: usize,
+    display_list: *const c_void,
+    callbacks: FfiPaintingDumpCallbacks,
+) {
+    assert!(!display_list.is_null());
+    let arena = unsafe { crate::painting::ffi::arena_from_handle(arena) };
+    let visual_context_tree = unsafe { crate::painting::ffi::tree_from_handle(visual_context_tree) };
+    let command_runs = unsafe { crate::painting::ffi::ffi_slice(command_runs, command_run_count) };
+    let owners = VisualContextNodeOwners::collect(arena, viewport);
+    let mut output = visual_context_tree.dump_nodes_reachable_from_runs(command_runs, |kind, index| {
+        let shell = arena.shell_if_live(owners.owner(kind, index)?);
+        (!shell.is_null()).then(|| callbacks.debug_description(shell))
+    });
+    output.push_str("\nDisplayList:\n");
+    dump_commands(&mut output, &callbacks, display_list, 0);
+    callbacks.append_text(&output);
+}
+
+fn push_indent(output: &mut String, indent: usize) {
+    output.extend(std::iter::repeat_n(' ', indent * 2));
+}
+
+fn dump_commands(
+    output: &mut String,
+    callbacks: &FfiPaintingDumpCallbacks,
+    display_list: *const c_void,
+    base_indent: usize,
+) {
+    dump_command_bytes(output, callbacks, callbacks.command_bytes(display_list), base_indent);
+}
+
+fn dump_command_bytes(
+    output: &mut String,
+    callbacks: &FfiPaintingDumpCallbacks,
+    command_bytes: &[u8],
+    base_indent: usize,
+) {
+    for_each_command(command_bytes, |header, _, payload| {
+        push_indent(output, base_indent);
+        write!(output, "{}@", header.command_type.name()).unwrap();
+        write_context(output, header.context);
+        dump_command(output, header.command_type, payload);
+        if header.inline_clip_count > 0 {
+            dump_inline_clips(output, header, payload);
+        }
+        if let Some(transform) = inline_transform_of(header, payload) {
+            output.push_str(" inline_transform=");
+            push_affine_transform(output, transform);
+        }
+        output.push('\n');
+
+        dump_records_inside(output, callbacks, header.command_type, payload, base_indent + 1);
+        let Some(nested) = nested_display_lists(header.command_type, payload) else {
+            return;
+        };
+        dump_commands(
+            output,
+            callbacks,
+            callbacks.nested_display_list(nested.display_list),
+            base_indent + 1,
+        );
+    });
+}
+
+struct NestedDisplayLists {
+    display_list: DisplayListResourceId,
+}
+
+fn nested_display_lists(command_type: DisplayListCommandType, payload: &[u8]) -> Option<NestedDisplayLists> {
+    match command_type {
+        DisplayListCommandType::PaintNestedDisplayList => Some(NestedDisplayLists {
+            display_list: read_command::<PaintNestedDisplayList>(payload).display_list_id,
+        }),
+        _ => None,
+    }
+}
+
+fn dump_records_inside(
+    output: &mut String,
+    callbacks: &FfiPaintingDumpCallbacks,
+    command_type: DisplayListCommandType,
+    payload: &[u8],
+    indent: usize,
+) {
+    for_each_nested_record_span(command_type, payload, |role, span| {
+        let label = match role {
+            NestedRecordsRole::IsolatedGroupMask => Some("Mask:\n"),
+            NestedRecordsRole::PatternTile => Some("PatternTile:\n"),
+            NestedRecordsRole::IsolatedGroupContent
+            | NestedRecordsRole::RepeatedTile
+            | NestedRecordsRole::MaskContent => None,
+        };
+        let mut nested_indent = indent;
+        if let Some(label) = label {
+            push_indent(output, indent);
+            output.push_str(label);
+            nested_indent += 1;
+        }
+        dump_command_bytes(output, callbacks, span_bytes(payload, span), nested_indent);
+    });
+}
+
+trait DumpValue {
+    fn push_dump(self, output: &mut String);
+}
+
+macro_rules! dump_value_via {
+    ($($type:ty => $push:expr),+ $(,)?) => {
+        $(impl DumpValue for $type {
+            fn push_dump(self, output: &mut String) {
+                $push(output, self);
+            }
+        })+
+    };
+}
+
+dump_value_via! {
+    IntPoint => push_int_point,
+    FloatPoint => push_float_point,
+    IntSize => push_int_size,
+    FloatSize => push_float_size,
+    IntRect => push_int_rect,
+    FloatRect => push_float_rect,
+    f32 => push_float_like_ak,
+    Color => write_color,
+    SpatialNodeIndex => write_spatial_node_index,
+}
+
+fn write_spatial_node_index(output: &mut String, index: SpatialNodeIndex) {
+    write!(output, "s{}", index.0).unwrap();
+}
+
+fn write_field(output: &mut String, label: &str, value: impl DumpValue) {
+    output.push(' ');
+    output.push_str(label);
+    output.push('=');
+    value.push_dump(output);
+}
+
+fn dump_command(output: &mut String, command_type: DisplayListCommandType, payload: &[u8]) {
+    match command_type {
+        DisplayListCommandType::DrawGlyphRun => {
+            let command = read_command::<DrawGlyphRun>(payload);
+            write_field(output, "rect", command.rect);
+            write_field(output, "translation", command.translation);
+            write_field(output, "color", command.color);
+        }
+        DisplayListCommandType::FillRect => {
+            let command = read_command::<FillRect>(payload);
+            write_field(output, "rect", command.rect);
+            write_field(output, "color", command.color);
+            write_blend_mode(output, command.compositing_and_blending_operator);
+        }
+        DisplayListCommandType::PaintCaret => {
+            let command = read_command::<PaintCaret>(payload);
+            write_field(output, "rect", command.rect);
+            write_field(output, "color", command.color);
+            write!(output, " should_blink={}", command.should_blink).unwrap();
+        }
+        DisplayListCommandType::DrawScaledDecodedImageFrame => {
+            let command = read_command::<DrawScaledDecodedImageFrame>(payload);
+            write_field(output, "dst_rect", command.dst_rect);
+            if let Some(rect) = command.src_rect.get() {
+                write_field(output, "src_rect", rect);
+            }
+            write_blend_mode(output, command.compositing_and_blending_operator);
+            if let Some(color) = command.isolated_backdrop_color.get() {
+                write_field(output, "isolated_backdrop_color", color);
+            }
+        }
+        DisplayListCommandType::DrawRepeatedDecodedImageFrame => {
+            let command = read_command::<DrawRepeatedDecodedImageFrame>(payload);
+            write_field(output, "dst_rect", command.dst_rect);
+            write_field(output, "clip_rect", command.clip_rect);
+            write_blend_mode(output, command.compositing_and_blending_operator);
+            if let Some(color) = command.isolated_backdrop_color.get() {
+                write_field(output, "isolated_backdrop_color", color);
+            }
+        }
+        DisplayListCommandType::DrawRepeatedTile => {
+            let command = read_command::<DrawRepeatedTile>(payload);
+            write_field(output, "dst_rect", command.dst_rect);
+            write_field(output, "clip_rect", command.clip_rect);
+            write!(output, " scaling_mode={}", scaling_mode_name(command.scaling_mode)).unwrap();
+            write_blend_mode(output, command.compositing_and_blending_operator);
+        }
+        DisplayListCommandType::DrawTiledDecodedImageFrame => {
+            let command = read_command::<DrawTiledDecodedImageFrame>(payload);
+            write_field(output, "tile_rect", command.tile_rect);
+            write_field(output, "clip_rect", command.clip_rect);
+            write_field(output, "src_rect", command.src_rect);
+            write_field(output, "tile_step", command.tile_step);
+            if let Some(count) = command.tile_count_x.get() {
+                write!(output, " tile_count_x={count}").unwrap();
+            } else {
+                output.push_str(" tile_count_x=repeat");
+            }
+            if let Some(count) = command.tile_count_y.get() {
+                write!(output, " tile_count_y={count}").unwrap();
+            } else {
+                output.push_str(" tile_count_y=repeat");
+            }
+        }
+        DisplayListCommandType::DrawCompositedContext => {
+            let command = read_command::<DrawCompositedContext>(payload);
+            write_field(output, "dst_rect", command.dst_rect);
+        }
+        DisplayListCommandType::DrawCanvas => {
+            let command = read_command::<DrawCanvas>(payload);
+            write_field(output, "dst_rect", command.dst_rect);
+            write!(output, " content_generation={}", command.content_generation).unwrap();
+        }
+        DisplayListCommandType::DrawVideoFrame => {
+            let command = read_command::<DrawVideoFrame>(payload);
+            write_field(output, "dst_rect", command.dst_rect);
+        }
+        DisplayListCommandType::PaintLinearGradient => {
+            let command = read_command::<PaintLinearGradient>(payload);
+            write_field(output, "rect", command.gradient_rect);
+            write_blend_mode(output, command.compositing_and_blending_operator);
+        }
+        DisplayListCommandType::PaintRadialGradient => {
+            let command = read_command::<PaintRadialGradient>(payload);
+            write_field(output, "rect", command.rect);
+            write_field(output, "center", command.center);
+            write_field(output, "size", command.size);
+            write_blend_mode(output, command.compositing_and_blending_operator);
+        }
+        DisplayListCommandType::PaintConicGradient => {
+            let command = read_command::<PaintConicGradient>(payload);
+            write_field(output, "rect", command.rect);
+            write_field(output, "position", command.position);
+            write_field(output, "angle", command.start_angle);
+            write_blend_mode(output, command.compositing_and_blending_operator);
+        }
+        DisplayListCommandType::PaintOuterBoxShadow => {
+            let command = read_command::<PaintOuterBoxShadow>(payload);
+            write_field(output, "content_rect", command.device_content_rect);
+            write_field(output, "shadow_rect", command.shadow_rect);
+            write!(output, " blur_radius={}", command.blur_radius).unwrap();
+            write_field(output, "color", command.color);
+        }
+        DisplayListCommandType::PaintInnerBoxShadow => {
+            let command = read_command::<PaintInnerBoxShadow>(payload);
+            write_field(output, "content_rect", command.device_content_rect);
+            write_field(output, "outer_shadow_rect", command.outer_shadow_rect);
+            write_field(output, "inner_shadow_rect", command.inner_shadow_rect);
+            write!(output, " blur_radius={}", command.blur_radius).unwrap();
+            write_field(output, "color", command.color);
+        }
+        DisplayListCommandType::PaintTextShadow => {
+            let command = read_command::<PaintTextShadow>(payload);
+            write_field(output, "shadow_rect", command.shadow_bounding_rect);
+            write_field(output, "text_rect", command.text_rect);
+            write_field(output, "draw_location", command.draw_location);
+            write!(output, " blur_radius={}", command.blur_radius).unwrap();
+            write_field(output, "color", command.color);
+        }
+        DisplayListCommandType::FillRectWithRoundedCorners => {
+            let command = read_command::<FillRectWithRoundedCorners>(payload);
+            write_field(output, "rect", command.rect);
+            write_field(output, "color", command.color);
+        }
+        DisplayListCommandType::FillPath => {
+            let command = read_command::<FillPath>(payload);
+            write_field(output, "path_bounding_rect", command.path_bounding_rect);
+            write_blend_mode(output, command.compositing_and_blending_operator);
+        }
+        DisplayListCommandType::StrokePath => {
+            let command = read_command::<StrokePath>(payload);
+            write_field(output, "path_bounding_rect", command.path_bounding_rect);
+            write_field(output, "thickness", command.thickness);
+            if command.paint_kind == PathPaintKind::Color {
+                write_field(output, "color", command.color);
+            }
+            if !command.dash_array.is_empty() {
+                write!(
+                    output,
+                    " dash_array_size={} dash_offset={:.2}",
+                    command.dash_array.size as usize / std::mem::size_of::<f32>(),
+                    command.dash_offset
+                )
+                .unwrap();
+            }
+        }
+        DisplayListCommandType::DrawEllipse => {
+            let command = read_command::<DrawEllipse>(payload);
+            write_field(output, "rect", command.rect);
+            write_field(output, "color", command.color);
+            write!(output, " thickness={}", command.thickness).unwrap();
+        }
+        DisplayListCommandType::DrawLine => {
+            let command = read_command::<DrawLine>(payload);
+            write_field(output, "from", command.from);
+            write_field(output, "to", command.to);
+            write_field(output, "color", command.color);
+            write!(
+                output,
+                " thickness={} style={}",
+                command.thickness,
+                line_style_name(command.style)
+            )
+            .unwrap();
+            if command.style != LineStyle::Solid {
+                write_field(output, "alternate_color", command.alternate_color);
+            }
+        }
+        DisplayListCommandType::BackdropFilterRegion => {
+            let command = read_command::<BackdropFilterRegion>(payload);
+            write_field(output, "rect", command.rect);
+        }
+        DisplayListCommandType::DrawRect => {
+            let command = read_command::<DrawRect>(payload);
+            write_field(output, "rect", command.rect);
+            write_field(output, "color", command.color);
+            write!(output, " rough={}", command.rough).unwrap();
+        }
+        DisplayListCommandType::PaintNestedDisplayList => {
+            let command = read_command::<PaintNestedDisplayList>(payload);
+            write_field(output, "rect", command.rect);
+        }
+        DisplayListCommandType::DrawIsolatedGroup => {
+            let command = read_command::<DrawIsolatedGroup>(payload);
+            if let Some(clip_rect) = command.clip_rect.get() {
+                write_field(output, "clip_rect", clip_rect);
+            }
+            if command.opacity != 1.0 {
+                write!(output, " opacity={}", format_float_like_ak(command.opacity)).unwrap();
+            }
+            if !command.filter.is_empty() {
+                output.push_str(" has_filter=true");
+            }
+            write_blend_mode(output, command.compositing_and_blending_operator);
+            if !command.mask.is_empty() {
+                write!(
+                    output,
+                    " has_mask={}",
+                    if command.mask_kind == libgfx_rust::MaskKind::Luminance {
+                        "luminance"
+                    } else {
+                        "alpha"
+                    }
+                )
+                .unwrap();
+            }
+        }
+        DisplayListCommandType::DeclareMaskContent => {
+            let command = read_command::<DeclareMaskContent>(payload);
+            write_field(output, "rect", command.rect);
+            write!(output, " effect=e{}", command.effect.0).unwrap();
+        }
+        DisplayListCommandType::CompositorScrollNode => {
+            let command = read_command::<CompositorScrollNode>(payload);
+            write_field(output, "scroll_node_index", command.scroll_node_index);
+            write_field(output, "parent_scroll_node_index", command.parent_scroll_node_index);
+            write_field(output, "scrollport_rect", command.scrollport_rect);
+            write_field(output, "min_scroll_offset", command.min_scroll_offset);
+            write_field(output, "max_scroll_offset", command.max_scroll_offset);
+            write!(output, " is_viewport={}", command.is_viewport).unwrap();
+        }
+        DisplayListCommandType::CompositorBlockingWheelEventRegion => {
+            let command = read_command::<CompositorBlockingWheelEventRegion>(payload);
+            write_field(output, "rect", command.rect);
+        }
+        DisplayListCommandType::CompositorWheelHitTestTarget => {
+            let command = read_command::<CompositorWheelHitTestTarget>(payload);
+            write_field(output, "target_scroll_node_index", command.target_scroll_node_index);
+            write_field(output, "rect", command.rect);
+        }
+        DisplayListCommandType::CompositorWheelHitTestTargetWithCornerRadii => {
+            let command = read_command::<CompositorWheelHitTestTargetWithCornerRadii>(payload);
+            write_field(output, "target_scroll_node_index", command.target_scroll_node_index);
+            write_field(output, "rect", command.rect);
+            if command.corner_radii.has_any_radius() {
+                let radii = command.corner_radii;
+                write!(
+                    output,
+                    " corner_radii=[{}x{},{}x{},{}x{},{}x{}]",
+                    radii.top_left.horizontal_radius,
+                    radii.top_left.vertical_radius,
+                    radii.top_right.horizontal_radius,
+                    radii.top_right.vertical_radius,
+                    radii.bottom_right.horizontal_radius,
+                    radii.bottom_right.vertical_radius,
+                    radii.bottom_left.horizontal_radius,
+                    radii.bottom_left.vertical_radius
+                )
+                .unwrap();
+            }
+        }
+        DisplayListCommandType::CompositorMainThreadWheelEventRegion => {
+            let command = read_command::<CompositorMainThreadWheelEventRegion>(payload);
+            write_field(output, "rect", command.rect);
+        }
+        DisplayListCommandType::CompositorViewportScrollbar => {
+            let command = read_command::<CompositorViewportScrollbar>(payload);
+            write_field(output, "scroll_node_index", command.scroll_node_index);
+            write_field(output, "gutter_rect", command.gutter_rect);
+            write_field(output, "thumb_rect", command.thumb_rect);
+            write_field(output, "expanded_gutter_rect", command.expanded_gutter_rect);
+            write_field(output, "expanded_thumb_rect", command.expanded_thumb_rect);
+            write!(
+                output,
+                " scroll_size={} expanded_scroll_size={}",
+                command.scroll_size, command.expanded_scroll_size
+            )
+            .unwrap();
+            write_field(output, "min_scroll_offset", command.min_scroll_offset);
+            write_field(output, "max_scroll_offset", command.max_scroll_offset);
+            write_field(output, "thumb_color", command.thumb_color);
+            write_field(output, "track_color", command.track_color);
+            write!(output, " vertical={}", command.vertical).unwrap();
+        }
+        DisplayListCommandType::PaintScrollBar => {}
+    }
+}
+
+fn dump_inline_clips(output: &mut String, header: &DisplayListCommandHeader, payload: &[u8]) {
+    output.push_str(" inline_clips=[");
+    let count = header.inline_clip_count as usize;
+    let entries_size = count * INLINE_CLIP_ENTRY_SIZE;
+    assert!(entries_size <= payload.len());
+    let entries_offset = payload.len() - entries_size;
+    for index in 0..count {
+        if index > 0 {
+            output.push_str(", ");
+        }
+        let clip = read_command::<DisplayListInlineClip>(&payload[entries_offset + index * INLINE_CLIP_ENTRY_SIZE..]);
+        if clip.kind == InlineClipKind::Path {
+            let start = clip.path_data.offset as usize;
+            let size = clip.path_data.size as usize;
+            assert!(start <= payload.len() && size <= payload.len() - start);
+            let path = OwnedPath::from_serialized_bytes(&payload[start..start + size]);
+            let svg_path = path.to_svg_string();
+            let has_host_dependent_curves = svg_path.contains('Q') || svg_path.contains('C');
+            output.push_str("clip_path=[bounds: ");
+            push_float_rect(output, clip.clip_rect_or_path_device_bounds);
+            if has_host_dependent_curves {
+                let command_count = svg_path
+                    .bytes()
+                    .filter(|byte| matches!(byte, b'M' | b'L' | b'Q' | b'C' | b'Z'))
+                    .count();
+                write!(output, ", curved path: {command_count} commands]").unwrap();
+            } else {
+                write!(output, ", path: {svg_path}]").unwrap();
+            }
+        } else {
+            output.push_str("clip=");
+            push_float_rect(output, clip.clip_rect_or_path_device_bounds);
+            write_inline_clip_radii(output, clip.corner_radii);
+        }
+        if clip.mode == ClipMode::Difference {
+            output.push_str(" mode=difference");
+        }
+    }
+    output.push(']');
+}
+
+// A context prints its spatial, clip and effect nodes.
+fn write_context(output: &mut String, context: ContextRef) {
+    write_spatial_node_index(output, context.spatial);
+    if !context.clip.is_none() {
+        write!(output, "/c{}", context.clip.0).unwrap();
+    }
+    if !context.effect.is_none() {
+        write!(output, "/e{}", context.effect.0).unwrap();
+    }
+}
+
+fn write_color(output: &mut String, color: Color) {
+    match color.alpha() {
+        0 => write!(output, "rgba({}, {}, {}, 0)", color.red(), color.green(), color.blue()).unwrap(),
+        255 => write!(output, "rgb({}, {}, {})", color.red(), color.green(), color.blue()).unwrap(),
+        alpha => {
+            let (digits, length) = format_to_8bit_compatible(alpha);
+            let fraction = std::str::from_utf8(&digits[..length]).expect("digits are ASCII");
+            write!(
+                output,
+                "rgba({}, {}, {}, 0.{fraction})",
+                color.red(),
+                color.green(),
+                color.blue()
+            )
+            .unwrap();
+        }
+    }
+}
+
+fn write_blend_mode(output: &mut String, operator: CompositingAndBlendingOperator) {
+    if operator != CompositingAndBlendingOperator::Normal {
+        write!(output, " blend_mode={}", operator as i32).unwrap();
+    }
+}
+
+fn line_style_name(style: LineStyle) -> &'static str {
+    match style {
+        LineStyle::Solid => "Solid",
+        LineStyle::Dotted => "Dotted",
+        LineStyle::Dashed => "Dashed",
+    }
+}
+
+fn scaling_mode_name(mode: ScalingMode) -> &'static str {
+    match mode {
+        ScalingMode::None => "None",
+        ScalingMode::Bilinear => "Bilinear",
+        ScalingMode::BilinearMipmap => "BilinearMipmap",
+        ScalingMode::NearestNeighbor => "NearestNeighbor",
+    }
+}
+
+fn write_inline_clip_radii(output: &mut String, radii: CornerRadii) {
+    if radii.has_any_radius() {
+        write!(
+            output,
+            " radii=({},{},{},{})",
+            radii.top_left.horizontal_radius,
+            radii.top_right.horizontal_radius,
+            radii.bottom_right.horizontal_radius,
+            radii.bottom_left.horizontal_radius
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::painting::display_list::builder::DisplayListBuilder;
+    use crate::painting::display_list::builder::{HEADER_SIZE, read_header};
+    use libgfx_rust::IntRect;
+
+    #[test]
+    fn command_dump_matches_the_canonical_format() {
+        use crate::painting::visual_context::{
+            ClipNodeData, ClipNodeIndex, EffectNodeData, EffectNodeIndex, TransformData, TransformDataRole,
+        };
+        let mut tree = VisualContextTree::create(TransformData {
+            matrix: libgfx_rust::FloatMatrix4x4::identity(),
+            origin: libgfx_rust::FloatPoint::default(),
+            sorting_context_root_index: None,
+            flattens_inherited_transform: false,
+            role: TransformDataRole::CssTransform,
+            synthetic_plane: false,
+            establishes_sorting_context: false,
+        });
+        let clip = tree.append_clip(
+            ClipNodeData::rect_clip(libgfx_rust::FloatRect::new(0.0, 0.0, 9.0, 9.0)),
+            ClipNodeIndex::NONE,
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let effect = tree.append_effect(
+            EffectNodeData::BackgroundColorAnimation,
+            EffectNodeIndex::NONE,
+            VISUAL_VIEWPORT_NODE_INDEX,
+            ClipNodeIndex::NONE,
+        );
+        let effect_only = ContextRef {
+            clip: ClipNodeIndex::NONE,
+            effect,
+            ..ContextRef::default()
+        };
+        let clip_and_effect = ContextRef {
+            clip,
+            effect,
+            ..ContextRef::default()
+        };
+        let fill = FillRect {
+            rect: IntRect::new(1, 2, 30, 40),
+            color: Color::from_rgba(101, 2, 0, 204),
+            compositing_and_blending_operator: CompositingAndBlendingOperator::Multiply,
+            background_color_animation_effect: EffectNodeIndex::NONE,
+        };
+        let dump = |context: ContextRef| {
+            let mut builder = DisplayListBuilder::new();
+            builder.append(
+                &fill,
+                &[],
+                ContextRef {
+                    spatial: SpatialNodeIndex(0),
+                    ..context
+                },
+            );
+            let bytes = builder.bytes();
+            let header = read_header(bytes);
+            let payload = &bytes[HEADER_SIZE..HEADER_SIZE + header.payload_size as usize];
+            let mut output = format!("{}@", header.command_type.name());
+            write_context(&mut output, header.context);
+            dump_command(&mut output, header.command_type, payload);
+            output
+        };
+        assert_eq!(
+            dump(clip_and_effect),
+            "FillRect@s0/c0/e0 rect=[1,2 30x40] color=rgba(101, 2, 0, 0.8) blend_mode=2"
+        );
+        assert_eq!(
+            dump(effect_only),
+            "FillRect@s0/e0 rect=[1,2 30x40] color=rgba(101, 2, 0, 0.8) blend_mode=2"
+        );
+        assert_eq!(
+            dump(ContextRef::default()),
+            "FillRect@s0 rect=[1,2 30x40] color=rgba(101, 2, 0, 0.8) blend_mode=2"
+        );
+    }
+}

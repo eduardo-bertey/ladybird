@@ -14,7 +14,7 @@
 #include <LibWeb/Bindings/WebGLRenderingContextBase.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -31,8 +31,9 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/Infra/SerializedURL.h>
-#include <LibWeb/Layout/CanvasBox.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/WebGL/WebGL2RenderingContext.h>
@@ -102,8 +103,8 @@ void HTMLCanvasElement::apply_presentational_hints(Vector<CSS::StyleProperty>& p
 
     // https://html.spec.whatwg.org/multipage/rendering.html#map-to-the-aspect-ratio-property
     // if element has both attributes w and h, and parsing those attributes' values using the rules for parsing non-negative integers doesn't generate an error for either
-    auto w = parse_non_negative_integer(get_attribute_value_view(HTML::AttributeNames::width).value_or({}));
-    auto h = parse_non_negative_integer(get_attribute_value_view(HTML::AttributeNames::height).value_or({}));
+    auto w = parse_non_negative_integer(attribute(HTML::AttributeNames::width).value_or({}));
+    auto h = parse_non_negative_integer(attribute(HTML::AttributeNames::height).value_or({}));
 
     // then the user agent is expected to use the parsed integers as a presentational hint for the 'aspect-ratio' property of the form auto w / h.
     if (w.has_value() && h.has_value()) {
@@ -215,6 +216,7 @@ void HTMLCanvasElement::notify_context_about_canvas_size_change()
         [](Empty) {
             // Do nothing.
         });
+    Painting::push_canvas_paint_facts(*this);
 }
 
 void HTMLCanvasElement::set_width(unsigned value)
@@ -248,9 +250,9 @@ void HTMLCanvasElement::attribute_changed(Utf16FlyString const& local_name, Opti
     }
 }
 
-RefPtr<Layout::Node> HTMLCanvasElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+Layout::Node* HTMLCanvasElement::create_layout_node(CSS::LayoutStyle style)
 {
-    return make_ref_counted<Layout::CanvasBox>(document(), *this, style);
+    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::CanvasBox);
 }
 
 HTMLCanvasElement::HasOrCreatedContext HTMLCanvasElement::create_2d_context(CanvasRenderingContext2DSettings context_attributes)
@@ -464,28 +466,29 @@ void HTMLCanvasElement::set_canvas_content_dirty()
 
 void HTMLCanvasElement::prepare_for_compositing()
 {
-    if (!m_canvas_content_dirty)
-        return;
-    m_canvas_content_dirty = false;
+    if (m_canvas_content_dirty) {
+        m_canvas_content_dirty = false;
 
-    // NB: The content generation is recorded into DrawCanvas display list commands, letting display list damage
-    //     computation see that the canvas content changed. Canvases are prepared for compositing before painting
-    //     in the rendering update, so display lists recorded in the same update pick up the new generation.
-    ++m_content_generation;
+        // NB: The content generation is recorded into DrawCanvas display list commands, letting display list damage
+        //     computation see that the canvas content changed. Canvases are prepared for compositing before painting
+        //     in the rendering update, so display lists recorded in the same update pick up the new generation.
+        ++m_content_generation;
 
-    m_context.visit(
-        [](GC::Ref<CanvasRenderingContext2D>& context) {
-            context->prepare_for_compositing();
-        },
-        [](GC::Ref<WebGL::WebGLRenderingContext>& context) {
-            context->prepare_for_compositing();
-        },
-        [](GC::Ref<WebGL::WebGL2RenderingContext>& context) {
-            context->prepare_for_compositing();
-        },
-        [](Empty) {
-            // Do nothing.
-        });
+        m_context.visit(
+            [](GC::Ref<CanvasRenderingContext2D>& context) {
+                context->prepare_for_compositing();
+            },
+            [](GC::Ref<WebGL::WebGLRenderingContext>& context) {
+                context->prepare_for_compositing();
+            },
+            [](GC::Ref<WebGL::WebGL2RenderingContext>& context) {
+                context->prepare_for_compositing();
+            },
+            [](Empty) {
+                // Do nothing.
+            });
+    }
+    Painting::push_canvas_paint_facts(*this);
 }
 
 void HTMLCanvasElement::notify_compositor_backing_storage_lost()

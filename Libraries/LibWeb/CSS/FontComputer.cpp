@@ -10,19 +10,18 @@
 
 #include "FontComputer.h"
 #include <AK/Platform.h>
+#include <AK/ScopeGuard.h>
 #include <LibGC/RootHashTable.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/Font/TypefaceSkia.h>
-#include <LibWeb/CSS/CSSFontFaceRule.h>
-#include <LibWeb/CSS/CSSFontFeatureValuesRule.h>
-#include <LibWeb/CSS/CSSGroupingRule.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Fetch.h>
-#include <LibWeb/CSS/FontFace.h>
 #include <LibWeb/CSS/FontFaceSet.h>
+#include <LibWeb/CSS/FontFaceState.h>
 #include <LibWeb/CSS/FontLoading.h>
+#include <LibWeb/CSS/RustFontFeatureValues.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/CSS/StyleValues/CustomIdentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StringStyleValue.h>
@@ -54,11 +53,13 @@ struct Traits<Web::CSS::ComputedFontCacheKey> : public DefaultTraits<Web::CSS::C
     static unsigned hash(Web::CSS::ComputedFontCacheKey const& key)
     {
         unsigned hash = 0;
-        for (auto const& family_value : key.font_family->as_value_list().values()) {
-            if (family_value->is_keyword())
-                hash = pair_int_hash(hash, to_underlying(family_value->as_keyword().keyword()));
-            else
-                hash = string_from_style_value(family_value).hash();
+        for (auto const& family : key.font_families) {
+            if (family.has<Web::CSS::GenericFontFamily>()) {
+                hash = pair_int_hash(hash, to_underlying(family.get<Web::CSS::GenericFontFamily>()));
+            } else {
+                auto const& name = family.get<Web::CSS::ComputedFontFamilyName>();
+                hash = pair_int_hash(hash, pair_int_hash(name.name.hash(), to_underlying(name.syntax)));
+            }
         }
 
         hash = pair_int_hash(hash, to_underlying(key.font_optical_sizing));
@@ -78,11 +79,16 @@ struct Traits<Web::CSS::ComputedFontCacheKey> : public DefaultTraits<Web::CSS::C
 
 namespace Web::CSS {
 
-FontLoader::FontLoader(FontComputer& font_computer, RuleOrDeclaration rule_or_declaration, Utf16FlyString family_name, Vector<Gfx::UnicodeRange> unicode_ranges, Vector<URL> urls, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load)
+FontComputer::FontComputer(DOM::Document& document)
+    : m_document(document)
+{
+}
+
+FontComputer::~FontComputer() = default;
+
+FontLoader::FontLoader(FontComputer& font_computer, RuleOrDeclaration rule_or_declaration, Vector<URL> urls, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load)
     : m_font_computer(font_computer)
     , m_rule_or_declaration(rule_or_declaration)
-    , m_family_name(move(family_name))
-    , m_unicode_ranges(move(unicode_ranges))
     , m_urls(move(urls))
 {
     if (on_load)
@@ -117,18 +123,34 @@ bool FontLoader::is_loading() const
     return m_fetch_controller && !m_typeface;
 }
 
-RefPtr<Gfx::Font const> FontLoader::font_with_point_size(float point_size, Gfx::FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features)
+bool FontLoader::may_finish_from_cache() const
 {
-    if (!m_typeface) {
-        if (!m_fetch_controller)
-            start_loading_next_url();
-        return nullptr;
-    }
-    return m_typeface->font(point_size, variations, shape_features);
+    return !m_fetch_controller || !m_fetch_controller->requires_network();
+}
+
+bool FontLoader::has_started_request() const
+{
+    return m_fetch_controller && m_fetch_controller->has_started_request();
+}
+
+void FontLoader::did_request_for_rendering()
+{
+    // INTEROP: Delay the document load event til the fetch for this font has settled. Blink, Gecko, and WebKit all
+    //          keep the document from completing while a font load requested for rendering is pending — so pages
+    //          that measure font-dependent geometry in a load-event handler see the loaded font, not a fallback.
+    if (is_loading() && !m_document_load_event_delayer.has_value())
+        m_document_load_event_delayer.emplace(m_font_computer->document());
 }
 
 void FontLoader::start_loading_next_url()
 {
+    // A loader that has settled must not consume another URL: its typeface is final, and fetching a
+    // further src would replace it after subscribers already saw the settled one. load_font_face()
+    // hands back an existing loader for a shared first URL, so a second FontFace can reach here after
+    // the first one finished.
+    if (m_has_completed)
+        return;
+
     // FIXME: Load local() fonts somehow.
     if (m_fetch_controller && m_fetch_controller->state() == Fetch::Infrastructure::FetchController::State::Ongoing)
         return;
@@ -139,6 +161,7 @@ void FontLoader::start_loading_next_url()
     // To fetch a font given a selected <url> url for @font-face rule, fetch url, with ruleOrDeclaration being rule,
     // destination "font", CORS mode "cors", and processResponse being the following steps given response res and null,
     // failure or a byte stream stream:
+    m_has_received_font_data = false;
     m_fetch_controller = fetch_a_style_resource(m_urls.take_first(), m_rule_or_declaration, Fetch::Infrastructure::Request::Destination::Font, CorsMode::Cors,
         [loader = this](auto response, auto stream) {
             // 1. If stream is null, return.
@@ -154,6 +177,7 @@ void FontLoader::start_loading_next_url()
                 }
                 return;
             }
+            loader->m_has_received_font_data = true;
             auto bytes = immutable_bytes->copy_to_byte_buffer().release_value_but_fixme_should_propagate_errors();
 
             auto mime_type_essence = loader->try_load_font_mime_type_essence(response, bytes);
@@ -207,11 +231,12 @@ void FontLoader::start_loading_next_url()
 
 void FontLoader::font_did_load_or_fail(RefPtr<Gfx::Typeface const> typeface)
 {
-    if (typeface) {
+    if (typeface)
         m_typeface = typeface.release_nonnull();
-        m_font_computer->clear_computed_font_cache(m_family_name);
-    }
     m_has_completed = true;
+    m_document_load_event_delayer.clear();
+    // Each subscriber publishes its now-loaded FontFace to FontComputer. The face's complete
+    // descriptors are needed to compare the old and new selections, so invalidation happens there.
     for (auto& callback : m_subscribers)
         callback->function()(m_typeface);
     m_subscribers.clear();
@@ -287,7 +312,7 @@ struct FontComputer::MatchingFontCandidate {
     unsigned width { Gfx::FontWidth::Normal };
     Gfx::Typeface const* system_typeface { nullptr };
 
-    [[nodiscard]] RefPtr<Gfx::FontCascadeList const> font_with_point_size(HashMap<FontFaceKey, Vector<GC::Ref<FontFace>>> const& font_faces, float point_size, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values) const
+    [[nodiscard]] RefPtr<Gfx::FontCascadeList const> font_with_point_size(HashMap<FontFaceKey, Vector<NonnullRefPtr<FontFaceState>>> const& font_faces, float point_size, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values) const
     {
         auto const& shape_features = font_feature_data.to_shape_features(font_feature_values);
 
@@ -303,6 +328,15 @@ struct FontComputer::MatchingFontCandidate {
 
         auto font_list = Gfx::FontCascadeList::create();
         for (auto const& face : it->value) {
+            // https://drafts.csswg.org/css-font-loading/#font-face-load
+            // User agents can initiate font loads on their own, whenever they determine that a given font face is
+            // necessary to render something on the page. When this happens, they must act as if they had called the
+            // corresponding FontFace’s load() method described here.
+            // NB: An unloaded face with no subsetting unicode-range starts loading once a style actually selects
+            //     it. Loading happens via FontFace::load(). The font_with_point_size() call below then observes the
+            //     fetch in flight — and so delays the document load event until the fetch has settled.
+            if (face->has_urls() && !face->has_non_default_unicode_range() && face->status() == FontFaceLoadStatus::Unloaded)
+                face->load_for_style();
             if (auto face_fonts = face->font_with_point_size(point_size, variations, shape_features)) {
                 font_list->extend(*face_fonts);
                 continue;
@@ -310,9 +344,9 @@ struct FontComputer::MatchingFontCandidate {
             // Unloaded subset face: surface it as a pending entry so the fetch only
             // fires once font_for_code_point() sees a codepoint in its unicode-range.
             if (face->has_urls() && face->has_non_default_unicode_range()) {
-                GC::Root<FontFace> rooted_face(*face);
+                auto rooted_face = GC::make_root(face->keep_alive_during_load());
                 font_list->add_pending_face(face->unicode_ranges(), [rooted_face = move(rooted_face)] {
-                    const_cast<FontFace&>(*rooted_face).load();
+                    return rooted_face->elements().first()->resolve_for_rendering();
                 });
             }
         }
@@ -365,7 +399,6 @@ RefPtr<Gfx::FontCascadeList const> FontComputer::font_matching_algorithm(Utf16Fl
     // If a font family match occurs, the user agent assembles the set of font faces in that family and then
     // narrows the set to a single face using other font properties in the order given below.
     Vector<MatchingFontCandidate> matching_family_fonts;
-    // FIXME: URL-backed faces with no typeface yet should trigger a load on demand, matching other engines.
     for (auto const& [map_key, faces] : m_font_faces) {
         if (map_key.family_name.equals_ignoring_ascii_case(family_name)) {
             matching_family_fonts.empend(map_key);
@@ -482,14 +515,38 @@ HashMap<FontFeatureValueKey, Vector<u32>> const& FontComputer::font_feature_valu
         // single block), the last-defined one is used.
 
         // FIXME: We only account for Author stylesheets here, we should also account for UserAgent and User
-        m_document->style_scope().for_each_active_css_style_sheet([&](CSS::CSSStyleSheet const& sheet) {
-            sheet.for_each_effective_rule(TraversalOrder::Preorder, [&](auto const& rule) {
-                if (auto const* font_feature_values_rule = as_if<CSSFontFeatureValuesRule>(rule)) {
-                    if (!font_feature_values_rule->font_families().contains_slow(family_name))
-                        return;
-
-                    font_feature_values.update(font_feature_values_rule->to_hash_map());
+        m_document->style_scope().for_each_active_css_style_sheet([&](CSS::StyleSheetState const& sheet) {
+            sheet.for_each_effective_rule_data(TraversalOrder::Preorder, [&](RustRuleView const& rule, Utf16View) {
+                if (rule.type() != RustRule::Type::FontFeatureValues)
+                    return;
+                auto values = rule.font_feature_values();
+                bool matches_family = false;
+                for (size_t index = 0; index < values.family_count(); ++index) {
+                    if (values.family_at(index) == family_name.view()) {
+                        matches_family = true;
+                        break;
+                    }
                 }
+                if (!matches_family)
+                    return;
+
+                auto append = [&](FontFeatureValuesRuleKind kind, FontFeatureValueType type) {
+                    values.for_each_entry(kind, [&](auto key, auto values) {
+                        Vector<u32> copy;
+                        copy.append(values.data(), values.size());
+                        font_feature_values.set({ type, Utf16FlyString::from_utf16(key) }, move(copy));
+                    });
+                };
+                append(FontFeatureValuesRuleKind::Annotation, FontFeatureValueType::Annotation);
+                append(FontFeatureValuesRuleKind::Ornaments, FontFeatureValueType::Ornaments);
+                append(FontFeatureValuesRuleKind::Stylistic, FontFeatureValueType::Stylistic);
+                append(FontFeatureValuesRuleKind::Swash, FontFeatureValueType::Swash);
+                append(FontFeatureValuesRuleKind::CharacterVariant, FontFeatureValueType::CharacterVariant);
+                append(FontFeatureValuesRuleKind::Styleset, FontFeatureValueType::Styleset);
+
+                // NB: We don't include historical-forms since it can't be referenced - it seems like it's inclusion in the syntax
+                //     for @font-feature-values was a mistake and isn't supported by Chrome or Firefox. See
+                //     https://github.com/w3c/csswg-drafts/issues/9926#issuecomment-2017241274
             });
         });
 
@@ -499,10 +556,10 @@ HashMap<FontFeatureValueKey, Vector<u32>> const& FontComputer::font_feature_valu
     return m_font_feature_values_cache.get(family_name).value();
 }
 
-NonnullRefPtr<Gfx::FontCascadeList const> FontComputer::compute_font_for_style_values(StyleValue const& font_family, CSSPixels const& font_size, int font_slope, double font_weight, Percentage const& font_width, FontOpticalSizing font_optical_sizing, HashMap<Utf16FlyString, double> const& font_variation_settings, FontFeatureData const& font_feature_data) const
+NonnullRefPtr<Gfx::FontCascadeList const> FontComputer::compute_font_for_style_values(Vector<ComputedFontFamily> font_families, CSSPixels const& font_size, int font_slope, double font_weight, Percentage const& font_width, FontOpticalSizing font_optical_sizing, HashMap<Utf16FlyString, double> const& font_variation_settings, FontFeatureData const& font_feature_data) const
 {
     ComputedFontCacheKey cache_key {
-        .font_family = font_family,
+        .font_families = move(font_families),
         .font_optical_sizing = font_optical_sizing,
         .font_size = font_size,
         .font_slope = font_slope,
@@ -513,11 +570,31 @@ NonnullRefPtr<Gfx::FontCascadeList const> FontComputer::compute_font_for_style_v
     };
 
     return m_computed_font_cache.ensure(cache_key, [&]() {
-        return compute_font_for_style_values_impl(font_family, font_size, font_slope, font_weight, font_width, font_optical_sizing, font_variation_settings, font_feature_data);
+        return compute_font_for_style_values_impl(cache_key.font_families.span(), font_size, font_slope, font_weight, font_width, font_optical_sizing, font_variation_settings, font_feature_data);
     });
 }
 
-NonnullRefPtr<Gfx::FontCascadeList const> FontComputer::compute_font_for_style_values_impl(StyleValue const& font_family, CSSPixels const& font_size, int slope, double font_weight, Percentage const& font_width, FontOpticalSizing font_optical_sizing, HashMap<Utf16FlyString, double> const& font_variation_settings, FontFeatureData const& font_feature_data) const
+NonnullRefPtr<Gfx::FontCascadeList const> FontComputer::compute_font_for_style_values(StyleValue const& font_family, CSSPixels const& font_size, int font_slope, double font_weight, Percentage const& font_width, FontOpticalSizing font_optical_sizing, HashMap<Utf16FlyString, double> const& font_variation_settings, FontFeatureData const& font_feature_data) const
+{
+    Vector<ComputedFontFamily> font_families;
+    auto const& values = font_family.as_value_list().values();
+    font_families.ensure_capacity(values.size());
+    for (auto const& value : values) {
+        if (value->is_keyword()) {
+            auto generic_family = keyword_to_generic_font_family(value->to_keyword());
+            VERIFY(generic_family.has_value());
+            font_families.unchecked_append(generic_family.release_value());
+        } else {
+            font_families.unchecked_append(ComputedFontFamilyName {
+                .name = string_from_style_value(value),
+                .syntax = value->is_string() ? ComputedFontFamilySyntax::String : ComputedFontFamilySyntax::CustomIdent,
+            });
+        }
+    }
+    return compute_font_for_style_values(move(font_families), font_size, font_slope, font_weight, font_width, font_optical_sizing, font_variation_settings, font_feature_data);
+}
+
+NonnullRefPtr<Gfx::FontCascadeList const> FontComputer::compute_font_for_style_values_impl(ReadonlySpan<ComputedFontFamily const> font_families, CSSPixels const& font_size, int slope, double font_weight, Percentage const& font_width, FontOpticalSizing font_optical_sizing, HashMap<Utf16FlyString, double> const& font_variation_settings, FontFeatureData const& font_feature_data) const
 {
     // FIXME: We round to int here as that is what is expected by our font infrastructure below
     auto weight = round_to<int>(font_weight);
@@ -551,7 +628,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> FontComputer::compute_font_for_style_v
     auto find_macos_system_ui_font = [&](Gfx::SystemUIFontKind kind, Utf16FlyString const& family) -> RefPtr<Gfx::FontCascadeList const> {
         auto const& font_feature_values = font_feature_values_for_family(family);
         auto shape_features = font_feature_data.to_shape_features(font_feature_values);
-        auto typeface = Gfx::TypefaceSkia::match_system_ui(kind, font_size_used_value, weight, font_width.value(), slope);
+        auto typeface = Gfx::TypefaceSkia::match_system_ui(kind, font_size_used_value, weight, font_width_bucket_from_percentage(font_width.value()), slope);
         if (typeface.is_error() || !typeface.value())
             return {};
 
@@ -597,7 +674,8 @@ NonnullRefPtr<Gfx::FontCascadeList const> FontComputer::compute_font_for_style_v
         return {};
     };
 
-    auto find_generic_font = [&](Keyword font_id) -> RefPtr<Gfx::FontCascadeList const> {
+    auto find_generic_font = [&](GenericFontFamily family) -> RefPtr<Gfx::FontCascadeList const> {
+        auto font_id = to_keyword(family);
 #ifdef AK_OS_MACOS
         if (auto system_ui_font_kind = macos_system_ui_font_kind_from_family_name(string_from_keyword(font_id)); system_ui_font_kind.has_value()) {
             auto family = utf16_fly_string_from_keyword(font_id);
@@ -644,12 +722,12 @@ NonnullRefPtr<Gfx::FontCascadeList const> FontComputer::compute_font_for_style_v
 
     auto font_list = Gfx::FontCascadeList::create();
 
-    for (auto const& family : font_family.as_value_list().values()) {
+    for (auto const& family : font_families) {
         RefPtr<Gfx::FontCascadeList const> other_font_list;
-        if (family->is_keyword()) {
-            other_font_list = find_generic_font(family->to_keyword());
+        if (family.has<GenericFontFamily>()) {
+            other_font_list = find_generic_font(family.get<GenericFontFamily>());
         } else {
-            other_font_list = find_font(string_from_style_value(family));
+            other_font_list = find_font(family.get<ComputedFontFamilyName>().name);
         }
 
         if (other_font_list)
@@ -695,11 +773,11 @@ NonnullRefPtr<Gfx::FontCascadeList const> FontComputer::compute_font_for_style_v
 Gfx::Font const& FontComputer::initial_font() const
 {
     // FIXME: This is not correct.
-    static auto const& font = ComputedProperties::font_fallback(false, false, 12).leak_ref();
+    static auto const& font = Platform::FontPlugin::the().default_font(12).release_nonnull().leak_ref();
     return font;
 }
 
-static bool style_value_references_font_family(StyleValue const& font_family_value, Utf16FlyString const& family_name)
+static bool style_value_references_any_font_family(StyleValue const& font_family_value, Vector<Utf16FlyString> const& family_names)
 {
     if (!font_family_value.is_value_list())
         return false;
@@ -710,40 +788,64 @@ static bool style_value_references_font_family(StyleValue const& font_family_val
 
         auto item_family_name = string_from_style_value(*item);
 
-        if (item_family_name.equals_ignoring_ascii_case(family_name))
+        if (any_of(family_names, [&](auto const& family_name) { return item_family_name.equals_ignoring_ascii_case(family_name); }))
             return true;
     }
     return false;
 }
 
-static bool computed_values_reference_font_family(ComputedValues const& computed_values, Utf16FlyString const& family_name)
+static bool computed_font_families_reference_any_family(ReadonlySpan<ComputedFontFamily const> font_families, Vector<Utf16FlyString> const& family_names)
 {
-    for (auto const& family : computed_values.font_families()) {
-        if (auto const* name = family.get_pointer<ComputedFontFamilyName>(); name && name->name.equals_ignoring_ascii_case(family_name))
-            return true;
-    }
-    return false;
+    return any_of(font_families, [&](ComputedFontFamily const& family) {
+        return family.has<ComputedFontFamilyName>()
+            && any_of(family_names, [&](auto const& family_name) { return family.get<ComputedFontFamilyName>().name.equals_ignoring_ascii_case(family_name); });
+    });
+}
+
+static bool font_values_reference_any_font_family(ComputedValues::FontValues const& font_values, Vector<Utf16FlyString> const& family_names)
+{
+    auto font_family = font_values.font_family_style_value();
+    return font_family && style_value_references_any_font_family(*font_family, family_names);
 }
 
 void FontComputer::clear_computed_font_cache(Utf16FlyString const& family_name)
 {
+    Vector<Utf16FlyString> family_names;
+    family_names.append(family_name);
+    clear_computed_font_cache_for_families(family_names);
+}
+
+static void record_font_input_change(DOM::Element& element)
+{
+    if (auto* record = element.style_input_record())
+        record->font_environment_changed = true;
+    constexpr u8 font_group = 1u << ComputedValues::FontValues::style_group_index;
+    element.document().style_computer().style_engine().record_element_style_input_change(
+        element.style_node_id(), StyleEngine::PublishedStyle | StyleEngine::RecomputeStyle | StyleEngine::FontInputsChanged, font_group);
+}
+
+void FontComputer::clear_computed_font_cache_for_families(Vector<Utf16FlyString> const& family_names)
+{
+    VERIFY(!family_names.is_empty());
+    ++m_environment_generation;
+
     // Only clear cache entries that reference the loaded font family.
     m_computed_font_cache.remove_all_matching([&](auto const& key, auto const&) {
-        return style_value_references_font_family(key.font_family, family_name);
+        return computed_font_families_reference_any_family(key.font_families, family_names);
     });
 
     auto element_uses_font_family = [&](DOM::Element const& element) {
         // Check the element's own font-family.
-        if (auto style = element.computed_values()) {
-            if (computed_values_reference_font_family(*style, family_name))
+        if (auto const* values = element.style_group<ComputedValues::FontValues>()) {
+            if (font_values_reference_any_font_family(*values, family_names))
                 return true;
         }
 
         // Check pseudo-elements, which may use a different font-family than the element itself.
         bool synthetic_pseudo_element_uses_font_family = false;
-        element.for_each_synthetic_pseudo_element([&](Web::CSS::PseudoElement, Web::DOM::SyntheticPseudoElement const& pseudo_element) {
-            if (auto style = pseudo_element.computed_values()) {
-                if (computed_values_reference_font_family(*style, family_name)) {
+        element.for_each_synthetic_pseudo_element([&](Web::CSS::PseudoElement pseudo_element, Web::DOM::SyntheticPseudoElement const&) {
+            if (auto const* values = element.style_group<ComputedValues::FontValues>(pseudo_element)) {
+                if (font_values_reference_any_font_family(*values, family_names)) {
                     synthetic_pseudo_element_uses_font_family = true;
                     return IterationDecision::Break;
                 }
@@ -754,25 +856,14 @@ void FontComputer::clear_computed_font_cache(Utf16FlyString const& family_name)
         return synthetic_pseudo_element_uses_font_family;
     };
 
-    if (document().needs_full_style_update())
-        return;
-
-    // Walk the DOM tree (including shadow trees) and invalidate elements that use this font family.
+    // Walk the DOM tree (including shadow trees) and publish inputs for elements that use this font family.
     document().for_each_shadow_including_inclusive_descendant([&](DOM::Node& node) {
         auto* element = as_if<DOM::Element>(node);
         if (!element)
             return TraversalDecision::Continue;
 
-        // If this element's subtree is already marked for style update, skip the entire subtree.
-        if (element->entire_subtree_needs_style_update())
-            return TraversalDecision::SkipChildrenAndContinue;
-
-        // If this element already needs a style update, check descendants but don't re-check this element.
-        if (element->needs_style_update())
-            return TraversalDecision::Continue;
-
         if (element_uses_font_family(*element)) {
-            element->set_needs_style_update(true);
+            record_font_input_change(*element);
             return TraversalDecision::Continue;
         }
 
@@ -785,12 +876,105 @@ void FontComputer::clear_font_feature_values_cache(Utf16FlyString const& family_
     m_font_feature_values_cache.remove(family_name);
 }
 
+bool FontComputer::should_defer_initial_paint()
+{
+    if (m_has_completed_initial_paint)
+        return false;
+    bool has_pending_fonts = false;
+    // OPTIMIZATION: Finish cache lookups and decode cache-resident fonts before the first paint. A cache miss
+    //               releases this wait before any network activity; subsequent paints use the font display timeline.
+    for (auto const& entry : m_font_faces) {
+        for (auto const& face : entry.value) {
+            if (face->is_pending_rendering_from_cache())
+                return true;
+            has_pending_fonts |= face->has_pending_rendering();
+        }
+    }
+    m_initial_paint_had_pending_fonts = has_pending_fonts;
+    m_has_completed_initial_paint = true;
+    return false;
+}
+
 void FontComputer::did_load_font(Utf16FlyString const& family_name)
 {
+    if (m_font_face_change_batch_depth > 0) {
+        if (!any_of(m_batched_font_face_change_families, [&](auto const& existing_family_name) { return existing_family_name.equals_ignoring_ascii_case(family_name); }))
+            m_batched_font_face_change_families.append(family_name);
+        return;
+    }
+
     clear_computed_font_cache(family_name);
 }
 
-void FontComputer::register_font_face(GC::Ref<FontFace> face)
+void FontComputer::did_load_font(FontFaceKey const& changed_face)
+{
+    if (m_font_face_change_batch_depth > 0) {
+        did_load_font(changed_face.family_name);
+        return;
+    }
+
+    ++m_environment_generation;
+    // A family can contain many faces, but one face becoming available changes only the cached
+    // selections which now resolve to it. Compare those selections before discarding their cache
+    // entries, then find the elements holding the discarded cascade identities.
+    HashTable<Gfx::FontCascadeList const*> invalidated_font_lists;
+    Vector<NonnullRefPtr<Gfx::FontCascadeList const>> invalidated_font_lists_kept_alive_for_the_walk;
+    m_computed_font_cache.remove_all_matching([&](auto const& key, auto const& font_list) {
+        if (!any_of(key.font_families, [&](ComputedFontFamily const& family) {
+                return family.has<ComputedFontFamilyName>()
+                    && family.get<ComputedFontFamilyName>().name.equals_ignoring_ascii_case(changed_face.family_name);
+            }))
+            return false;
+        auto updated_font_list = compute_font_for_style_values_impl(key.font_families, key.font_size, key.font_slope, key.font_weight, key.font_width, key.font_optical_sizing, key.font_variation_settings, key.font_feature_data);
+        if (!font_list->has_pending_faces() && font_list->equals(*updated_font_list))
+            return false;
+        invalidated_font_lists.set(font_list.ptr());
+        invalidated_font_lists_kept_alive_for_the_walk.append(font_list);
+        return true;
+    });
+    if (invalidated_font_lists.is_empty())
+        return;
+
+    document().for_each_shadow_including_inclusive_descendant([&](DOM::Node& node) {
+        auto* element = as_if<DOM::Element>(node);
+        if (!element)
+            return TraversalDecision::Continue;
+        auto uses_invalidated_font_list = [&](Optional<CSS::PseudoElement> pseudo_element = {}) {
+            auto const* values = element->style_group<ComputedValues::FontValues>(pseudo_element);
+            return values && invalidated_font_lists.contains(&values->font_list_value());
+        };
+        bool should_recompute = uses_invalidated_font_list();
+        element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement pseudo_element, DOM::SyntheticPseudoElement const&) {
+            if (uses_invalidated_font_list(pseudo_element)) {
+                should_recompute = true;
+                return IterationDecision::Break;
+            }
+            return IterationDecision::Continue;
+        });
+        if (should_recompute)
+            record_font_input_change(*element);
+        return TraversalDecision::Continue;
+    });
+}
+
+void FontComputer::begin_font_face_change_batch()
+{
+    ++m_font_face_change_batch_depth;
+}
+
+void FontComputer::end_font_face_change_batch()
+{
+    VERIFY(m_font_face_change_batch_depth > 0);
+    --m_font_face_change_batch_depth;
+
+    if (m_font_face_change_batch_depth > 0 || m_batched_font_face_change_families.is_empty())
+        return;
+
+    clear_computed_font_cache_for_families(m_batched_font_face_change_families);
+    m_batched_font_face_change_families.clear();
+}
+
+void FontComputer::register_font_face(NonnullRefPtr<FontFaceState> face)
 {
     VERIFY(face->should_be_registered_with_font_computer());
 
@@ -803,10 +987,10 @@ void FontComputer::register_font_face(GC::Ref<FontFace> face)
     auto& faces = m_font_faces.ensure(key);
     if (!faces.contains_slow(face))
         faces.append(face);
-    did_load_font(key.family_name);
+    did_load_font(key);
 }
 
-void FontComputer::unregister_font_face(GC::Ref<FontFace> face)
+void FontComputer::unregister_font_face(NonnullRefPtr<FontFaceState> face)
 {
     VERIFY(face->should_be_registered_with_font_computer());
 
@@ -821,10 +1005,40 @@ void FontComputer::unregister_font_face(GC::Ref<FontFace> face)
         if (it->value.is_empty())
             m_font_faces.remove(it);
     }
-    did_load_font(key.family_name);
+    did_load_font(key);
 }
 
-GC::Ptr<FontLoader> FontComputer::load_font_face(ParsedFontFace const& font_face, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load)
+void FontComputer::synchronize_font_face_order(Vector<NonnullRefPtr<FontFaceState>> const& font_source_order)
+{
+    for (auto& entry : m_font_faces) {
+        Vector<NonnullRefPtr<FontFaceState>> ordered_faces;
+        for (auto& font_face : font_source_order) {
+            if (entry.value.contains_slow(font_face))
+                ordered_faces.append(font_face);
+        }
+        for (auto& font_face : entry.value) {
+            if (!ordered_faces.contains_slow(font_face))
+                ordered_faces.append(font_face);
+        }
+
+        bool order_changed = ordered_faces.size() != entry.value.size();
+        if (!order_changed) {
+            for (size_t index = 0; index < entry.value.size(); ++index) {
+                if (ordered_faces[index] != entry.value[index]) {
+                    order_changed = true;
+                    break;
+                }
+            }
+        }
+        if (!order_changed)
+            continue;
+
+        entry.value = move(ordered_faces);
+        did_load_font(entry.key.family_name);
+    }
+}
+
+GC::Ptr<FontLoader> FontComputer::load_font_face(ParsedFontFace const& font_face, RefPtr<StyleSheetState> parent_style_sheet, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load)
 {
     if (font_face.sources().is_empty()) {
         if (on_load)
@@ -848,7 +1062,7 @@ GC::Ptr<FontLoader> FontComputer::load_font_face(ParsedFontFace const& font_face
     RuleOrDeclaration rule_or_declaration {
         .environment_settings_object = document().relevant_settings_object(),
         .value = RuleOrDeclaration::Rule {
-            .parent_style_sheet = font_face.parent_rule()->parent_style_sheet(),
+            .parent_style_sheet = parent_style_sheet,
         },
         .style_resource_base_url = {},
         .parent_style_sheet_origin_clean = {},
@@ -861,84 +1075,98 @@ GC::Ptr<FontLoader> FontComputer::load_font_face(ParsedFontFace const& font_face
         return it->value;
     }
 
-    auto loader = GC::Heap::the().allocate<FontLoader>(*this, rule_or_declaration, font_face.font_family(), font_face.unicode_ranges(), move(urls), move(on_load));
+    auto loader = GC::Heap::the().allocate<FontLoader>(*this, rule_or_declaration, move(urls), move(on_load));
     m_loaders_by_url.set(move(key), loader);
     return loader;
 }
 
-static bool is_font_rule(CSSRule const& rule)
+static void for_each_nested_font_rule(Parser::ValueParserFFI::NativeRuleList const* rules, Function<void(RustRuleView const&)> const& callback)
 {
-    return is<CSSFontFaceRule>(rule) || is<CSSFontFeatureValuesRule>(rule);
+    Parser::ValueParserFFI::rust_rule_list_visit_font_rules(rules, &callback, [](void const* context, Parser::ValueParserFFI::NativeRuleView const* rule) {
+        (*static_cast<Function<void(RustRuleView const&)> const*>(context))(RustRuleView { *rule });
+    });
 }
 
-static void for_each_nested_font_rule(CSSRuleList& rules, Function<void(CSSRule&)> const& callback)
+static void clear_font_feature_values_caches(RustRuleView const& rule, FontComputer& font_computer)
 {
-    for (auto& rule : rules) {
-        if (is_font_rule(*rule))
-            callback(*rule);
-
-        if (auto* grouping_rule = as_if<CSSGroupingRule>(*rule))
-            for_each_nested_font_rule(grouping_rule->css_rules(), callback);
+    auto values = rule.font_feature_values();
+    for (size_t index = 0; index < values.family_count(); ++index) {
+        auto family = Utf16FlyString::from_utf16(values.family_at(index));
+        font_computer.clear_computed_font_cache(family);
+        font_computer.clear_font_feature_values_cache(family);
     }
 }
 
-static void for_each_effective_font_rule(CSSStyleSheet& sheet, Function<void(CSSRule&)> const& callback)
+void FontComputer::load_fonts_from_sheet(StyleSheetState& sheet)
 {
-    GC::RootHashTable<CSSRule const*> effective_font_rules;
-    sheet.for_each_effective_rule(TraversalOrder::Preorder, [&](CSSRule const& rule) {
-        // Imported sheets are attached and load their fonts separately.
-        if (rule.parent_style_sheet() == &sheet && is_font_rule(rule))
-            effective_font_rules.set(&rule);
-    });
+    begin_font_face_change_batch();
+    ScopeGuard finish_font_face_change_batch = [&] {
+        end_font_face_change_batch();
+    };
 
-    for_each_nested_font_rule(sheet.rules(), [&](CSSRule& rule) {
-        if (effective_font_rules.contains(&rule))
-            callback(rule);
-    });
-}
+    HashTable<u64> effective_font_rules;
+    bool ancestors_match = true;
+    for (auto* ancestor = &sheet; ancestor; ancestor = ancestor->parent_style_sheet()) {
+        if (ancestor->disabled() || !ancestor->native_media_list().matches()) {
+            ancestors_match = false;
+            break;
+        }
+    }
+    if (ancestors_match) {
+        sheet.for_each_effective_rule_data(TraversalOrder::Preorder, [&](RustRuleView const& rule, Utf16View) {
+            // Only this sheet's rules are connected below. Imported sheets synchronize separately.
+            if (rule.type() == RustRule::Type::FontFace)
+                effective_font_rules.set(rule.identity());
+        });
+    }
 
-void FontComputer::load_fonts_from_sheet(CSSStyleSheet& sheet)
-{
-    for_each_effective_font_rule(sheet, [&](auto& rule) {
-        if (auto* font_face_rule = as_if<CSSFontFaceRule>(rule)) {
-            if (!font_face_rule->is_valid())
+    for_each_nested_font_rule(sheet.native_rules().handle(), [&](RustRuleView const& rule) {
+        if (rule.type() == RustRule::Type::FontFace) {
+            auto descriptors = rule.descriptors();
+            auto should_be_css_connected = effective_font_rules.contains(rule.identity())
+                && descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::FontFamily))
+                && descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::Src));
+            auto connected_font_face = sheet.css_connected_font_face(rule.identity());
+            if (!should_be_css_connected) {
+                if (connected_font_face)
+                    connected_font_face->disconnect_from_css_rule();
+                return;
+            }
+
+            if (connected_font_face)
                 return;
 
-            auto font_face = FontFace::create_css_connected(HTML::relevant_realm(document()), *font_face_rule);
+            // https://drafts.csswg.org/css-font-loading/#font-face-css-connection
+            // A CSS @font-face rule automatically defines a corresponding FontFace object, which is automatically
+            // placed in the document's font source when the rule is parsed. This FontFace object is CSS-connected.
+            auto font_face = FontFaceState::create_css_connected(HTML::relevant_realm(document()), rule.identity(), sheet);
             document().fonts()->add_css_connected_font(font_face);
-
-            if (font_face->has_non_default_unicode_range()) {
-                // Register for matching, but defer loading until a rendered codepoint
-                // actually falls in this face's unicode-range.
-                register_font_face(font_face);
-            } else {
-                // NB: Load via FontFace::load(), to satisfy this requirement:
-                // https://drafts.csswg.org/css-font-loading/#font-face-load
-                // User agents can initiate font loads on their own, whenever they determine that a given font face is
-                // necessary to render something on the page. When this happens, they must act as if they had called the
-                // corresponding FontFace’s load() method described here.
-                font_face->load();
-            }
         }
 
-        if (auto* font_feature_values_rule = as_if<CSSFontFeatureValuesRule>(rule))
-            font_feature_values_rule->clear_caches();
+        if (rule.type() == RustRule::Type::FontFeatureValues)
+            clear_font_feature_values_caches(rule, *this);
     });
+
+    document().fonts()->synchronize_css_connected_font_order();
 }
 
-void FontComputer::unload_fonts_from_sheet(CSSStyleSheet& sheet)
+void FontComputer::unload_fonts_from_sheet(StyleSheetState& sheet)
 {
+    begin_font_face_change_batch();
+    ScopeGuard finish_font_face_change_batch = [&] {
+        end_font_face_change_batch();
+    };
+
     // https://drafts.csswg.org/css-font-loading/#font-face-css-connection
     // If a @font-face rule is removed from the document, its connected FontFace object is no longer CSS-connected.
-    for_each_nested_font_rule(sheet.rules(), [&](auto& rule) {
-        if (auto* font_face_rule = as_if<CSSFontFaceRule>(rule)) {
-            if (auto font_face = font_face_rule->css_connected_font_face())
-                unregister_font_face(*font_face);
-            font_face_rule->disconnect_font_face();
+    for_each_nested_font_rule(sheet.native_rules().handle(), [&](RustRuleView const& rule) {
+        if (rule.type() == RustRule::Type::FontFace) {
+            if (auto font_face = sheet.css_connected_font_face(rule.identity()))
+                font_face->disconnect_from_css_rule();
         }
 
-        if (auto* font_feature_values_rule = as_if<CSSFontFeatureValuesRule>(rule))
-            font_feature_values_rule->clear_caches();
+        if (rule.type() == RustRule::Type::FontFeatureValues)
+            clear_font_feature_values_caches(rule, *this);
     });
 }
 

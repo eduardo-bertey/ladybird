@@ -1,5 +1,5 @@
 {
-  "builtin-baseline": "40f3c709db80acf154ac4b17a1f83c564ebd022e",
+  "builtin-baseline": "7f3781e19cc7d4e4882a4caec01668c6f7b5c163",
   "dependencies": [
     {
       "name": "angle",
@@ -97,7 +97,6 @@
       "platform": "linux | windows | osx"
     },
     "libjpeg-turbo",
-    "libjxl",
     {
       "name": "libpng",
       "features": [
@@ -310,10 +309,6 @@
       "version": "10.2.0#0"
     },
     {
-      "name": "highway",
-      "version": "1.4.0#0"
-    },
-    {
       "name": "icu",
       "version": "78.3#1"
     },
@@ -332,10 +327,6 @@
     {
       "name": "libjpeg-turbo",
       "version": "3.2.0#0"
-    },
-    {
-      "name": "libjxl",
-      "version": "0.11.2#0"
     },
     {
       "name": "libpng",
@@ -407,7 +398,7 @@
     },
     {
       "name": "simdutf",
-      "version": "9.0.0#0"
+      "version": "9.1.0#0"
     },
     {
       "name": "skia",

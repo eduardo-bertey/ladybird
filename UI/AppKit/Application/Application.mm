@@ -9,17 +9,22 @@
 #include <LibCore/EventLoop.h>
 #include <LibCore/ThreadEventQueue.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/SessionStore.h>
 #include <LibWebView/URL.h>
+#include <LibWebView/Utilities.h>
 #include <LibWebView/ViewImplementation.h>
 #include <Utilities/Conversions.h>
+#include <Utilities/ExternalURLHandler.h>
 
 #import <Application/Application.h>
 #import <Application/ApplicationDelegate.h>
+#import <Application/ClipboardTypes.h>
 #import <Interface/BookmarksBar.h>
 #import <Interface/LadybirdWebView.h>
 #import <Interface/LocationSearchField.h>
 #import <Interface/Tab.h>
 #import <Interface/TabController.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #if !__has_feature(objc_arc)
 #    error "This project requires ARC"
@@ -36,7 +41,17 @@ Core::EventLoop& Application::create_platform_event_loop()
         [::Application sharedApplication];
     }
 
-    return WebView::Application::create_platform_event_loop();
+    auto& event_loop = WebView::Application::create_platform_event_loop();
+
+    if (!browser_options().headless_mode.has_value())
+        static_cast<EventLoopImplementationMacOS&>(event_loop.impl()).set_main_loop();
+
+    return event_loop;
+}
+
+Optional<String> Application::ui_font_family() const
+{
+    return ns_string_to_string([[NSFont systemFontOfSize:[NSFont systemFontSize]] familyName]);
 }
 
 Optional<WebView::ViewImplementation&> Application::active_web_view() const
@@ -130,6 +145,11 @@ void Application::open_url_in_new_window(URL::URL const& url, WebView::IsPrivate
                      tabLocation:TabLocation::end()];
 }
 
+void Application::resolve_external_url_handler(URL::URL const& url, WebView::ExternalURLHandlerCallback callback) const
+{
+    Ladybird::resolve_external_url_handler(url, move(callback));
+}
+
 Optional<ByteString> Application::ask_user_for_download_path(ByteString const& file) const
 {
     auto* panel = [NSSavePanel savePanel];
@@ -210,28 +230,39 @@ Utf16String Application::clipboard_text(ClipboardType) const
     return {};
 }
 
-Vector<Web::Clipboard::SystemClipboardRepresentation> Application::clipboard_entries() const
+Web::Clipboard::SystemClipboardItem Application::clipboard_item() const
 {
     Vector<Web::Clipboard::SystemClipboardRepresentation> representations;
     auto* paste_board = [NSPasteboard generalPasteboard];
 
-    for (NSPasteboardType type : [paste_board types]) {
-        String mime_type;
+    auto* file_list = [paste_board readObjectsForClasses:@[ [NSURL class] ]
+                                                 options:@{NSPasteboardURLReadingFileURLsOnlyKey : @YES}];
 
-        if (type == NSPasteboardTypeString)
-            mime_type = "text/plain"_string;
-        else if (type == NSPasteboardTypeHTML)
-            mime_type = "text/html"_string;
-        else if (type == NSPasteboardTypePNG)
-            mime_type = "image/png"_string;
-        else
-            continue;
+    for (NSURL* url in file_list) {
+        auto file_path = Ladybird::ns_string_to_byte_string([url path]);
 
-        auto data = Ladybird::ns_data_to_string([paste_board dataForType:type]);
-        representations.empend(move(data), move(mime_type));
+        if (auto file = WebView::create_selected_file(file_path); file.is_error()) {
+            warnln("Unable to open clipboard file {}: {}", file_path, file.error());
+        } else if (auto* resource_values = [url resourceValuesForKeys:@[ NSURLContentTypeKey ] error:nil]) {
+            UTType* content_type = resource_values[NSURLContentTypeKey];
+
+            if (auto* mime_type = [content_type preferredMIMEType])
+                representations.empend(Ladybird::ns_string_to_string(mime_type), file.release_value());
+        }
     }
 
-    return representations;
+    if (representations.is_empty()) {
+        for (NSPasteboardType type : [paste_board types]) {
+            auto mime_type = Ladybird::mime_type_for_pasteboard_type(type);
+            if (!mime_type.has_value())
+                continue;
+
+            auto data = Ladybird::ns_data_to_string([paste_board dataForType:type]);
+            representations.empend(mime_type.release_value(), move(data));
+        }
+    }
+
+    return { move(representations) };
 }
 
 void Application::insert_clipboard_item(Web::Clipboard::SystemClipboardItem item)
@@ -240,20 +271,14 @@ void Application::insert_clipboard_item(Web::Clipboard::SystemClipboardItem item
     [paste_board clearContents];
 
     for (auto const& entry : item.system_clipboard_representations) {
-        NSPasteboardType pasteboard_type = nil;
-
-        // https://w3c.github.io/clipboard-apis/#os-specific-well-known-format
-        if (entry.mime_type == "text/plain"sv)
-            pasteboard_type = NSPasteboardTypeString;
-        else if (entry.mime_type == "text/html"sv)
-            pasteboard_type = NSPasteboardTypeHTML;
-        else if (entry.mime_type == "image/png"sv)
-            pasteboard_type = NSPasteboardTypePNG;
-        else
+        NSPasteboardType pasteboard_type = Ladybird::pasteboard_type_for_mime_type(entry.name);
+        if (!pasteboard_type)
             continue;
 
-        [paste_board setData:Ladybird::string_to_ns_data(entry.data)
-                     forType:pasteboard_type];
+        if (auto const* data = entry.data.get_pointer<ByteString>()) {
+            [paste_board setData:Ladybird::string_to_ns_data(*data)
+                         forType:pasteboard_type];
+        }
     }
 }
 
@@ -358,7 +383,7 @@ static NonnullRefPtr<PromiseType> display_add_or_edit_bookmark_dialog(
     NSString* title,
     Optional<URL::URL const&> current_url,
     Optional<String const&> current_title,
-    Optional<String> current_favicon,
+    Optional<String> current_favicon_hash,
     ResolveCallback resolve_bookmark)
 {
     auto promise = PromiseType::construct();
@@ -391,7 +416,7 @@ static NonnullRefPtr<PromiseType> display_add_or_edit_bookmark_dialog(
                        WebView::BookmarkItem::Bookmark bookmark {
                            .url = url.release_value(),
                            .title = move(bookmark_title),
-                           .favicon_base64_png = current_favicon,
+                           .favicon_hash = current_favicon_hash,
                        };
                        resolve_bookmark(*promise, move(bookmark));
                    }];
@@ -405,19 +430,19 @@ NonnullRefPtr<Application::AddBookmarkPromise> Application::display_add_bookmark
 
     Optional<URL::URL> current_url;
     Optional<String> current_title;
-    Optional<String> current_favicon;
+    Optional<String> current_favicon_hash;
     Optional<String> copied_target_folder_id;
 
     if (auto view = active_web_view(); view.has_value()) {
         current_url = view->url();
         current_title = view->title().to_utf8();
-        current_favicon = view->favicon_base64_png();
+        current_favicon_hash = view->favicon_hash();
     }
     if (target_folder_id.has_value())
         copied_target_folder_id = *target_folder_id;
 
     return display_add_or_edit_bookmark_dialog<AddBookmarkPromise>(
-        [delegate activeTab], @"Add Bookmark", current_url, current_title, current_favicon,
+        [delegate activeTab], @"Add Bookmark", current_url, current_title, current_favicon_hash,
         [target_folder_id = move(copied_target_folder_id)](AddBookmarkPromise& promise, WebView::BookmarkItem::Bookmark bookmark) {
             promise.resolve(AddBookmarkDialogResult {
                 .bookmark = move(bookmark),
@@ -430,7 +455,7 @@ NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_d
 {
     ApplicationDelegate* delegate = [NSApp delegate];
     return display_add_or_edit_bookmark_dialog<BookmarkPromise>(
-        [delegate activeTab], @"Edit Bookmark", current_bookmark.url, current_bookmark.title, current_bookmark.favicon_base64_png,
+        [delegate activeTab], @"Edit Bookmark", current_bookmark.url, current_bookmark.title, current_bookmark.favicon_hash,
         [](BookmarkPromise& promise, WebView::BookmarkItem::Bookmark bookmark) {
             promise.resolve(move(bookmark));
         });
@@ -534,6 +559,9 @@ void Application::on_devtools_disabled() const
     if (![self confirmStopActiveDownloads])
         return;
 
+    ApplicationDelegate* delegate = [NSApp delegate];
+    [delegate reconcileSessionTopology];
+    WebView::Application::session_store(WebView::IsPrivate::No).application_quitting();
     Core::EventLoop::current().quit(0);
 }
 

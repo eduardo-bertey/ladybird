@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <script src="../include.js"></script>
 <script>
-    asyncTest(async done => {
+    promiseTest(async () => {
         const frame = document.createElement("iframe");
         document.body.append(frame);
 
@@ -17,8 +17,12 @@
 
         webSocket.onclose = () => {};
         frame.remove();
-        await internals.gcAsync();
-        println(`root after destroy: ${internals.hasActivityRoot(webSocket)}`);
-        done();
+        // Child destruction now completes asynchronously through the UI process.
+        let hasRoot = true;
+        for (let i = 0; i < 100 && hasRoot; ++i) {
+            await internals.gcAsync();
+            hasRoot = internals.hasActivityRoot(webSocket);
+        }
+        println(`root after destroy: ${hasRoot}`);
     });
 </script>

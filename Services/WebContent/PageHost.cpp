@@ -22,12 +22,12 @@ PageHost::PageHost(ConnectionFromClient& client)
 {
 }
 
-void PageHost::initialize(u64 initial_page_id, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator)
+void PageHost::initialize(u64 initial_page_id, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
     VERIFY(m_pages.is_empty());
     m_cross_process_id_allocator = cross_process_id_allocator;
     auto& first_page = create_page(initial_page_id, root_navigable_id);
-    Web::HTML::LocalTraversableNavigable::create_a_fresh_top_level_traversable(first_page.page(), URL::about_blank());
+    Web::HTML::LocalTraversableNavigable::create_a_fresh_top_level_traversable(first_page.page(), URL::about_blank(), Empty {}, move(initial_history_entry), system_visibility_state);
 }
 
 PageClient& PageHost::create_page(u64 page_id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id)
@@ -52,12 +52,6 @@ Web::HTML::CrossProcessId PageHost::allocate_navigable_id()
 void PageHost::remove_page(Badge<PageClient>, u64 page_id)
 {
     m_pages.remove(page_id);
-}
-
-void PageHost::close_webdriver_connections_after_sending_pending_messages()
-{
-    for (auto& page : m_pages)
-        page.value->close_webdriver_connection_after_sending_pending_messages();
 }
 
 Optional<PageClient&> PageHost::page(u64 page_id)

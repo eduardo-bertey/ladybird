@@ -19,8 +19,10 @@
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/WebDriver/ElementReference.h>
 
 namespace Web::WebDriver {
@@ -266,17 +268,17 @@ bool is_element_pointer_interactable(Web::HTML::BrowsingContext const& browsing_
     if (!document)
         return false;
 
-    auto paint_root = document->paintable_box();
-    if (!paint_root)
+    auto const* layout_root = document->layout_node();
+    if (!layout_root || !Painting::has_committed_box(*layout_root))
         return false;
 
-    auto viewport = browsing_context.page().top_level_traversable()->viewport_rect();
+    auto viewport = as<HTML::LocalNavigable>(*browsing_context.page().top_level_traversable()).viewport_rect();
     auto center_point_or_error = in_view_center_point(element, viewport);
     if (center_point_or_error.is_error())
         return false;
     auto center_point = center_point_or_error.release_value();
 
-    auto result = const_cast<DOM::Document&>(*document).hit_test(center_point, Painting::HitTestType::Exact);
+    auto result = const_cast<DOM::Document&>(*document).hit_test(center_point);
     if (!result.has_value())
         return false;
 
@@ -380,7 +382,8 @@ bool is_element_in_view(ReadonlySpan<GC::Ref<Web::DOM::Element>> paint_tree, Web
 {
     // An element is in view if it is a member of its own pointer-interactable paint tree, given the pretense that its
     // pointer events are not disabled.
-    if (!element.paintable() || !element.paintable()->is_visible() || !element.paintable()->visible_for_hit_testing())
+    auto const* layout_node = element.layout_node();
+    if (!layout_node || !Painting::has_committed_box(*layout_node) || !Painting::is_visible(*layout_node) || !Painting::visible_for_hit_testing(*layout_node))
         return false;
 
     return paint_tree.contains_slow(GC::Ref { element });
@@ -409,7 +412,7 @@ GC::RootVector<GC::Ref<Web::DOM::Element>> pointer_interactable_tree(Web::HTML::
         return GC::RootVector<GC::Ref<Web::DOM::Element>> {};
 
     // 4. Let center point be the in-view center point of the first indexed element in rectangles.
-    auto viewport = browsing_context.page().top_level_traversable()->viewport_rect();
+    auto viewport = as<HTML::LocalNavigable>(*browsing_context.page().top_level_traversable()).viewport_rect();
     auto center_point_or_error = Web::WebDriver::in_view_center_point(element, viewport);
     if (center_point_or_error.is_error())
         return GC::RootVector<GC::Ref<Web::DOM::Element>> {};

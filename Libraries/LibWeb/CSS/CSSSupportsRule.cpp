@@ -13,20 +13,20 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSSupportsRule);
 
-GC::Ref<CSSSupportsRule> CSSSupportsRule::create(NonnullRefPtr<Supports>&& supports, CSSRuleList& rules)
+GC::Ref<CSSSupportsRule> CSSSupportsRule::create(RustRule rule, CSSRuleList& rules)
 {
-    return GC::Heap::the().allocate<CSSSupportsRule>(move(supports), rules);
+    return GC::Heap::the().allocate<CSSSupportsRule>(move(rule), rules);
 }
 
-CSSSupportsRule::CSSSupportsRule(NonnullRefPtr<Supports>&& supports, CSSRuleList& rules)
-    : CSSConditionRule(rules, Type::Supports)
-    , m_supports(move(supports))
+CSSSupportsRule::CSSSupportsRule(RustRule rule, CSSRuleList& rules)
+    : CSSConditionRule(rules, move(rule))
+    , m_supports(RustQueryHandle::retained(native_rule().payload().supports))
 {
 }
 
 Utf16String CSSSupportsRule::serialized_condition_text() const
 {
-    return m_supports->to_string();
+    return serialize_supports_condition(m_supports);
 }
 
 // https://www.w3.org/TR/cssom-1/#serialize-a-css-rule
@@ -56,7 +56,7 @@ void CSSSupportsRule::dump(StringBuilder& builder, int indent_levels) const
 {
     Base::dump(builder, indent_levels);
 
-    supports().dump(builder, indent_levels + 1);
+    dump_supports_condition(builder, supports(), indent_levels + 1);
 
     dump_indent(builder, indent_levels + 1);
     builder.appendff("Rules ({}):\n", css_rules().length());

@@ -12,6 +12,7 @@
 #include <LibCore/System.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibWebView/Process.h>
+#include <LibWebView/ProcessManager.h>
 
 #include <fcntl.h>
 
@@ -34,10 +35,20 @@ Process::Process(ProcessType type, RefPtr<IPC::ConnectionBase> connection, Core:
 {
 }
 
+void Process::save_crash_report(Optional<int> exit_status)
+{
+    if (m_crash_report && exit_status.has_value()) {
+        if (auto result = m_crash_report->save(*exit_status); result.is_error())
+            warnln("Could not save {} crash report: {}", process_name_from_type(m_type), result.error());
+    }
+    m_crash_report = nullptr;
+}
+
 Process::~Process()
 {
-    if (m_connection)
-        m_connection->shutdown();
+    // shutdown() can release the connection's last owner while dispatching die().
+    if (auto connection = m_connection.strong_ref())
+        connection->shutdown();
 }
 
 ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(Core::ProcessSpawnOptions const& options, bool capture_output)
@@ -70,6 +81,9 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(C
     auto port_a_send = TRY(port_a_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
     auto port_b_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
     auto port_b_send = TRY(port_b_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
+
+    // The child may receive startup messages before it has constructed its transport.
+    IPC::TransportMachPort::raise_receive_queue_limit(port_b_recv);
 
     Sync::MutexLocker child_registration_locker(Application::transport_bootstrap_server().child_registration_lock());
     auto process = TRY(Core::Process::spawn(spawn_options));

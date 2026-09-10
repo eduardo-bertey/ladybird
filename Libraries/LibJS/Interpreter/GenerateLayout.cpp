@@ -10,11 +10,14 @@
 #include <AK/Format.h>
 #include <AK/StringBase.h>
 #include <AK/Utf16StringData.h>
+#include <LibGC/HeapRegion.h>
 #include <LibGC/PrimitiveStorage.h>
 #include <LibJS/Bytecode/Builtins.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Bytecode/PropertyNameIterator.h>
 #include <LibJS/Bytecode/PutKind.h>
+#include <LibJS/Interpreter/SlowPathResult.h>
+#include <LibJS/Runtime/Accessor.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/DeclarativeEnvironment.h>
 #include <LibJS/Runtime/ECMAScriptFunctionObject.h>
@@ -90,6 +93,10 @@ int main()
     EMIT_FIELD(OBJECT_INDEXED_ARRAY_LIKE_SIZE, Object, indexed_array_like_size, u32, Object, m_indexed_array_like_size, 4, nullable, scalar);
     EMIT_SIZEOF(OBJECT_SIZE, Object);
 
+    // Accessor layout
+    outln("\n# Accessor layout");
+    EMIT_FIELD(ACCESSOR_GETTER, Accessor, getter, FunctionObject, Accessor, m_getter, 8, nullable, cell);
+
     // Object flags
     outln("\n# Object flags");
     EMIT_FIELD(OBJECT_FLAGS, Object, flags, u16, Object, m_flags, 2, nullable, scalar);
@@ -99,6 +106,8 @@ int main()
     outln("const OBJECT_FLAG_IS_FUNCTION = {}", Object::Flag::IsFunction);
     outln("const OBJECT_FLAG_IS_ECMASCRIPT_FUNCTION_OBJECT = {}", Object::Flag::IsECMAScriptFunctionObject);
     outln("const OBJECT_FLAG_IS_RAW_NATIVE_FUNCTION = {}", Object::Flag::IsRawNativeFunction);
+    outln("const OBJECT_FLAG_IS_DIRECT_GETTER_FUNCTION = {}", Object::Flag::IsDirectGetterFunction);
+    outln("const OBJECT_FLAG_IS_GLOBAL_OBJECT = {}", Object::Flag::IsGlobalObject);
 
     // Shape layout
     outln("\n# Shape layout");
@@ -110,13 +119,16 @@ int main()
     // PropertyLookupCache layout
     outln("\n# PropertyLookupCache layout");
     EMIT_OFFSET(PROPERTY_LOOKUP_CACHE_DATA, PropertyLookupCache, m_data);
-    outln("const PROPERTY_LOOKUP_CACHE_DATA_POINTER_MASK = 0x{:X}", ~PropertyLookupCache::polymorphic_data_tag);
+    outln("const PROPERTY_LOOKUP_CACHE_DATA_POINTER_MASK = 0x{:X}", ~PropertyLookupCache::cache_data_tag_mask);
     EMIT_SIZEOF(PROPERTY_LOOKUP_CACHE_SIZE, PropertyLookupCache);
 
     // PropertyLookupCache::Entry layout
     outln("\n# PropertyLookupCache::Entry layout");
+    EMIT_FIELD(PROPERTY_LOOKUP_CACHE_ENTRY_TYPE, PropertyLookupCache, entry_type, u32, PropertyLookupCache::Entry, type, 4, nullable, scalar);
+    outln("const PROPERTY_LOOKUP_CACHE_ENTRY_TYPE_GET_MISSING_PROPERTY = {}", to_underlying(PropertyLookupCache::Entry::Type::GetMissingProperty));
     EMIT_PAIRED_FIELD(PROPERTY_LOOKUP_CACHE_ENTRY_PROPERTY_OFFSET, PropertyLookupCache, property_offset, u32, PropertyLookupCache::Entry, property_offset, 4, scalar, cache_details);
     EMIT_PAIRED_FIELD(PROPERTY_LOOKUP_CACHE_ENTRY_DICTIONARY_GENERATION, PropertyLookupCache, shape_dictionary_generation, u32, PropertyLookupCache::Entry, shape_dictionary_generation, 4, scalar, cache_details);
+    EMIT_FIELD(PROPERTY_LOOKUP_CACHE_ENTRY_DIRECT_GETTER_VALIDATED, PropertyLookupCache, direct_getter_validated, bool, PropertyLookupCache::Entry, direct_getter_validated, 1, nullable, scalar);
     EMIT_OFFSET(PROPERTY_LOOKUP_CACHE_ENTRY_FROM_SHAPE, PropertyLookupCache::Entry, from_shape);
     EMIT_PAIRED_FIELD(PROPERTY_LOOKUP_CACHE_ENTRY_SHAPE, PropertyLookupCache, shape, Shape, PropertyLookupCache::Entry, shape, 8, cell, cache_target);
     EMIT_PAIRED_FIELD(PROPERTY_LOOKUP_CACHE_ENTRY_PROTOTYPE, PropertyLookupCache, prototype, Object, PropertyLookupCache::Entry, prototype, 8, cell, cache_target);
@@ -152,6 +164,8 @@ int main()
     EMIT_FIELD(PROPERTY_NAME_ITERATOR_SHAPE_DICTIONARY_GENERATION, PropertyNameIterator, shape_dictionary_generation, u32, PropertyNameIterator, m_shape_dictionary_generation, 4, nullable, scalar);
     EMIT_FIELD(PROPERTY_NAME_ITERATOR_FAST_PATH, PropertyNameIterator, fast_path, u8, PropertyNameIterator, m_fast_path, 1, nullable, scalar);
 
+    outln("const SLOW_PATH_CONTINUATION_BIT = {}", slow_path_continuation_bit);
+
     // Executable layout
     outln("\n# Executable layout");
     EMIT_OFFSET(EXECUTABLE_CONSTANTS, Executable, constants);
@@ -177,6 +191,7 @@ int main()
     EMIT_FIELD(EXECUTION_CONTEXT_YIELD_IS_AWAIT, ExecutionContext, yield_is_await, bool, ExecutionContext, yield_is_await, 1, nullable, scalar);
     EMIT_FIELD(EXECUTION_CONTEXT_YIELD_VALUE_IS_ITERATOR_RESULT, ExecutionContext, yield_value_is_iterator_result, bool, ExecutionContext, yield_value_is_iterator_result, 1, nullable, scalar);
     EMIT_FIELD(EXECUTION_CONTEXT_CALLER_IS_CONSTRUCT, ExecutionContext, caller_is_construct, bool, ExecutionContext, caller_is_construct, 1, nullable, scalar);
+    EMIT_FIELD(EXECUTION_CONTEXT_FRAME_INITIALIZED, ExecutionContext, frame_initialized, bool, ExecutionContext, frame_initialized, 1, nullable, scalar);
     EMIT_PAIRED_FIELD(EXECUTION_CONTEXT_THIS_VALUE, ExecutionContext, this_value, Value, ExecutionContext, this_value, 8, scalar, this_and_executable);
     EMIT_PAIRED_FIELD(EXECUTION_CONTEXT_EXECUTABLE, ExecutionContext, executable, Executable, ExecutionContext, executable, 8, cell, this_and_executable);
     EMIT_FIELD(EXECUTION_CONTEXT_CALLER_FRAME, ExecutionContext, caller_frame, ExecutionContext, ExecutionContext, caller_frame, 8, nullable, scalar);
@@ -184,6 +199,7 @@ int main()
     EMIT_PAIRED_FIELD(EXECUTION_CONTEXT_CALLER_RETURN_PC, ExecutionContext, caller_return_pc, u32, ExecutionContext, caller_return_pc, 4, scalar, caller_return);
     EMIT_PAIRED_FIELD(EXECUTION_CONTEXT_CALLER_DST_RAW, ExecutionContext, caller_dst_raw, u32, ExecutionContext, caller_dst_raw, 4, scalar, caller_return);
     EMIT_FIELD(EXECUTION_CONTEXT_PROGRAM_COUNTER, ExecutionContext, program_counter, u32, ExecutionContext, program_counter, 4, nullable, scalar);
+    EMIT_FIELD(EXECUTION_CONTEXT_FRAME_ID, ExecutionContext, frame_id, u64, ExecutionContext, frame_id, 8, nullable, scalar);
     EMIT_PAIRED_FIELD(EXECUTION_CONTEXT_REGISTERS_AND_CONSTANTS_AND_LOCALS_AND_ARGUMENTS_COUNT, ExecutionContext, slot_count, u32, ExecutionContext, registers_and_constants_and_locals_and_arguments_count, 4, scalar, counts);
     EMIT_PAIRED_FIELD(EXECUTION_CONTEXT_ARGUMENT_COUNT, ExecutionContext, argument_count, u32, ExecutionContext, argument_count, 4, scalar, counts);
     EMIT_SIZEOF(SIZEOF_EXECUTION_CONTEXT, ExecutionContext);
@@ -207,6 +223,7 @@ int main()
     outln("\n# InterpreterStack layout");
     EMIT_OFFSET(INTERPRETER_STACK_LIMIT, InterpreterStack, m_limit);
     EMIT_OFFSET(INTERPRETER_STACK_TOP, InterpreterStack, m_top);
+    EMIT_OFFSET(INTERPRETER_STACK_NEXT_FRAME_ID, InterpreterStack, m_next_frame_id);
 
     // Realm layout
     outln("\n# Realm layout");
@@ -221,16 +238,20 @@ int main()
     EMIT_OFFSET(VM_STACK_INFO, VM, m_stack_info);
     EMIT_OFFSET(VM_EXECUTION_GENERATION, VM, m_execution_generation);
     EMIT_OFFSET(VM_PRIMITIVE_STORAGE_CAGE_BASE, VM, m_primitive_storage_cage_base);
+    EMIT_OFFSET(VM_HEAP_REGION_BASE, VM, m_heap_region_base);
     EMIT_OFFSET(VM_NATIVE_FUNCTION_TABLE_DATA, VM, m_native_function_table_data);
     EMIT_OFFSET(VM_BREAKPOINT_CONTROLLER, VM, m_debugger);
     outln("field VM.primitive_storage_cage_base u64 VM_PRIMITIVE_STORAGE_CAGE_BASE nonnull scalar");
+    outln("field VM.heap_region_base u64 VM_HEAP_REGION_BASE nonnull scalar");
     outln("field VM.native_function_table Sequence<NativeFunctionTableEntry> VM_NATIVE_FUNCTION_TABLE_DATA nonnull scalar");
     outln("const VM_INTERPRETER_STACK_TOP = {}", offsetof(VM, m_interpreter_stack) + offsetof(InterpreterStack, m_top));
     outln("const VM_INTERPRETER_STACK_LIMIT = {}", offsetof(VM, m_interpreter_stack) + offsetof(InterpreterStack, m_limit));
+    outln("const VM_INTERPRETER_STACK_NEXT_FRAME_ID = {}", offsetof(VM, m_interpreter_stack) + offsetof(InterpreterStack, m_next_frame_id));
     outln("const VM_STACK_INFO_BASE = {}", offsetof(VM, m_stack_info) + offsetof(StackInfo, m_base));
     outln("field VM.running_execution_context ExecutionContext VM_RUNNING_EXECUTION_CONTEXT nullable scalar");
     outln("field VM.interpreter_stack_top u64 VM_INTERPRETER_STACK_TOP nonnull scalar interpreter_stack_bounds");
     outln("field VM.interpreter_stack_limit u64 VM_INTERPRETER_STACK_LIMIT nonnull scalar interpreter_stack_bounds");
+    outln("field VM.interpreter_stack_next_frame_id u64 VM_INTERPRETER_STACK_NEXT_FRAME_ID nonnull scalar");
     outln("field VM.stack_base u64 VM_STACK_INFO_BASE nullable scalar");
 #if defined(HAS_ADDRESS_SANITIZER)
     outln("const VM_STACK_SPACE_LIMIT = {}", 96 * KiB);
@@ -359,6 +380,13 @@ int main()
     outln("field NativeFunctionTableEntry.function u64 NATIVE_FUNCTION_TABLE_ENTRY_FUNCTION nonnull scalar native_function_table_entry stride {}", sizeof(NativeFunctionTableEntry));
     outln("field NativeFunctionTableEntry.type u32 NATIVE_FUNCTION_TABLE_ENTRY_TYPE nullable scalar native_function_table_entry");
 
+    // DirectGetterFunction layout
+    outln("\n# DirectGetterFunction layout");
+    EMIT_FIELD(DIRECT_GETTER_FUNCTION_WRAPPER_IMPLEMENTATION_WORD_OFFSET, DirectGetterFunction, wrapper_implementation_word_offset, u32, DirectGetterFunction, m_wrapper_implementation_word_offset, 4, nullable, scalar);
+    EMIT_FIELD(DIRECT_GETTER_FUNCTION_IMPLEMENTATION_VALUE_WORD_OFFSET, DirectGetterFunction, implementation_value_word_offset, u32, DirectGetterFunction, m_implementation_value_word_offset, 4, nullable, scalar);
+    EMIT_FIELD(DIRECT_GETTER_FUNCTION_MAIN_WORLD_WRAPPER_WORD_OFFSET, DirectGetterFunction, main_world_wrapper_word_offset, u32, DirectGetterFunction, m_main_world_wrapper_word_offset, 4, nullable, scalar);
+    EMIT_FIELD(DIRECT_GETTER_FUNCTION_WEAK_IMPL_VALUE_WORD_OFFSET, DirectGetterFunction, weak_impl_value_word_offset, u32, DirectGetterFunction, m_weak_impl_value_word_offset, 4, nullable, scalar);
+
     // ECMAScriptFunctionObject layout
     outln("\n# ECMAScriptFunctionObject layout");
     EMIT_FIELD(ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA, ECMAScriptFunctionObject, shared_data, SharedFunctionInstanceData, ECMAScriptFunctionObject, m_shared_data, 8, nonnull, cell);
@@ -404,9 +432,12 @@ int main()
 
     // Utf16StringData layout
     outln("\n# Utf16StringData layout");
-    EMIT_OFFSET(UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS, AK::Detail::Utf16StringData, m_length_in_code_units);
+    EMIT_OFFSET(UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS, AK::Detail::Utf16StringData, m_header.length_in_code_units);
+    EMIT_OFFSET(UTF16_STRING_DATA_FLAGS, AK::Detail::Utf16StringData, m_header.flags);
     outln("const UTF16_STRING_DATA_STRING_STORAGE = {}", AK::Detail::Utf16StringData::offset_of_string_storage());
-    outln("field Utf16StringData.length_in_code_units u64 UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS nullable scalar");
+    outln("const UTF16_STRING_DATA_HAS_UTF16_STORAGE = {}", static_cast<u32>(AK::Detail::Utf16StringData::HasUtf16Storage));
+    outln("field Utf16StringData.length_in_code_units u32 UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS nullable scalar");
+    outln("field Utf16StringData.flags u32 UTF16_STRING_DATA_FLAGS nullable scalar");
     outln("field Utf16StringData.string_storage Sequence<u8> UTF16_STRING_DATA_STRING_STORAGE embedded scalar");
 
     // Environment layout
@@ -458,6 +489,7 @@ int main()
     EMIT_FIELD(TYPED_ARRAY_CACHED_DATA_OFFSET, Object, typed_array_cached_data_offset, u64, TypedArrayBase, m_cached_data_offset, 8, nullable, scalar);
     outln("const TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID = 0x{:X}", static_cast<size_t>(TypedArrayBase::invalid_cached_data_offset));
     outln("const PRIMITIVE_STORAGE_CAGE_OFFSET_MASK = 0x{:X}", static_cast<size_t>(GC::PrimitiveStorage::cage_offset_mask));
+    outln("const HEAP_REGION_OFFSET_MASK = 0x{:X}", static_cast<size_t>(GC::HEAP_REGION_OFFSET_MASK));
 
     // ByteLength (Variant<Auto, Detached, u32>) layout
     outln("\n# ByteLength layout");
@@ -516,6 +548,7 @@ int main()
     outln("const BOOLEAN_TRUE = 0x{:X}", static_cast<u64>((BOOLEAN_TAG << GC::TAG_SHIFT) | 1));
     outln("const BOOLEAN_FALSE = 0x{:X}", static_cast<u64>(BOOLEAN_TAG << GC::TAG_SHIFT));
     outln("const UNDEFINED_SHIFTED = 0x{:X}", static_cast<u64>(UNDEFINED_TAG << GC::TAG_SHIFT));
+    outln("const NULL_VALUE = 0x{:X}", static_cast<u64>(NULL_TAG << GC::TAG_SHIFT));
     outln("const EMPTY_TAG_SHIFTED = 0x{:X}", static_cast<u64>(EMPTY_TAG << GC::TAG_SHIFT));
     outln("const NAN_BASE_TAG = 0x{:X}", static_cast<u64>(GC::BASE_TAG));
     outln("const CANON_NAN_BITS = 0x{:X}", static_cast<u64>(GC::CANON_NAN_BITS));

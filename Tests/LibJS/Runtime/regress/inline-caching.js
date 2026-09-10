@@ -91,3 +91,119 @@ test("Modifying prototype in dictionary mode should cause prototype-chain validi
     });
     f(obj, 123);
 });
+
+test("Static property lookup cache invalidates missing own properties", () => {
+    const object = {
+        valueOf() {
+            return 1;
+        },
+    };
+
+    for (let i = 0; i < 10; ++i) expect(+object).toBe(1);
+
+    object[Symbol.toPrimitive] = () => 2;
+    expect(+object).toBe(2);
+});
+
+test("Static property lookup cache invalidates missing prototype properties", () => {
+    const prototype = {
+        valueOf() {
+            return 1;
+        },
+    };
+    const object = Object.create(prototype);
+
+    for (let i = 0; i < 10; ++i) expect(+object).toBe(1);
+
+    prototype[Symbol.toPrimitive] = () => 2;
+    expect(+object).toBe(2);
+});
+
+test("GetById cache invalidates missing own properties", () => {
+    function read_value(object) {
+        return object.value;
+    }
+
+    const object = {};
+    for (let i = 0; i < 10; ++i) expect(read_value(object)).toBeUndefined();
+
+    object.value = 42;
+    expect(read_value(object)).toBe(42);
+});
+
+test("GetById cache invalidates missing prototype properties", () => {
+    function read_value(object) {
+        return object.value;
+    }
+
+    const prototype = {};
+    const object = Object.create(prototype);
+    for (let i = 0; i < 10; ++i) expect(read_value(object)).toBeUndefined();
+
+    prototype.value = 42;
+    expect(read_value(object)).toBe(42);
+});
+
+test("GetById cache invokes prototype getters with the receiver", () => {
+    function read_value(object) {
+        return object.value;
+    }
+
+    const prototype = {
+        get value() {
+            return this.payload;
+        },
+    };
+    const object = Object.create(prototype);
+    object.payload = 42;
+
+    for (let i = 0; i < 10; ++i) expect(read_value(object)).toBe(42);
+});
+
+test("GetById cache propagates getter exceptions to the caller", () => {
+    function read_value(object) {
+        return object.value;
+    }
+
+    let should_throw = false;
+    const object = {
+        get value() {
+            if (should_throw) throw new Error("boom");
+            return 42;
+        },
+    };
+
+    for (let i = 0; i < 10; ++i) expect(read_value(object)).toBe(42);
+    should_throw = true;
+    expect(() => read_value(object)).toThrowWithMessage(Error, "boom");
+    should_throw = false;
+    expect(read_value(object)).toBe(42);
+});
+
+test("GetById cache invokes raw native getters with the receiver", () => {
+    function read_size(object) {
+        return object.size;
+    }
+
+    const map = new Map([
+        ["a", 1],
+        ["b", 2],
+    ]);
+    for (let i = 0; i < 10; ++i) expect(read_size(map)).toBe(2);
+
+    map.set("c", 3);
+    expect(read_size(map)).toBe(3);
+});
+
+test("GetById cache propagates raw native getter exceptions", () => {
+    function read_size(object) {
+        return object.size;
+    }
+
+    const invalid_map = Object.create(Map.prototype);
+    for (let i = 0; i < 10; ++i) {
+        expect(() => read_size(invalid_map)).toThrow(TypeError);
+    }
+
+    expect(read_size(new Map([["a", 1]]))).toBe(1);
+});

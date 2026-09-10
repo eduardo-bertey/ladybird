@@ -9,6 +9,7 @@
 #include <AK/HashMap.h>
 #include <AK/String.h>
 #include <AK/Utf16FlyString.h>
+#include <AK/Utf16String.h>
 #include <LibWeb/Export.h>
 
 namespace Web::CSS::Parser {
@@ -29,26 +30,10 @@ struct UnknownRuleError {
     unsigned hash() const { return rule_name.hash(); }
 };
 
-struct UnknownMediaFeatureError {
-    Utf16FlyString media_feature_name;
-    bool operator==(UnknownMediaFeatureError const&) const = default;
-    unsigned hash() const { return media_feature_name.hash(); }
-};
-
-struct UnknownPseudoClassOrElementError {
-    Utf16FlyString rule_name { "style"_utf16_fly_string };
-    Utf16FlyString name;
-    bool operator==(UnknownPseudoClassOrElementError const&) const = default;
-    unsigned hash() const
-    {
-        return pair_int_hash(rule_name.hash(), name.hash());
-    }
-};
-
 struct InvalidPropertyError {
     Utf16FlyString rule_name { "style"_utf16_fly_string };
     Utf16FlyString property_name;
-    String value_string;
+    Utf16String value_string;
     String description;
     bool operator==(InvalidPropertyError const&) const = default;
     unsigned hash() const
@@ -70,45 +55,12 @@ struct InvalidValueError {
 
 struct InvalidRuleError {
     Utf16FlyString rule_name;
-    String prelude;
+    Utf16String prelude;
     String description;
     bool operator==(InvalidRuleError const&) const = default;
     unsigned hash() const
     {
         return pair_int_hash(rule_name.hash(), pair_int_hash(prelude.hash(), description.hash()));
-    }
-};
-
-struct InvalidQueryError {
-    Utf16FlyString query_type { "@media"_utf16_fly_string };
-    String value_string;
-    String description;
-    bool operator==(InvalidQueryError const&) const = default;
-    unsigned hash() const
-    {
-        return pair_int_hash(query_type.hash(), pair_int_hash(value_string.hash(), description.hash()));
-    }
-};
-
-struct InvalidSelectorError {
-    Utf16FlyString rule_name { "style"_utf16_fly_string };
-    String value_string;
-    String description;
-    bool operator==(InvalidSelectorError const&) const = default;
-    unsigned hash() const
-    {
-        return pair_int_hash(rule_name.hash(), pair_int_hash(value_string.hash(), description.hash()));
-    }
-};
-
-struct InvalidPseudoClassOrElementError {
-    Utf16FlyString name;
-    String value_string;
-    String description;
-    bool operator==(InvalidPseudoClassOrElementError const&) const = default;
-    unsigned hash() const
-    {
-        return pair_int_hash(name.hash(), pair_int_hash(value_string.hash(), description.hash()));
     }
 };
 
@@ -122,7 +74,25 @@ struct InvalidRuleLocationError {
     }
 };
 
-using ParsingError = Variant<UnknownPropertyError, UnknownRuleError, UnknownMediaFeatureError, UnknownPseudoClassOrElementError, InvalidPropertyError, InvalidValueError, InvalidRuleError, InvalidQueryError, InvalidSelectorError, InvalidPseudoClassOrElementError, InvalidRuleLocationError>;
+enum class SyntaxDiagnosticCode : u8 {
+    BadString,
+    BadUrl,
+};
+
+struct SyntaxDiagnosticError {
+    SyntaxDiagnosticCode code;
+    u32 start_line;
+    u32 start_column;
+    u32 end_line;
+    u32 end_column;
+    bool operator==(SyntaxDiagnosticError const&) const = default;
+    unsigned hash() const
+    {
+        return pair_int_hash(to_underlying(code), pair_int_hash(pair_int_hash(start_line, start_column), pair_int_hash(end_line, end_column)));
+    }
+};
+
+using ParsingError = Variant<UnknownPropertyError, UnknownRuleError, InvalidPropertyError, InvalidValueError, InvalidRuleError, InvalidRuleLocationError, SyntaxDiagnosticError>;
 
 String serialize_parsing_error(ParsingError const&);
 

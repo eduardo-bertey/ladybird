@@ -3,10 +3,6 @@ plugins {
     id("org.jetbrains.kotlin.android") version "2.1.20"
 }
 
-var buildDir = layout.buildDirectory.get()
-var cacheDir = System.getenv("LADYBIRD_CACHE_DIR") ?: "$buildDir/caches"
-var sourceDir = layout.projectDirectory.dir("../../").toString()
-
 android {
     namespace = "org.serenityos.ladybird"
     compileSdk = 35

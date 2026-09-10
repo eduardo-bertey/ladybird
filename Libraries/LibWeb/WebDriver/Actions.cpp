@@ -20,8 +20,9 @@
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/WebDriver/Actions.h>
 #include <LibWeb/WebDriver/Contexts.h>
 #include <LibWeb/WebDriver/ElementReference.h>
@@ -157,12 +158,15 @@ static CSSPixelPoint get_parent_offset(HTML::BrowsingContext const& browsing_con
         CSSPixels border_left_width = 0;
         CSSPixels border_top_width = 0;
 
-        if (auto paintable_box = container_element->paintable_box()) {
+        auto const* layout_node = container_element->layout_node();
+        if (layout_node && Painting::has_committed_box(*layout_node)) {
+            auto const box_model = Painting::box_model(*layout_node);
+
             // 7. Let borderLeftWidth be the computed border-left-width of containerElement in CSS pixels.
-            border_left_width = paintable_box->computed_values().border_left().width;
+            border_left_width = box_model.border.left;
 
             // 8. Let borderTopWidth be the computed border-top-width of containerElement in CSS pixels.
-            border_top_width = paintable_box->computed_values().border_top().width;
+            border_top_width = box_model.border.top;
         }
 
         // 9. Add containerRect.left + borderLeftWidth to offsetLeft.
@@ -1256,7 +1260,7 @@ static ErrorOr<void, WebDriver::Error> perform_pointer_move(ActionObject::Pointe
 // https://w3c.github.io/webdriver/#dfn-dispatch-a-pointermove-action
 static ErrorOr<void, WebDriver::Error> dispatch_pointer_move_action(ActionObject::PointerMoveFields const& action_object, PointerInputSource& source, GlobalKeyState const& global_key_state, AK::Duration tick_duration, HTML::BrowsingContext& browsing_context, ActionsOptions const& actions_options)
 {
-    auto viewport = browsing_context.page().top_level_traversable()->viewport_rect();
+    auto viewport = as<HTML::LocalNavigable>(*browsing_context.page().top_level_traversable()).viewport_rect();
 
     // 1. Let x offset be equal to the x property of action object.
     // 2. Let y offset be equal to the y property of action object.
@@ -1300,7 +1304,7 @@ static ErrorOr<void, WebDriver::Error> dispatch_pointer_move_action(ActionObject
 // https://w3c.github.io/webdriver/#dfn-dispatch-a-scroll-action
 static ErrorOr<void, WebDriver::Error> dispatch_scroll_action(ActionObject::ScrollFields const& action_object, GlobalKeyState const& global_key_state, AK::Duration tick_duration, HTML::BrowsingContext& browsing_context, ActionsOptions const& actions_options)
 {
-    auto viewport = browsing_context.page().top_level_traversable()->viewport_rect();
+    auto viewport = as<HTML::LocalNavigable>(*browsing_context.page().top_level_traversable()).viewport_rect();
 
     // 1. Let x offset be equal to the x property of action object.
     // 2. Let y offset be equal to the y property of action object.
@@ -1335,7 +1339,10 @@ static ErrorOr<void, WebDriver::Error> dispatch_scroll_action(ActionObject::Scro
     //     but the total scroll applied at the end of duration milliseconds must be delta x and delta y, and after each
     //     increment the sum of the applied deltas must not be greater than delta x and delta y.
     auto position = browsing_context.page().css_to_device_point(coordinates);
-    browsing_context.page().handle_mousewheel(position, position, 0, 0, global_key_state.modifiers(), static_cast<double>(action_object.delta_x), static_cast<double>(action_object.delta_y));
+
+    // AD-HOC: A scroll action emulates a mouse wheel, so its deltas are stepwise wheel input. A snap container the
+    //         action scrolls therefore ends at the snap position the input selects, rather than at the requested delta.
+    browsing_context.page().handle_mousewheel(position, position, 0, 0, global_key_state.modifiers(), static_cast<double>(action_object.delta_x), static_cast<double>(action_object.delta_y), WheelDeltaPrecision::Discrete);
 
     // 12. Return success with data null.
     return {};

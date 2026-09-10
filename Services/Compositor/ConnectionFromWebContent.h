@@ -41,12 +41,12 @@ private:
     virtual void offer_video_presentation_channel(IPC::TransportHandle handle) override;
     virtual void add_video_sink(Media::VideoSinkHandle) override;
     virtual void remove_video_sink(Media::VideoSinkHandle) override;
-    virtual void set_video_update_flags(Media::VideoSinkHandle, Web::Compositor::VideoUpdateFlags) override;
+    virtual void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick) override;
     virtual void set_parent_context(Web::Compositor::CompositorContextId, Optional<Web::Compositor::CompositorContextId>) override;
     virtual void stop_presenting_to_client(Web::Compositor::CompositorContextId) override;
     virtual void destroy_context(Web::Compositor::CompositorContextId) override;
     virtual void update_display_list(Web::Compositor::CompositorContextId, NonnullRefPtr<Web::Painting::DisplayList>, Web::Painting::AccumulatedVisualContextTree, Web::Painting::DisplayListResourceTransaction, Web::Painting::ScrollStateSnapshot) override;
-    virtual void update_visual_context_tree(Web::Compositor::CompositorContextId, Web::Painting::AccumulatedVisualContextTree) override;
+    virtual void update_visual_context_tree(Web::Compositor::CompositorContextId, Web::Painting::AccumulatedVisualContextTree, Web::Painting::DisplayListResourceTransaction) override;
     virtual void update_scroll_state(Web::Compositor::CompositorContextId, Web::Painting::ScrollStateSnapshot) override;
     virtual void update_image_frame_resources(Web::Compositor::CompositorContextId, Vector<Web::Painting::DisplayListImageFrameResource>) override;
     virtual Messages::CompositorWebContentServer::CreateCanvas2dContextResponse create_canvas_2d_context(Gfx::IntSize, bool) override;
@@ -64,19 +64,22 @@ private:
     virtual Messages::CompositorWebContentServer::WebglReadPixelsResponse webgl_read_pixels(Web::Painting::CanvasId canvas_id, i32 x, i32 y, i32 width, i32 height, u32 format, u32 type, i32 buf_size, Core::AnonymousBuffer pixels) override;
     virtual Messages::CompositorWebContentServer::WebglReadBufferSubDataResponse webgl_read_buffer_sub_data(Web::Painting::CanvasId canvas_id, u32 target, i64 offset, i64 size, Core::AnonymousBuffer data) override;
     virtual void invalidate_wheel_event_listener_state(Web::Compositor::CompositorContextId, u64 generation) override;
-    virtual Messages::CompositorWebContentServer::AsyncScrollByResponse async_scroll_by(Web::Compositor::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::AsyncScrollOperationTracking) override;
-    virtual Messages::CompositorWebContentServer::SmoothScrollToResponse smooth_scroll_to(Web::Compositor::CompositorContextId, Web::Compositor::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel) override;
+    virtual Messages::CompositorWebContentServer::AsyncScrollByResponse async_scroll_by(Web::Compositor::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::SnapContainerHandling, Web::Compositor::AsyncScrollOperationTracking) override;
+    virtual Messages::CompositorWebContentServer::SmoothScrollToResponse smooth_scroll_to(Web::Compositor::CompositorContextId, Web::Compositor::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel, Web::Compositor::ScrollAnimationKind) override;
     virtual void cancel_smooth_scroll(Web::Compositor::CompositorContextId, Web::Compositor::AsyncScrollNodeStableID) override;
     virtual Messages::CompositorWebContentServer::TakePendingAsyncScrollUpdatesResponse take_pending_async_scroll_updates(Web::Compositor::CompositorContextId) override;
     virtual void viewport_size_updated(Web::Compositor::CompositorContextId, Gfx::IntSize viewport_size, Web::Compositor::WindowResizingInProgress) override;
-    virtual void present_frame(Web::Compositor::CompositorContextId, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect) override;
+    virtual void request_rendering_opportunity(Web::Compositor::CompositorContextId, double maximum_frames_per_second) override;
+    virtual void hurry_rendering_opportunity(Web::Compositor::CompositorContextId) override;
+    virtual void present_frame(Web::Compositor::CompositorContextId, Gfx::IntRect viewport_rect) override;
     virtual void request_screenshot(Web::Compositor::CompositorContextId, Web::Compositor::ScreenshotRequestId request_id, Gfx::ShareableBitmap target_bitmap) override;
 
     virtual void dispatch_mouse_event_to_web_content(u64 page_id, Web::MouseEvent const&) override;
     virtual void request_rendering_update() override;
+    virtual void rendering_opportunity(Web::Compositor::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds) override;
+    virtual void async_scroll_updates(Web::Compositor::CompositorContextId, Web::Compositor::PendingAsyncScrollUpdates const&) override;
     virtual void create_video_edge(Media::VideoSinkHandle) override;
     virtual void release_video_edge(Media::VideoSinkHandle) override;
-    virtual void set_video_sink_ticking(Media::VideoSinkHandle, bool ticking) override;
     bool context_is_owned_by_this_connection(Web::Compositor::CompositorContextId);
 
     NonnullRefPtr<CompositorState> m_compositor_state;

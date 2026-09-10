@@ -2,6 +2,7 @@ set(SOURCES
     ConnectionFromClient.cpp
     ConsoleGlobalEnvironmentExtensions.cpp
     DevToolsConsoleClient.cpp
+    DevToolsDebugger.cpp
     PageClient.cpp
     PageHost.cpp
     WebContentCompositorHost.cpp
@@ -29,6 +30,9 @@ target_include_directories(webcontentservice PUBLIC $<BUILD_INTERFACE:${LADYBIRD
 target_include_directories(webcontentservice PUBLIC $<BUILD_INTERFACE:${LADYBIRD_SOURCE_DIR}/Services/>)
 
 target_link_libraries(webcontentservice PUBLIC LibCore LibCrypto LibDevTools LibFileSystem LibGfx LibHTTP LibIPC LibJS LibMain LibMedia LibWasm LibWeb LibWebSocket LibRequests LibWebView LibImageDecoderClient LibGC)
+if (ENABLE_CRANELIFT_JIT)
+    target_link_libraries(webcontentservice PUBLIC LibWasmCompilerClient)
+endif()
 target_link_libraries(webcontentservice PRIVATE OpenSSL::Crypto OpenSSL::SSL)
 target_link_libraries(webcontentservice PRIVATE SDL3::SDL3)
 target_compile_options(webcontentservice PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wexit-time-destructors>)
@@ -55,6 +59,7 @@ target_sources(webcontentservice PUBLIC FILE_SET server TYPE HEADERS
     BASE_DIRS ${LADYBIRD_SOURCE_DIR}/Services
     FILES ConnectionFromClient.h
           ConsoleGlobalEnvironmentExtensions.h
+          DevToolsDebugger.h
           Forward.h
           PageHost.h
           WebContentCompositorHost.h

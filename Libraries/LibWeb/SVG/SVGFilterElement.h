@@ -6,7 +6,9 @@
 
 #pragma once
 
-#include <LibGfx/Filter.h>
+#include <AK/Vector.h>
+#include <LibGfx/Forward.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGAnimatedEnumeration.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGURIReference.h>
@@ -25,22 +27,24 @@ public:
 
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
-    Optional<Gfx::Filter> gfx_filter(Layout::NodeWithStyle const& referenced_node, Gfx::FloatPoint filter_scale);
+    // Hands every supported child primitive to the Rust primitive list behind `sink` as attribute
+    // facts, with the frame an feImage draws for the list to retain.
+    void push_primitives(void* sink);
 
     GC::Ref<SVGAnimatedEnumeration> filter_units() const;
     GC::Ref<SVGAnimatedEnumeration> primitive_units() const;
 
     // https://drafts.csswg.org/filter-effects-1#dom-svgfilterelement-x
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, CSS::PercentageStyleValue::create(CSS::Percentage { -10 }));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, SVGLengthValue::percentage(-10));
 
     // https://drafts.csswg.org/filter-effects-1#dom-svgfilterelement-y
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, CSS::PercentageStyleValue::create(CSS::Percentage { -10 }));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, SVGLengthValue::percentage(-10));
 
     // https://drafts.csswg.org/filter-effects-1#dom-svgfilterelement-width
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, CSS::PercentageStyleValue::create(CSS::Percentage { 120 }));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, SVGLengthValue::percentage(120));
 
     // https://drafts.csswg.org/filter-effects-1#dom-svgfilterelement-height
-    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, CSS::PercentageStyleValue::create(CSS::Percentage { 120 }));
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, SVGLengthValue::percentage(120));
 
 private:
     SVGFilterElement(DOM::Document&, DOM::QualifiedName);

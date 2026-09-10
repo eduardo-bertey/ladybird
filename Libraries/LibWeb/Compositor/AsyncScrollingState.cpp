@@ -7,17 +7,25 @@
 #include <AK/Utf16View.h>
 #include <LibWeb/Compositor/AsyncScrollTree.h>
 #include <LibWeb/Compositor/AsyncScrollingState.h>
+#include <LibWeb/Page/InputEvent.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/ScrollState.h>
 
 namespace Web::Compositor {
 
-static AsyncScrollNodeID scroll_node_id_for(UniqueNodeID document_id, Painting::VisualContextIndex scroll_node_index)
+SnapContainerHandling snap_container_handling_for(WheelDeltaPrecision wheel_delta_precision, ScrollGesturePhase scroll_gesture_phase)
+{
+    if (wheel_delta_precision == WheelDeltaPrecision::Discrete || scroll_gesture_phase == ScrollGesturePhase::Momentum)
+        return SnapContainerHandling::DeferToMainThread;
+    return SnapContainerHandling::ScrollOnCompositor;
+}
+
+static AsyncScrollNodeID scroll_node_id_for(UniqueNodeID document_id, Painting::SpatialNodeIndex scroll_node_index)
 {
     return { .document_id = document_id, .scroll_node_index = scroll_node_index };
 }
 
-static AsyncScrollNodeKind async_scroll_node_kind_for(Painting::CompositorScrollNodeKind kind)
+AsyncScrollNodeKind async_scroll_node_kind_for(Painting::CompositorScrollNodeKind kind)
 {
     switch (kind) {
     case Painting::CompositorScrollNodeKind::Viewport:
@@ -42,8 +50,8 @@ static AsyncScrollNodeStableID stable_scroll_node_id_for(UniqueNodeID scrollable
 AsyncScrollingState async_scrolling_state_from_display_list(Painting::DisplayList const& display_list)
 {
     AsyncScrollingState async_scrolling_state;
-    Vector<Painting::VisualContextIndex> parent_scroll_node_indices;
-    Vector<Painting::VisualContextIndex> wheel_hit_test_target_scroll_node_indices;
+    Vector<Painting::SpatialNodeIndex> parent_scroll_node_indices;
+    Vector<Painting::SpatialNodeIndex> wheel_hit_test_target_scroll_node_indices;
     Vector<UniqueNodeID> wheel_hit_test_target_document_ids;
 
     if (auto const& metadata = display_list.async_scrolling_metadata(); metadata.has_value()) {
@@ -53,10 +61,10 @@ AsyncScrollingState async_scrolling_state_from_display_list(Painting::DisplayLis
         async_scrolling_state.has_blocking_wheel_event_region_covering_viewport = metadata->has_blocking_wheel_event_region_covering_viewport;
     }
 
-    display_list.for_each_command_header([&](Painting::DisplayListCommandHeader const& header, ReadonlyBytes payload) {
+    auto read_compositor_metadata = [&](Painting::DisplayListCommandHeader const& header, ReadonlyBytes payload) {
         auto append_wheel_hit_test_target = [&](auto const& command, Gfx::CornerRadii corner_radii) {
             async_scrolling_state.wheel_hit_test_targets.append({
-                .visual_context_index = header.context_index,
+                .context = header.context,
                 .rect = command.rect,
                 .corner_radii = corner_radii,
                 .target_node_id = {},
@@ -65,32 +73,13 @@ AsyncScrollingState async_scrolling_state_from_display_list(Painting::DisplayLis
             wheel_hit_test_target_document_ids.append(command.document_id);
         };
 
-        switch (header.type) {
+        switch (header.command_type) {
         case Painting::DisplayListCommandType::CompositorBlockingWheelEventRegion: {
             auto command = Painting::read_display_list_command_payload<Painting::CompositorBlockingWheelEventRegion>(payload);
             async_scrolling_state.has_blocking_wheel_event_listeners = true;
             async_scrolling_state.blocking_wheel_event_regions.append({
-                .visual_context_index = header.context_index,
+                .context = header.context,
                 .rect = command.rect,
-            });
-            break;
-        }
-        case Painting::DisplayListCommandType::CompositorStickyArea: {
-            auto command = Painting::read_display_list_command_payload<Painting::CompositorStickyArea>(payload);
-            async_scrolling_state.sticky_areas.append({
-                .document_id = command.document_id,
-                .scroll_node_index = command.scroll_node_index,
-                .parent_scroll_node_index = command.parent_scroll_node_index,
-                .nearest_scrolling_ancestor_index = command.nearest_scrolling_ancestor_index,
-                .position_relative_to_scroll_ancestor = command.position_relative_to_scroll_ancestor,
-                .border_box_size = command.border_box_size,
-                .scrollport_size = command.scrollport_size,
-                .containing_block_region = command.containing_block_region,
-                .needs_parent_offset_adjustment = command.needs_parent_offset_adjustment,
-                .inset_top = command.inset_top,
-                .inset_right = command.inset_right,
-                .inset_bottom = command.inset_bottom,
-                .inset_left = command.inset_left,
             });
             break;
         }
@@ -101,10 +90,13 @@ AsyncScrollingState async_scrolling_state_from_display_list(Painting::DisplayLis
                 .stable_node_id = stable_scroll_node_id_for(command.scrollable_node_id, command.scroll_node_kind, command.pseudo_element_type),
                 .parent_node_id = {},
                 .scrollport_rect = command.scrollport_rect,
+                .min_scroll_offset = command.min_scroll_offset,
                 .max_scroll_offset = command.max_scroll_offset,
                 .is_viewport = command.is_viewport,
                 .can_be_wheel_scrolled_horizontally = command.can_be_wheel_scrolled_horizontally,
                 .can_be_wheel_scrolled_vertically = command.can_be_wheel_scrolled_vertically,
+                .snaps_scroll_position_horizontally = command.snaps_scroll_position_horizontally,
+                .snaps_scroll_position_vertically = command.snaps_scroll_position_vertically,
             });
             parent_scroll_node_indices.append(command.parent_scroll_node_index);
             break;
@@ -122,7 +114,7 @@ AsyncScrollingState async_scrolling_state_from_display_list(Painting::DisplayLis
         case Painting::DisplayListCommandType::CompositorMainThreadWheelEventRegion: {
             auto command = Painting::read_display_list_command_payload<Painting::CompositorMainThreadWheelEventRegion>(payload);
             async_scrolling_state.main_thread_wheel_event_regions.append({
-                .visual_context_index = header.context_index,
+                .context = header.context,
                 .rect = command.rect,
             });
             break;
@@ -138,6 +130,7 @@ AsyncScrollingState async_scrolling_state_from_display_list(Painting::DisplayLis
                 .expanded_thumb_rect = command.expanded_thumb_rect,
                 .scroll_size = command.scroll_size,
                 .expanded_scroll_size = command.expanded_scroll_size,
+                .min_scroll_offset = command.min_scroll_offset,
                 .max_scroll_offset = command.max_scroll_offset,
                 .thumb_color = command.thumb_color,
                 .track_color = command.track_color,
@@ -148,7 +141,12 @@ AsyncScrollingState async_scrolling_state_from_display_list(Painting::DisplayLis
         default:
             break;
         }
-    });
+    };
+    for (auto const& run : display_list.command_runs()) {
+        if (!run.has_compositor_metadata)
+            continue;
+        Painting::DisplayList::for_each_command_header(display_list.command_bytes_of_run(run), read_compositor_metadata);
+    }
 
     VERIFY(parent_scroll_node_indices.size() == async_scrolling_state.scroll_nodes.size());
     for (size_t i = 0; i < async_scrolling_state.scroll_nodes.size(); ++i) {
@@ -205,16 +203,18 @@ bool blocks_wheel_event_at_position(AsyncScrollingState const& async_scrolling_s
     if (!display_list || !visual_context_tree)
         return async_scrolling_state.has_blocking_wheel_event_listeners;
 
-    VERIFY(display_list->compatible_visual_context_tree_version() == visual_context_tree->version());
+    VERIFY(display_list->compatible_visual_context_tree_structural_epoch() == visual_context_tree->structural_epoch());
     for (auto const& region : async_scrolling_state.blocking_wheel_event_regions) {
-        auto position_in_context = visual_context_tree->transform_point_for_hit_test(region.visual_context_index, position, scroll_state_snapshot);
+        if (!visual_context_tree->context_is_valid(region.context))
+            return true;
+        auto position_in_context = visual_context_tree->transform_point_for_hit_test(region.context, position, scroll_state_snapshot);
         if (position_in_context.has_value() && region.rect.contains(*position_in_context))
             return true;
     }
     return false;
 }
 
-static WheelHitTestResult hit_test_scroll_node_at_position(AsyncScrollingState const& async_scrolling_state, RefPtr<Painting::DisplayList const> const& display_list, Painting::AccumulatedVisualContextTree const* visual_context_tree, Painting::ScrollStateSnapshot const& scroll_state_snapshot, Gfx::FloatPoint position, Gfx::FloatPoint delta)
+static WheelHitTestResult hit_test_scroll_node_at_position(AsyncScrollingState const& async_scrolling_state, RefPtr<Painting::DisplayList const> const& display_list, Painting::AccumulatedVisualContextTree const* visual_context_tree, Painting::ScrollStateSnapshot const& scroll_state_snapshot, Gfx::FloatPoint position, Gfx::FloatPoint delta, SnapContainerHandling snap_container_handling)
 {
     if (!display_list || !visual_context_tree)
         return {};
@@ -223,12 +223,12 @@ static WheelHitTestResult hit_test_scroll_node_at_position(AsyncScrollingState c
     auto async_scrolling_state_copy = async_scrolling_state;
     scroll_tree.set_state(move(async_scrolling_state_copy));
     scroll_tree.rebuild_wheel_hit_test_targets(display_list, visual_context_tree, scroll_state_snapshot);
-    return scroll_tree.hit_test_scroll_node_for_wheel(position, delta);
+    return scroll_tree.hit_test_scroll_node_for_wheel(*visual_context_tree, position, delta, snap_container_handling);
 }
 
-WheelScrollAdmission admit_wheel_scroll(AsyncScrollingState const& async_scrolling_state, RefPtr<Painting::DisplayList const> const& display_list, Painting::AccumulatedVisualContextTree const* visual_context_tree, Painting::ScrollStateSnapshot const& scroll_state_snapshot, Gfx::FloatPoint position, Gfx::FloatPoint delta, bool blocking_wheel_event_regions_are_current)
+WheelScrollAdmission admit_wheel_scroll(AsyncScrollingState const& async_scrolling_state, RefPtr<Painting::DisplayList const> const& display_list, Painting::AccumulatedVisualContextTree const* visual_context_tree, Painting::ScrollStateSnapshot const& scroll_state_snapshot, Gfx::FloatPoint position, Gfx::FloatPoint delta, SnapContainerHandling snap_container_handling, bool blocking_wheel_event_regions_are_current)
 {
-    auto hit_test_result = hit_test_scroll_node_at_position(async_scrolling_state, display_list, visual_context_tree, scroll_state_snapshot, position, delta);
+    auto hit_test_result = hit_test_scroll_node_at_position(async_scrolling_state, display_list, visual_context_tree, scroll_state_snapshot, position, delta, snap_container_handling);
     if (hit_test_result.blocked_by_main_thread_region)
         return WheelScrollAdmission::BlockedByMainThreadRegion;
 

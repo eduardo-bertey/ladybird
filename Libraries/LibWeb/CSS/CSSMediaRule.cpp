@@ -13,15 +13,24 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSMediaRule);
 
-GC::Ref<CSSMediaRule> CSSMediaRule::create(MediaList& media_queries, CSSRuleList& rules)
+GC::Ref<CSSMediaRule> CSSMediaRule::create(RustRule rule, CSSRuleList& rules)
 {
-    return GC::Heap::the().allocate<CSSMediaRule>(media_queries, rules);
+    return GC::Heap::the().allocate<CSSMediaRule>(move(rule), rules);
 }
 
-CSSMediaRule::CSSMediaRule(MediaList& media, CSSRuleList& rules)
-    : CSSConditionRule(rules, Type::Media)
-    , m_media(media)
+CSSMediaRule::CSSMediaRule(RustRule rule, CSSRuleList& rules)
+    : CSSConditionRule(rules, move(rule))
+    , m_media_list(Parser::ValueParserFFI::rust_media_list_retain(native_rule().payload().media))
 {
+}
+
+MediaList* CSSMediaRule::media() const
+{
+    if (!m_media) {
+        m_media = MediaList::create(m_media_list.retain());
+        m_media->set_associated_rule(const_cast<CSSMediaRule&>(*this));
+    }
+    return m_media.ptr();
 }
 
 void CSSMediaRule::visit_edges(GC::Cell::Visitor& visitor)
@@ -32,7 +41,7 @@ void CSSMediaRule::visit_edges(GC::Cell::Visitor& visitor)
 
 Utf16String CSSMediaRule::serialized_condition_text() const
 {
-    return m_media->media_text();
+    return m_media_list.media_text();
 }
 
 // https://www.w3.org/TR/cssom-1/#serialize-a-css-rule
@@ -72,7 +81,7 @@ void CSSMediaRule::dump(StringBuilder& builder, int indent_levels) const
 {
     Base::dump(builder, indent_levels);
 
-    m_media->dump(builder, indent_levels + 1);
+    m_media_list.dump(builder, indent_levels + 1);
 
     dump_indent(builder, indent_levels + 1);
     builder.appendff("Rules ({}):\n", css_rules().length());

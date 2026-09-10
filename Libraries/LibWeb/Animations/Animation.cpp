@@ -13,6 +13,7 @@
 #include <LibWeb/Animations/AnimationPlaybackEvent.h>
 #include <LibWeb/Animations/BindingsGlue.h>
 #include <LibWeb/Animations/DocumentTimeline.h>
+#include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/CSS/CSSAnimation.h>
@@ -383,6 +384,16 @@ void Animation::calculate_auto_aligned_start_time()
 // https://www.w3.org/TR/web-animations-1/#animation-current-time
 Optional<TimeValue> Animation::current_time() const
 {
+    return current_time_at(m_timeline ? m_timeline->current_time() : Optional<TimeValue> {});
+}
+
+Optional<TimeValue> Animation::current_time_for_observation() const
+{
+    return current_time_at(m_timeline ? m_timeline->current_time_for_observation() : Optional<TimeValue> {});
+}
+
+Optional<TimeValue> Animation::current_time_at(Optional<TimeValue> timeline_time) const
+{
     // The current time is calculated from the first matching condition from below:
 
     // -> If the animation’s hold time is resolved,
@@ -395,7 +406,7 @@ Optional<TimeValue> Animation::current_time() const
     //    - the animation has no associated timeline, or
     //    - the associated timeline is inactive, or
     //    - the animation’s start time is unresolved.
-    if (!m_timeline || m_timeline->is_inactive() || !m_start_time.has_value()) {
+    if (!m_timeline || !timeline_time.has_value() || !m_start_time.has_value()) {
         // The current time is an unresolved time value.
         return {};
     }
@@ -404,7 +415,13 @@ Optional<TimeValue> Animation::current_time() const
     //    current time = (timeline time - start time) × playback rate
     //    Where timeline time is the current time value of the associated timeline. The playback rate value is defined
     //    in §4.4.15 Speed control.
-    return (m_timeline->current_time().value() - m_start_time.value()) * playback_rate();
+    return (timeline_time.value() - m_start_time.value()) * playback_rate();
+}
+
+NullableCSSNumberish Animation::current_time_for_bindings() const
+{
+    update_style_if_needed();
+    return NullableCSSNumberish::from_optional_css_numberish_time(current_time_for_observation());
 }
 
 // https://www.w3.org/TR/web-animations-1/#animation-set-the-current-time
@@ -483,10 +500,15 @@ WebIDL::ExceptionOr<void> Animation::set_playback_rate(double new_playback_rate)
 void Animation::update_style_if_needed() const
 {
     if (m_owning_element.has_value())
-        m_owning_element->document().update_style_if_needed_for_element(*m_owning_element);
+        m_owning_element->document().update_style_for_element(*m_owning_element, DOM::Document::StyleUpdateMode::OnlyIfNeeded);
 }
 
 AnimationPlayState Animation::play_state() const
+{
+    return play_state_at(current_time());
+}
+
+AnimationPlayState Animation::play_state_at(Optional<TimeValue> current_time) const
 {
     // The play state of animation, animation, at a given moment is the state corresponding to the first matching
     // condition from the following:
@@ -495,7 +517,6 @@ AnimationPlayState Animation::play_state() const
     //    - The current time of animation is unresolved, and
     //    - the start time of animation is unresolved, and
     //    - animation does not have either a pending play task or a pending pause task,
-    auto current_time = this->current_time();
     if (!current_time.has_value() && !m_start_time.has_value() && !pending()) {
         // → idle
         return AnimationPlayState::Idle;
@@ -528,7 +549,7 @@ AnimationPlayState Animation::play_state_for_bindings()
     if (auto owning_element = this->owning_element(); owning_element.has_value())
         owning_element->document().update_style();
 
-    return play_state();
+    return play_state_at(current_time_for_observation());
 }
 
 bool Animation::pending_for_bindings() const
@@ -543,9 +564,18 @@ GC::Ref<WebIDL::Promise> Animation::ready_for_bindings() const
     return ready();
 }
 
-GC::Ref<WebIDL::Promise> Animation::finished_for_bindings() const
+GC::Ref<WebIDL::Promise> Animation::finished_for_bindings()
 {
     update_style_if_needed();
+    auto observed_timeline_time = m_timeline ? m_timeline->current_time_for_observation() : Optional<TimeValue> {};
+    auto observed_current_time = current_time_at(observed_timeline_time);
+    if (m_timeline
+        && !m_is_finished
+        && play_state_at(current_time()) != AnimationPlayState::Finished
+        && play_state_at(observed_current_time) == AnimationPlayState::Finished) {
+        AnimationTimeline::CurrentTimeOverrideScope current_time_override_scope { *m_timeline, observed_timeline_time };
+        update_finished_state(DidSeek::No, SynchronouslyNotify::Yes, ShouldInvalidate::No, observed_current_time);
+    }
     return finished();
 }
 
@@ -656,8 +686,8 @@ void Animation::cancel(ShouldInvalidate should_invalidate)
     // Note: When called from JS, we always want to invalidate the animation target's style. However, this method is
     //       also called from the StyleComputer when the animation-name CSS property changes. That happens in the
     //       middle of a cascade, and importantly, _before_ computing the animation effect stack, so there is no
-    //       need for another invalidation. And in fact, if we did invalidate, it would lead to a crash, as the element
-    //       would not have it's "m_needs_style_update" flag cleared.
+    //       need for another invalidation. It would also schedule a redundant follow-up reaction while the current
+    //       style computation is already updating the animation effect stack.
 
     auto& realm = HTML::relevant_realm(relevant_global_object());
 
@@ -799,6 +829,13 @@ WebIDL::ExceptionOr<void> Animation::play(ShouldInvalidate should_invalidate)
 // https://drafts.csswg.org/web-animations-2/#play-an-animation
 WebIDL::ExceptionOr<void> Animation::play_an_animation(AutoRewind auto_rewind, ShouldInvalidate should_invalidate)
 {
+    m_css_cancellation_disassociation_pending = false;
+    if (m_needs_target_reassociation && m_effect) {
+        if (auto target = m_effect->target())
+            target->associate_with_animation(*this);
+        m_needs_target_reassociation = false;
+    }
+
     // 1. Let aborted pause be a boolean flag that is true if animation has a pending pause task, and false otherwise.
     auto aborted_pause = m_pending_pause_task == TaskState::Scheduled;
 
@@ -903,6 +940,15 @@ WebIDL::ExceptionOr<void> Animation::play_an_animation(AutoRewind auto_rewind, S
     update_finished_state(DidSeek::No, SynchronouslyNotify::No, should_invalidate);
 
     return {};
+}
+
+void Animation::disassociate_from_target_after_css_cancellation()
+{
+    m_css_cancellation_disassociation_pending = false;
+    if (!m_effect || !m_effect->target())
+        return;
+    m_effect->target()->disassociate_with_animation(*this);
+    m_needs_target_reassociation = true;
 }
 
 // https://www.w3.org/TR/web-animations-1/#dom-animation-pause
@@ -1157,8 +1203,26 @@ void Animation::update()
 
     // Prevent unnecessary work if the animation is already finished and can't exit the finished state due to timeline
     // changes
-    if (!m_is_finished || !m_timeline->is_monotonically_increasing())
-        update_finished_state(DidSeek::No, SynchronouslyNotify::Yes);
+    if (!m_is_finished || !m_timeline->is_monotonically_increasing()) {
+        bool was_finished = m_is_finished;
+        update_finished_state(DidSeek::No, SynchronouslyNotify::Yes, ShouldInvalidate::No);
+        if (play_state() == AnimationPlayState::Running && m_effect && is<KeyframeEffect>(*m_effect)) {
+            auto& effect = static_cast<KeyframeEffect&>(*m_effect);
+            bool output_is_constant_before_active_start = !pending()
+                && effect.is_in_the_before_phase()
+                && m_timeline
+                && m_timeline->is_monotonically_increasing()
+                && playback_rate() > 0;
+            if (effect.can_skip_per_frame_style_update()) {
+                if (auto target = effect.target())
+                    target->document().note_throttled_animation_style_update();
+            } else if (!pending() && !output_is_constant_before_active_start) {
+                invalidate_effect();
+            }
+        } else if (m_is_finished != was_finished) {
+            invalidate_effect();
+        }
+    }
 
     // Act on the pending play or pause task
     if (m_pending_play_task == TaskState::Scheduled && is_ready()) {
@@ -1169,6 +1233,23 @@ void Animation::update()
     if (m_pending_pause_task == TaskState::Scheduled && is_ready_to_run_pending_pause_task()) {
         m_pending_pause_task = TaskState::None;
         run_pending_pause_task();
+    }
+
+    if (play_state() == AnimationPlayState::Running && !pending() && m_effect && is<KeyframeEffect>(*m_effect)) {
+        auto& effect = static_cast<KeyframeEffect&>(*m_effect);
+        if (effect.is_in_the_before_phase()
+            && m_timeline && m_timeline->is_monotonically_increasing()
+            && playback_rate() > 0
+            && effect.start_delay().type == TimeValue::Type::Milliseconds) {
+            auto animation_current_time = current_time();
+            if (animation_current_time.has_value() && animation_current_time->type == TimeValue::Type::Milliseconds) {
+                auto delay = (effect.start_delay().value - animation_current_time->value) / playback_rate();
+                if (delay > 0) {
+                    if (auto target = effect.target())
+                        target->document().schedule_compositor_animation_wakeup(delay);
+                }
+            }
+        }
     }
 }
 
@@ -1261,7 +1342,7 @@ WebIDL::ExceptionOr<void> Animation::silently_set_current_time(Optional<TimeValu
 }
 
 // https://www.w3.org/TR/web-animations-1/#update-an-animations-finished-state
-void Animation::update_finished_state(DidSeek did_seek, SynchronouslyNotify synchronously_notify, ShouldInvalidate should_invalidate)
+void Animation::update_finished_state(DidSeek did_seek, SynchronouslyNotify synchronously_notify, ShouldInvalidate should_invalidate, Optional<TimeValue> observed_current_time)
 {
     auto& realm = HTML::relevant_realm(relevant_global_object());
 
@@ -1271,11 +1352,11 @@ void Animation::update_finished_state(DidSeek did_seek, SynchronouslyNotify sync
     //
     // Note: This is required to accommodate timelines that may change direction. Without this definition, a once-
     //       finished animation would remain finished even when its timeline progresses in the opposite direction.
-    Optional<TimeValue> unconstrained_current_time;
-    if (did_seek == DidSeek::No) {
+    Optional<TimeValue> unconstrained_current_time = observed_current_time;
+    if (!unconstrained_current_time.has_value() && did_seek == DidSeek::No) {
         TemporaryChange change(m_hold_time, {});
         unconstrained_current_time = current_time();
-    } else {
+    } else if (!unconstrained_current_time.has_value()) {
         unconstrained_current_time = current_time();
     }
 
@@ -1527,7 +1608,12 @@ void Animation::run_pending_play_task()
 
     // 5. Run the procedure to update an animation’s finished state for animation with the did seek flag set to false,
     //    and the synchronously notify flag set to false.
-    update_finished_state(DidSeek::No, SynchronouslyNotify::No);
+    // OPTIMIZATION: A new CSS transition can already have a provisional compositor descriptor anchored to its style
+    //               change event time. Keep that descriptor so resolving this task does not restart its visual time.
+    auto should_invalidate = is_css_transition() && m_effect && is<KeyframeEffect>(*m_effect) && static_cast<KeyframeEffect&>(*m_effect).is_compositor_driven()
+        ? ShouldInvalidate::No
+        : ShouldInvalidate::Yes;
+    update_finished_state(DidSeek::No, SynchronouslyNotify::No, should_invalidate);
 }
 
 bool Animation::is_ready_to_run_pending_pause_task() const
@@ -1612,8 +1698,11 @@ void Animation::invalidate_effect()
     if (!m_effect)
         return;
 
-    if (auto target = m_effect->target())
-        target->document().set_needs_animated_style_update();
+    if (!is<KeyframeEffect>(*m_effect))
+        return;
+
+    auto& effect = static_cast<KeyframeEffect&>(*m_effect);
+    effect.invalidate_effect();
 }
 
 Animation::Animation(HTML::EnvironmentSettingsObject& environment)
@@ -1624,9 +1713,25 @@ Animation::Animation(HTML::EnvironmentSettingsObject& environment)
     m_global_animation_list_order = next_animation_list_order++;
 }
 
+void Animation::set_provisional_effect(GC::Ref<AnimationEffect> effect)
+{
+    VERIFY(!m_effect);
+    VERIFY(!effect->associated_animation());
+    effect->set_associated_animation(this);
+    m_effect = effect;
+}
+
+void Animation::discard_provisional_effect()
+{
+    VERIFY(m_effect);
+    VERIFY(m_effect->associated_animation() == GC::Ptr<Animation> { *this });
+    m_effect->set_associated_animation({});
+    m_effect = nullptr;
+}
+
 GC::Ptr<Bindings::Wrappable> Animation::relevant_global_impl() const
 {
-    return &m_environment->universal_global_scope().this_impl();
+    return HTML::relevant_window_or_worker_global_scope(m_environment->global_object()).this_impl();
 }
 
 void Animation::visit_edges(Cell::Visitor& visitor)

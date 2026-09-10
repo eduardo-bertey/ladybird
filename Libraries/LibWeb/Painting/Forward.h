@@ -10,11 +10,13 @@
 
 namespace Web::Painting {
 
+class AccumulatedVisualContextTree;
+class DocumentPaintState;
 class HitTestDisplayList;
+class ScrollStateSnapshot;
 enum class CaretLineDirection : u8;
 enum class CaretLineEdge : u8;
 enum class CaretPositionMode : u8;
-enum class HitTestType : u8;
 struct CaretPosition;
 struct HitTestResult;
 

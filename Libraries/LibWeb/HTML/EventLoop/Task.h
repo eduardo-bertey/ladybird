@@ -25,6 +25,11 @@ class Task final : public JS::Cell {
     GC_DECLARE_ALLOCATOR(Task);
 
 public:
+    enum class Priority {
+        Normal,
+        Idle,
+    };
+
     // https://html.spec.whatwg.org/multipage/webappapis.html#generic-task-sources
     enum class Source {
         Unspecified,
@@ -104,12 +109,18 @@ public:
         UniqueTaskSourceStart
     };
 
-    static GC::Ref<Task> create(Source, GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps);
+    static GC::Ref<Task> create(Source, GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps, Priority = Priority::Normal);
 
     virtual ~Task() override;
 
     [[nodiscard]] TaskID id() const { return m_id; }
     Source source() const { return m_source; }
+    Priority priority() const { return m_priority; }
+
+    // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timer-nesting-level
+    u32 timer_nesting_level() const { return m_timer_nesting_level; }
+    void set_timer_nesting_level(u32 nesting_level) { m_timer_nesting_level = nesting_level; }
+
     void execute();
 
     DOM::Document const* document() const;
@@ -118,12 +129,14 @@ public:
     bool is_permanently_unrunnable() const;
 
 private:
-    Task(Source, GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps);
+    Task(Source, GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps, Priority);
 
     virtual void visit_edges(Visitor&) override;
 
     TaskID m_id {};
     Source m_source { Source::Unspecified };
+    Priority m_priority { Priority::Normal };
+    u32 m_timer_nesting_level { 0 };
     GC::Ref<GC::Function<void()>> m_steps;
     GC::Ptr<DOM::Document const> m_document;
 

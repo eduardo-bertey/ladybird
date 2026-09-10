@@ -8,6 +8,7 @@
 
 #include <AK/Optional.h>
 #include <AK/RedBlackTree.h>
+#include <AK/String.h>
 #include <AK/Types.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/RootVector.h>
@@ -15,8 +16,10 @@
 #include <LibJS/Runtime/Value.h>
 #include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/Bindings/KeyframeEffect.h>
+#include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/Compositor/VisualAnimation.h>
 
 namespace Web::Animations {
 
@@ -45,7 +48,7 @@ StringView composite_operation_or_auto_to_string(CompositeOperationOrAuto);
 // https://www.w3.org/TR/web-animations-1/#dictdef-basekeyframe
 struct BaseKeyframe {
     using UnparsedProperties = HashMap<Utf16FlyString, Utf16String>;
-    using ParsedProperties = HashMap<CSS::PropertyID, NonnullRefPtr<CSS::StyleValue const>>;
+    using ParsedProperties = HashMap<CSS::PropertyNameAndID, CSS::RustStyleValueHandle>;
 
     Optional<double> offset {};
     EasingValue easing { "linear"_utf16 };
@@ -78,17 +81,22 @@ public:
     };
 
     struct KeyFrameSet : public RefCounted<KeyFrameSet> {
+        struct StyleSheetResourceContext {
+            String base_url;
+            bool origin_clean { false };
+        };
         struct UseInitial { };
         struct ResolvedKeyFrame {
-            // These StyleValue properties can be unresolved, as they may be generated from a @keyframes rule, well
+            // These style values can be unresolved, as they may be generated from a @keyframes rule, well
             // before they are applied to an element
-            HashMap<CSS::PropertyID, Variant<UseInitial, NonnullRefPtr<CSS::StyleValue const>>> properties {};
+            HashMap<CSS::PropertyNameAndID, Variant<UseInitial, CSS::RustStyleValueHandle>> properties {};
             CompositeOperationOrAuto composite { CompositeOperationOrAuto::Auto };
-            Variant<Empty, CSS::EasingFunction, NonnullRefPtr<CSS::StyleValue const>> easing {};
+            Variant<Empty, CSS::EasingFunction, CSS::RustStyleValueHandle> easing {};
         };
         RedBlackTree<u64, ResolvedKeyFrame> keyframes_by_key;
+        Optional<StyleSheetResourceContext> style_sheet_resource_context;
     };
-    static void generate_initial_and_final_frames(RefPtr<KeyFrameSet>, HashTable<CSS::PropertyID> const& animated_properties);
+    static void generate_initial_and_final_frames(RefPtr<KeyFrameSet>, HashTable<CSS::PropertyNameAndID> const& animated_properties);
 
     static int composite_order(GC::Ref<KeyframeEffect>, GC::Ref<KeyframeEffect>);
 
@@ -135,14 +143,89 @@ public:
     WebIDL::ExceptionOr<GC::RootVector<GC::Ref<JS::Object>>> get_keyframes(JS::Object& relevant_global_object);
 
     KeyFrameSet const* key_frame_set() { return m_key_frame_set; }
-    void set_key_frame_set(RefPtr<KeyFrameSet const> key_frame_set) { m_key_frame_set = key_frame_set; }
+    void set_key_frame_set(RefPtr<KeyFrameSet const>);
 
     virtual bool is_keyframe_effect() const override { return true; }
 
+    bool can_skip_per_frame_style_update() const;
+    void clear_per_frame_style_update_cache() { m_can_skip_per_frame_style_update_cache.clear(); }
+    bool can_skip_per_frame_animation_tick() const;
+    bool is_compositor_driven() const { return m_is_compositor_driven; }
+    void set_is_compositor_driven(bool value)
+    {
+        if (m_is_compositor_driven == value)
+            return;
+        m_is_compositor_driven = value;
+        m_can_skip_per_frame_style_update_cache.clear();
+    }
+    bool is_compositor_replaced() const { return m_is_compositor_replaced; }
+    void set_is_compositor_replaced(bool value)
+    {
+        if (m_is_compositor_replaced == value)
+            return;
+        m_is_compositor_replaced = value;
+        m_can_skip_per_frame_style_update_cache.clear();
+    }
+    Vector<Compositor::VisualAnimation> const& retained_compositor_animations() const { return m_retained_compositor_animations; }
+    void set_retained_compositor_animations(Vector<Compositor::VisualAnimation> animations) { m_retained_compositor_animations = move(animations); }
+    void clear_retained_compositor_animations() { m_retained_compositor_animations.clear(); }
+    void set_is_offscreen_throttled(bool value)
+    {
+        if (m_is_offscreen_throttled == value)
+            return;
+        m_is_offscreen_throttled = value;
+        m_can_skip_per_frame_style_update_cache.clear();
+    }
+    bool is_offscreen_throttled() const { return m_is_offscreen_throttled; }
+    void set_is_observation_relevant_compositor_animation(bool value) { m_is_observation_relevant_compositor_animation = value; }
+    bool is_observation_relevant_compositor_animation() const { return m_is_observation_relevant_compositor_animation; }
+    void request_observation_sample();
+    u64 animation_preparation_identity() const { return m_animation_preparation_identity; }
+    u64 animation_preparation_generation() const { return m_animation_preparation_generation; }
+    void invalidate_animation_preparation() { ++m_animation_preparation_generation; }
+    bool request_element_scoped_observation_sample(u64 task_generation)
+    {
+        if (m_last_element_scoped_observation_sample_task_generation == task_generation)
+            return false;
+        m_last_element_scoped_observation_sample_task_generation = task_generation;
+        request_observation_sample();
+        return true;
+    }
+    bool observation_sample_requested() const { return m_needs_observation_sample; }
+    bool consume_observation_sample_request() { return exchange(m_needs_observation_sample, false); }
+    bool per_frame_animation_tick_was_skipped() const { return m_per_frame_animation_tick_was_skipped; }
+    void note_per_frame_animation_tick_was_skipped() { m_per_frame_animation_tick_was_skipped = true; }
+    void clear_per_frame_animation_tick_was_skipped() { m_per_frame_animation_tick_was_skipped = false; }
+    struct CompositorKeyframeValueCache {
+        KeyFrameSet const* key_frame_set { nullptr };
+        u64 target_style_generation { 0 };
+        u64 style_environment_version { 0 };
+        float reference_width { 0 };
+        float reference_height { 0 };
+        float device_pixels_per_css_pixel { 0 };
+        bool is_valid { false };
+        Vector<Optional<Compositor::VisualAnimationValue>> values;
+    };
+    Optional<CompositorKeyframeValueCache>& compositor_keyframe_value_cache(Compositor::VisualAnimation::TargetKind target_kind)
+    {
+        switch (target_kind) {
+        case Compositor::VisualAnimation::TargetKind::Opacity:
+            return m_compositor_opacity_keyframe_value_cache;
+        case Compositor::VisualAnimation::TargetKind::BackgroundColor:
+            return m_compositor_background_color_keyframe_value_cache;
+        case Compositor::VisualAnimation::TargetKind::Filter:
+            return m_compositor_filter_keyframe_value_cache;
+        case Compositor::VisualAnimation::TargetKind::Transform:
+            return m_compositor_transform_keyframe_value_cache;
+        }
+        VERIFY_NOT_REACHED();
+    }
     virtual void update_computed_properties(AnimationUpdateContext&) override;
     void update_computed_properties_for_style(AnimationUpdateContext&, DOM::AbstractElement);
 
 private:
+    friend class Animation;
+
     KeyframeEffect();
     virtual ~KeyframeEffect() override = default;
 
@@ -166,6 +249,28 @@ private:
     Vector<GC::Ref<JS::Object>> m_keyframe_objects_cache {};
 
     RefPtr<KeyFrameSet const> m_key_frame_set {};
+    u64 m_animation_preparation_identity { 0 };
+    u64 m_animation_preparation_generation { 0 };
+    Optional<CompositorKeyframeValueCache> m_compositor_opacity_keyframe_value_cache;
+    Optional<CompositorKeyframeValueCache> m_compositor_background_color_keyframe_value_cache;
+    Optional<CompositorKeyframeValueCache> m_compositor_filter_keyframe_value_cache;
+    Optional<CompositorKeyframeValueCache> m_compositor_transform_keyframe_value_cache;
+    Vector<Compositor::VisualAnimation> m_retained_compositor_animations;
+    bool m_is_compositor_driven { false };
+    bool m_is_compositor_replaced { false };
+    bool m_is_offscreen_throttled { false };
+    bool m_is_observation_relevant_compositor_animation { false };
+    bool m_needs_observation_sample { false };
+    struct CanSkipPerFrameStyleUpdateCache {
+        u64 target_style_generation { 0 };
+        u64 target_subtree_style_generation { 0 };
+        bool target_is_connected { false };
+        Layout::Node const* layout_node { nullptr };
+        bool result { false };
+    };
+    mutable Optional<CanSkipPerFrameStyleUpdateCache> m_can_skip_per_frame_style_update_cache;
+    Optional<u64> m_last_element_scoped_observation_sample_task_generation;
+    bool m_per_frame_animation_tick_was_skipped { false };
 };
 
 WebIDL::ExceptionOr<Vector<BaseKeyframe>> process_keyframes(JS::Realm&, GC::Ptr<JS::Object>);

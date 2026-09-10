@@ -46,10 +46,10 @@ public:
     Utf16String hash() const;
     void set_hash(Utf16View);
 
-protected:
     virtual DOM::Element& hyperlink_element_utils_element() = 0;
     virtual DOM::Element const& hyperlink_element_utils_element() const = 0;
 
+protected:
     // https://html.spec.whatwg.org/multipage/links.html#update-href
     virtual void update_href() = 0;
 
@@ -58,9 +58,11 @@ protected:
 
     Optional<URL::Origin> hyperlink_element_utils_extract_an_origin() const;
 
+    void href_content_attribute_changed();
     void reinitialize_url() const;
 
     Optional<URL::URL> m_url;
+    bool m_should_invalidate_style_after_url_change { true };
 };
 
 }

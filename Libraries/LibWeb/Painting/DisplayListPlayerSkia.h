@@ -7,17 +7,25 @@
 #pragma once
 
 #include <AK/Function.h>
+#include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
 #include <LibGfx/Forward.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListCommand.h>
-#include <LibWeb/Painting/DisplayListRecorder.h>
 
 class GrDirectContext;
+class SkColorFilter;
+class SkImageFilter;
 class SkPaint;
+template<typename T>
+class sk_sp;
 
 namespace Web::Painting {
+
+// The color filter force-dark runs classified images through: the same Oklab lightness inversion the solid colors
+// take — as a Skia runtime effect. Exposed so a benchmark can time the shipped effect, rather than a copy of it.
+WEB_API sk_sp<SkColorFilter> force_dark_image_color_filter();
 
 class WEB_API DisplayListPlayerSkia final : public DisplayListPlayer {
 public:
@@ -46,21 +54,37 @@ private:
     void play_command(command_type const&) override;
     ENUMERATE_DISPLAY_LIST_COMMANDS(DECLARE_PLAY_COMMAND)
 #undef DECLARE_PLAY_COMMAND
-    void play_command(ApplyEffects const&, Gfx::Filter const*) override;
     void set_matrix(Gfx::FloatMatrix4x4 const&) override;
     Gfx::FloatMatrix4x4 canvas_matrix() const override;
-
-    void add_clip_path(Gfx::Path const&, Gfx::WindingRule) override;
-
     bool would_be_fully_clipped_by_painter(Gfx::IntRect) const override;
 
+    void push_clip(ReplayClip const&) override;
+    void push_clip_path(Gfx::Path const&, Gfx::WindingRule) override;
+    void push_transform(Gfx::AffineTransform const&) override;
+    void push_layer(ReplayLayer const&) override;
+    void push_mask(ReplayMask const&) override;
+    void pop_mask(ReplayMask const&, EffectNodeIndex) override;
+    void pop() override;
+    void push_device_space_plane_clip(Gfx::Path const&) override;
+
+    void clip_path(Gfx::Path const&, Gfx::WindingRule, bool anti_aliased);
+
     SkPaint paint_style_to_skia_paint(DisplayListPaintStyle const&, Gfx::FloatRect const& bounding_rect);
+    sk_sp<SkImageFilter> layer_image_filter(ReplayLayer const&);
+    sk_sp<SkImageFilter> backdrop_image_filter(ReplayLayer const&, bool limited_to_region);
+    sk_sp<SkImageFilter> image_filter_from_bytes(ReadonlyBytes);
     Gfx::Path path_from_data(DisplayListDataSpan) const;
+    sk_sp<SkImage> rasterize_records_into_tile(ReadonlyBytes tile_records, Gfx::IntRect tile_rect);
     ReadonlySpan<Color> gradient_colors(DisplayListGradientColorStops) const;
     ReadonlySpan<float> gradient_positions(DisplayListGradientColorStops) const;
 
     RefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;
     CompositedContextResolver const* m_composited_context_resolver { nullptr };
+
+    // Layer filters are built from their bytes once per frame node and kept until the visual
+    // context tree's structure changes, so a replayed frame does not rebuild them.
+    struct LayerImageFilterCache;
+    NonnullOwnPtr<LayerImageFilterCache> m_layer_image_filter_cache;
 };
 
 }

@@ -12,18 +12,26 @@
 
 namespace Web::CSS {
 
+inline Utf16View url_text_from_rust_data(StyleValueFFI::RetainedString const& string)
+{
+    auto view = StyleValueFFI::rust_css_url_text_view(&string);
+    if (view.ascii)
+        return Utf16View { StringView { reinterpret_cast<char const*>(view.ascii), view.length } };
+    return Utf16View { reinterpret_cast<char16_t const*>(view.utf16), view.length };
+}
+
 // Marshals a URL's request URL modifiers for a Rust-owned allocation, retaining one leaked
 // reference to each string-valued modifier.
-inline Vector<StyleValueFFI::RetainedRequestUrlModifier> retain_url_modifiers_for_rust(URL const& url)
+inline Vector<StyleValueFFI::FfiRequestUrlModifier> retain_url_modifiers_for_rust(URL const& url)
 {
-    Vector<StyleValueFFI::RetainedRequestUrlModifier> modifiers;
+    Vector<StyleValueFFI::FfiRequestUrlModifier> modifiers;
     modifiers.ensure_capacity(url.request_url_modifiers().size());
     for (auto const& modifier : url.request_url_modifiers()) {
-        StyleValueFFI::RetainedRequestUrlModifier ffi_modifier { to_underlying(modifier.type()), 0, { 0 } };
+        StyleValueFFI::FfiRequestUrlModifier ffi_modifier { to_underlying(modifier.type()), 0, 0 };
         modifier.value().visit(
             [&](CrossOriginModifierValue value) { ffi_modifier.enum_value = to_underlying(value); },
             [&](ReferrerPolicyModifierValue value) { ffi_modifier.enum_value = to_underlying(value); },
-            [&](Utf16FlyString const& string) { ffi_modifier.string_value.raw = string.to_raw_leaked(); });
+            [&](Utf16FlyString const& string) { ffi_modifier.string_value = string.to_raw_leaked(); });
         modifiers.unchecked_append(ffi_modifier);
     }
     return modifiers;
@@ -41,23 +49,18 @@ inline URL url_from_rust_data(StyleValueFFI::RetainedString const& url_string, u
             modifiers.unchecked_append(RequestURLModifier::create_cross_origin(static_cast<CrossOriginModifierValue>(modifier.enum_value)));
             break;
         case RequestURLModifier::Type::Integrity:
-            modifiers.unchecked_append(RequestURLModifier::create_integrity(Utf16FlyString::from_raw(modifier.string_value.raw)));
+            modifiers.unchecked_append(RequestURLModifier::create_integrity(css_string_from_rust(&modifier.string_value)));
             break;
         case RequestURLModifier::Type::ReferrerPolicy:
             modifiers.unchecked_append(RequestURLModifier::create_referrer_policy(static_cast<ReferrerPolicyModifierValue>(modifier.enum_value)));
             break;
         }
     }
-    return URL(String::from_raw(url_string.raw), static_cast<URL::Type>(url_type), move(modifiers));
+    return URL(url_text_from_rust_data(url_string), static_cast<URL::Type>(url_type), move(modifiers));
 }
 
 class URLStyleValue final : public StyleValueWithDefaultOperators<URLStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<URLStyleValue const> create(URL const& url)
-    {
-        return adopt_ref(*new (nothrow) URLStyleValue(url));
-    }
-
     virtual ~URLStyleValue() override = default;
 
     URL url() const
@@ -66,30 +69,12 @@ public:
         return url_from_rust_data(data.url, data.url_type, data.modifiers);
     }
 
-    bool properties_equal(URLStyleValue const& other) const { return url() == other.url(); }
-
-    void serialize(StringBuilder& builder, SerializationMode) const { builder.append(url().to_string()); }
-
 private:
     friend class StyleValue;
 
     explicit URLStyleValue(StyleValueFFI::StyleValueData const* data)
         : StyleValueWithDefaultOperators(Type::URL, data)
     {
-    }
-
-    URLStyleValue(URL const& url)
-        : StyleValueWithDefaultOperators(Type::URL, make_url_data(url))
-    {
-    }
-
-    static StyleValueFFI::StyleValueData const* make_url_data(URL const& url)
-    {
-        // The Rust allocation takes ownership of one leaked reference to each retained string.
-        auto modifiers = retain_url_modifiers_for_rust(url);
-        auto url_string = url.url();
-        auto url_bytes = url_string.bytes();
-        return StyleValueFFI::rust_style_value_create_url(url_string.to_raw_leaked(), url_bytes.data(), url_bytes.size(), to_underlying(url.type()), modifiers.data(), modifiers.size());
     }
 };
 

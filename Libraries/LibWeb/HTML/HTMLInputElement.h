@@ -72,7 +72,7 @@ class WEB_API HTMLInputElement final
 public:
     virtual ~HTMLInputElement() override;
 
-    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
+    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
     virtual void set_being_activated(bool) override;
 
     enum class TypeAttributeState {
@@ -101,10 +101,12 @@ public:
     virtual void set_dirty_value_flag(bool flag) override { m_dirty_value = flag; }
 
     bool user_validity() const { return m_user_validity; }
-    void set_user_validity(bool flag) { m_user_validity = flag; }
+    void set_user_validity(bool);
 
     void commit_pending_changes();
     bool has_uncommitted_changes() { return m_has_uncommitted_changes; }
+
+    void ensure_user_agent_shadow_tree(Badge<Internals::Internals>) { create_shadow_tree_if_needed(); }
 
     Utf16String placeholder() const;
     Optional<Utf16String> placeholder_value() const;
@@ -196,6 +198,7 @@ public:
 
     // https://html.spec.whatwg.org/multipage/forms.html#concept-submit-button
     virtual bool is_submit_button() const override;
+    static bool is_submit_button(TypeAttributeState);
 
     bool is_single_line() const;
 
@@ -203,6 +206,9 @@ public:
     virtual void clear_algorithm() override;
 
     virtual void form_associated_element_was_inserted() override;
+    virtual void form_associated_element_was_removed(DOM::Node*) override;
+    virtual void form_associated_element_was_moved(GC::Ptr<DOM::Node>) override;
+    virtual void form_associated_element_form_owner_changed() override;
     virtual void form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     virtual WebIDL::ExceptionOr<void> cloned(Node&, bool) const override;
@@ -280,7 +286,10 @@ private:
     HTMLInputElement(DOM::Document&, DOM::QualifiedName);
 
     void type_attribute_changed(TypeAttributeState old_state, TypeAttributeState new_state);
+    RadioButtonGroupRegistry* radio_button_group_registry();
+    void update_radio_button_group_registration();
     virtual void computed_properties_changed() override;
+    virtual void prepare_for_style_computation() override { create_shadow_tree_if_needed(); }
 
     virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
@@ -305,6 +314,7 @@ private:
     // ^Layout::ImageProvider
     virtual bool is_image_pending() const override;
     virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override { return image_data(); }
+    virtual Layout::Node const* image_provider_layout_node() const override;
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void adopted_from(DOM::Document&) override;
 
@@ -404,6 +414,9 @@ private:
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
     bool m_user_validity { false };
+
+    GC::Ptr<RadioButtonGroupRegistry> m_radio_button_group_registry;
+    Utf16FlyString m_radio_button_group_name;
 
     // https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior
     bool m_before_legacy_pre_activation_behavior_checked { false };

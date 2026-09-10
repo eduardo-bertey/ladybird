@@ -27,11 +27,15 @@
 #include <QWidget>
 
 class QTimer;
+class QColorDialog;
+class QFileDialog;
+class QMessageBox;
 namespace Ladybird {
 
 class BrowserWindow;
 enum class ChromeIcon;
 class DownloadsPopover;
+class JavaScriptDialog;
 class PrivateSessionPopover;
 class WindowControlButton;
 
@@ -103,7 +107,6 @@ public:
 
 public slots:
     void focus_location_editor();
-    void location_edit_return_pressed();
 
 signals:
     void title_changed(int id, QString const&);
@@ -111,6 +114,7 @@ signals:
     void audio_play_state_changed(int id, Web::HTML::AudioPlayState);
 
 private:
+    void location_edit_return_pressed(String, Optional<URL::URL>, WebView::OmniboxDestinationKind);
     virtual void resizeEvent(QResizeEvent*) override;
     virtual bool event(QEvent*) override;
 
@@ -186,8 +190,12 @@ private:
     Optional<ChromeIcon> m_downloads_button_icon;
     QString m_downloads_button_tooltip;
 
-    QPointer<QDialog> m_dialog;
+    JavaScriptDialog* m_javascript_dialog { nullptr };
+    QPointer<QColorDialog> m_color_picker_dialog;
+    QPointer<QFileDialog> m_file_picker_dialog;
+    QPointer<QMessageBox> m_external_url_confirmation_dialog;
 
+    bool m_suppress_javascript_dialogs_until_navigation { false };
     bool m_already_requested_close { false };
 };
 

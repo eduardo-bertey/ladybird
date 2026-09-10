@@ -26,20 +26,14 @@ public:
     static ValueComparingNonnullRefPtr<ImageSetStyleValue const> create(Vector<Option>);
     virtual ~ImageSetStyleValue() override = default;
 
-    void serialize(StringBuilder&, SerializationMode) const;
-    bool equals(StyleValue const& other) const;
     virtual void load_any_resources(DOM::Document&) override;
 
-    virtual Optional<CSSPixels> natural_width(DOM::Document const&) const override;
-    virtual Optional<CSSPixels> natural_height(DOM::Document const&) const override;
-    virtual Optional<CSSPixelFraction> natural_aspect_ratio(DOM::Document const&) const override;
+    virtual Optional<Painting::ImagePaint> image_paint(Painting::ImagePaintRequest const&) const override;
+    virtual bool is_paintable(GC::Ptr<HTML::DecodedImageData>) const override;
+    virtual SizeWithAspectRatio natural_size(HTML::DecodedImageData const&) const override;
 
-    virtual void resolve_for_size(Layout::NodeWithStyle const&, CSSPixelSize) const override;
-    virtual bool is_paintable(DOM::Document const&) const override;
-    virtual void paint(DisplayListRecordingContext&, DOM::Document const&, DevicePixelRect const&, ImageRendering, PreferredColorScheme) const override;
-    virtual Optional<Gfx::Color> color_if_single_pixel_bitmap(DOM::Document const&) const override;
-
-    AbstractImageStyleValue const* selected_image() const { return m_selected_image; }
+    AbstractImageStyleValue const* selected_image() const;
+    Optional<size_t> selected_option_index() const { return m_selected_option_index; }
 
 private:
     explicit ImageSetStyleValue(Vector<Option>);
@@ -47,10 +41,10 @@ private:
 
     // NB: StyleValue dispatches operations by type tag, so it may call private impls.
     friend class StyleValue;
-    void set_style_sheet(GC::Ptr<CSSStyleSheet>);
+    void set_style_sheet(StyleSheetState*);
     ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    Optional<Option> select_option(double device_pixels_per_css_pixel) const;
+    Optional<size_t> select_option_index(double device_pixels_per_css_pixel) const;
 
     Vector<Option> const& options() const
     {
@@ -63,7 +57,7 @@ private:
             auto const& option = list.pointer[i];
             Optional<Utf16String> type;
             if (option.has_type)
-                type = Utf16String::from_raw(option.type_string.raw);
+                type = css_string_from_rust(&option.type_string).to_utf16_string();
             options.unchecked_append(Option {
                 .image = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
                                                                      static_cast<StyleValueFFI::StyleValueData const*>(option.image.pointer)))
@@ -80,7 +74,7 @@ private:
     static StyleValueFFI::StyleValueData const* make_image_set_data(Vector<Option> const&);
 
     mutable Optional<Vector<Option>> m_options;
-    mutable AbstractImageStyleValue const* m_selected_image { nullptr };
+    mutable Optional<size_t> m_selected_option_index;
     mutable double m_selected_resolution { 1 };
 };
 

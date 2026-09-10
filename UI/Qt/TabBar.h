@@ -10,6 +10,7 @@
 
 #include <AK/TypeCasts.h>
 #include <LibWebView/Settings.h>
+#include <UI/Qt/Tab.h>
 
 #include <QPointer>
 #include <QPushButton>
@@ -37,7 +38,6 @@ class QWheelEvent;
 
 namespace Ladybird {
 
-class Tab;
 class TabPreviewPopup;
 class TabWidget;
 
@@ -221,6 +221,8 @@ private:
     void accept_tab_drop(QDropEvent*, int index);
 
     TabBar* m_tab_bar { nullptr };
+    void size_hidden_pages_like_the_current_one();
+
     QStackedWidget* m_stacked_widget { nullptr };
     QToolButton* m_new_tab_button { nullptr };
     QToolButton* m_minimize_window_button { nullptr };
@@ -264,6 +266,7 @@ public:
 
 protected:
     virtual bool event(QEvent* event) override;
+    virtual void paintEvent(QPaintEvent*) override;
 };
 
 }

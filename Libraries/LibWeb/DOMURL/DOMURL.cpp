@@ -20,9 +20,9 @@ namespace Web::DOMURL {
 
 GC_DEFINE_ALLOCATOR(DOMURL);
 
-GC::Ref<DOMURL> DOMURL::create(URL::URL url, GC::Ref<URLSearchParams> query)
+GC::Ref<DOMURL> DOMURL::create(URL::URL url)
 {
-    return GC::Heap::the().allocate<DOMURL>(move(url), query);
+    return GC::Heap::the().allocate<DOMURL>(move(url));
 }
 
 // https://url.spec.whatwg.org/#api-url-parser
@@ -50,20 +50,8 @@ static Optional<URL::URL> parse_api_url(Utf16View url, Optional<Utf16String> con
 // https://url.spec.whatwg.org/#url-initialize
 GC::Ref<DOMURL> DOMURL::initialize_a_url(URL::URL const& url_record)
 {
-    // 1. Let query be urlRecord’s query, if that is non-null; otherwise the empty string.
-    auto query = url_record.query().value_or(String {});
-
-    // 2. Set url’s URL to urlRecord.
-    // 3. Set url’s query object to a new URLSearchParams object.
-    auto query_object = URLSearchParams::create(query);
-
-    // 4. Initialize url’s query object with query.
-    auto result_url = DOMURL::create(url_record, move(query_object));
-
-    // 5. Set url’s query object’s URL object to url.
-    result_url->m_query->m_url = result_url;
-
-    return result_url;
+    // OPTIMIZATION: Defer creating and initializing the query object until searchParams is accessed.
+    return DOMURL::create(url_record);
 }
 
 // https://url.spec.whatwg.org/#dom-url-parse
@@ -96,9 +84,8 @@ WebIDL::ExceptionOr<GC::Ref<DOMURL>> DOMURL::create_from_url(Utf16String const& 
     return initialize_a_url(parsed_url.value());
 }
 
-DOMURL::DOMURL(URL::URL url, GC::Ref<URLSearchParams> query)
+DOMURL::DOMURL(URL::URL url)
     : m_url(move(url))
-    , m_query(move(query))
 {
 }
 
@@ -191,15 +178,17 @@ WebIDL::ExceptionOr<void> DOMURL::set_href(Utf16String const& value)
     // 3. Set this’s URL to parsedURL.
     m_url = parsed_url.release_value();
 
-    // 4. Empty this’s query object’s list.
-    m_query->m_list.clear();
+    if (m_query) {
+        // 4. Empty this’s query object’s list.
+        m_query->m_list.clear();
 
-    // 5. Let query be this’s URL’s query.
-    auto query = m_url.query();
+        // 5. Let query be this’s URL’s query.
+        auto query = m_url.query();
 
-    // 6. If query is non-null, then set this’s query object’s list to the result of parsing query.
-    if (query.has_value())
-        m_query->m_list = url_decode(*query);
+        // 6. If query is non-null, then set this’s query object’s list to the result of parsing query.
+        if (query.has_value())
+            m_query->m_list = url_decode(*query);
+    }
     return {};
 }
 
@@ -382,7 +371,8 @@ void DOMURL::set_search(Utf16String const& search)
     // 2. If the given value is the empty string, then set url’s query to null, empty this’s query object’s list, and return.
     if (search.is_empty()) {
         url.set_query({});
-        m_query->m_list.clear();
+        if (m_query)
+            m_query->m_list.clear();
         return;
     }
 
@@ -397,14 +387,21 @@ void DOMURL::set_search(Utf16String const& search)
     (void)URL::Parser::basic_parse(input, {}, &url, URL::Parser::State::Query);
 
     // 6. Set this’s query object’s list to the result of parsing input.
-    m_query->m_list = url_decode(input);
+    if (m_query)
+        m_query->m_list = url_decode(input);
 }
 
 // https://url.spec.whatwg.org/#dom-url-searchparams
-GC::Ref<URLSearchParams const> DOMURL::search_params() const
+GC::Ref<URLSearchParams const> DOMURL::search_params()
 {
     // The searchParams getter steps are to return this’s query object.
-    return m_query;
+    if (!m_query) {
+        auto query = m_url.query().value_or(String {});
+        m_query = URLSearchParams::create(query);
+        m_query->m_url = this;
+    }
+
+    return *m_query;
 }
 
 // https://url.spec.whatwg.org/#dom-url-hash
@@ -439,12 +436,9 @@ void DOMURL::set_hash(Utf16String const& hash)
 }
 
 // https://url.spec.whatwg.org/#concept-url-parser
-Optional<URL::URL> parse_from_byte_string(StringView input, Optional<URL::URL const&> base_url, Optional<StringView> encoding)
+static Optional<URL::URL> finish_parsing(Optional<URL::URL> url)
 {
     // FIXME: We should probably have an extended version of URL::URL for LibWeb instead of standalone functions like this.
-
-    // 1. Let url be the result of running the basic URL parser on input with base and encoding.
-    auto url = URL::Parser::basic_parse(input, base_url, {}, {}, encoding);
 
     // 2. If url is failure, return failure.
     if (!url.has_value())
@@ -474,16 +468,22 @@ Optional<URL::URL> parse_from_byte_string(StringView input, Optional<URL::URL co
     return url.release_value();
 }
 
+Optional<URL::URL> parse_from_byte_string(StringView input, Optional<URL::URL const&> base_url, Optional<StringView> encoding)
+{
+    // 1. Let url be the result of running the basic URL parser on input with base and encoding.
+    return finish_parsing(URL::Parser::basic_parse(input, base_url, {}, {}, encoding));
+}
+
 Optional<URL::URL> parse(Utf16View input, Optional<URL::URL const&> base_url, Optional<Utf16View> encoding)
 {
-    auto input_utf8 = MUST(input.to_utf8());
     Optional<String> encoding_utf8;
     Optional<StringView> encoding_view;
     if (encoding.has_value()) {
         encoding_utf8 = MUST(encoding->to_utf8());
         encoding_view = encoding_utf8->bytes_as_string_view();
     }
-    return parse_from_byte_string(input_utf8.bytes_as_string_view(), base_url, encoding_view);
+    // 1. Let url be the result of running the basic URL parser on input with base and encoding.
+    return finish_parsing(URL::Parser::basic_parse(input, base_url, {}, {}, encoding_view));
 }
 
 // FIXME: At time of writing, still open spec MR: https://github.com/whatwg/url/pull/892

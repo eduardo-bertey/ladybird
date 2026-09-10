@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use super::*;
+
 pub(crate) fn to_physical<T>(writing_mode: u8, inline: T, block: T) -> (T, T) {
     if writing_mode == writing_mode::HORIZONTAL_TB {
         (inline, block)
@@ -20,9 +22,10 @@ pub(crate) fn to_logical<T>(writing_mode: u8, horizontal: T, vertical: T) -> (T,
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AvailableSize {
     Definite(CssPixels),
+    #[default]
     Indefinite,
     MinContent,
     MaxContent,
@@ -118,6 +121,9 @@ pub(crate) struct RootSizingDirectives {
     pub(crate) forced_content_inline_size: Option<CssPixels>,
     pub(crate) forced_content_block_size: Option<CssPixels>,
     pub(crate) forced_min_border_box_block_size: Option<CssPixels>,
+    // Input-only: the parent block formatting context supplies the inline size it resolved while
+    // positioning an independent child, so the child's run prelude can commit it without resolving it again.
+    pub(crate) block_parent_resolved_content_inline_size: Option<CssPixels>,
     // Input-only: the table formatting context supplies the cell's intrinsic block padding
     // (the vertical-alignment stretch) before laying out the cell's contents.
     pub(crate) table_cell_intrinsic_block_padding: Option<(CssPixels, CssPixels)>,
@@ -128,7 +134,7 @@ pub(crate) struct RootSizingDirectives {
     pub(crate) adopt_automatic_content_block_size: bool,
     pub(crate) flex_self_block_size_resolution_space: Option<AvailableSpace>,
     pub(crate) float_avoidance_inline_size: Option<CssPixels>,
-    pub(crate) outer_float_intrusion_before_list_item_children: SpaceUsedByFloats,
+    pub(crate) outer_float_intrusion_before_list_item_children: inline_formatting_context::SpaceUsedByFloats,
     pub(crate) treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
 }
 
@@ -137,7 +143,7 @@ pub(crate) enum ParticipationInParentFormattingContext {
     BlockLevel,
     Float,
     AtomicInline,
-    AbsolutelyPositioned(AbsposLayoutInputs),
+    AbsolutelyPositioned(abspos_inputs::AbsposLayoutInputs),
     Item,
     Root,
 }

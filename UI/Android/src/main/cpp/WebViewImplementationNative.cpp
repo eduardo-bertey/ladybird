@@ -46,7 +46,7 @@ WebViewImplementationNative::WebViewImplementationNative(jobject thiz)
     };
 }
 
-void WebViewImplementationNative::initialize_client(WebView::ViewImplementation::CreateNewClient)
+void WebViewImplementationNative::initialize_client(WebView::ViewImplementation::CreateNewClient, Optional<Web::HTML::CrossProcessId>)
 {
     m_client_state = {};
 
@@ -112,6 +112,9 @@ void WebViewImplementationNative::mouse_event(Web::MouseEvent::Type event_type, 
         Web::UIEvents::MouseButton::Primary,
         Web::UIEvents::KeyModifier::Mod_None,
         0,
+        0,
+        Web::WheelDeltaPrecision::Discrete,
+        Web::ScrollGesturePhase::None,
         0,
         nullptr
     };

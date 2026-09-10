@@ -51,6 +51,7 @@ public:
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-parent-css-rule
     GC::Ptr<CSSRule> parent_rule() const { return m_parent_rule; }
     void set_parent_rule(GC::Ptr<CSSRule> parent) { m_parent_rule = parent; }
+    static constexpr size_t parent_rule_offset() { return offsetof(CSSStyleDeclaration, m_parent_rule); }
 
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-owner-node
     Optional<DOM::AbstractElement> owner_node() const { return m_owner_node; }
@@ -77,6 +78,7 @@ protected:
 
     virtual void visit_edges(GC::Cell::Visitor&) override;
 
+    void prepare_to_update_style_attribute();
     void update_style_attribute();
 
 private:

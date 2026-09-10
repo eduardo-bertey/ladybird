@@ -9,44 +9,23 @@
 
 #pragma once
 
-#include <LibWeb/CSS/GridTrackSize.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
 namespace Web::CSS {
 
 class GridTrackSizeListStyleValue final : public StyleValueWithDefaultOperators<GridTrackSizeListStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<GridTrackSizeListStyleValue const> create(CSS::GridTrackSizeList grid_track_size_list);
     virtual ~GridTrackSizeListStyleValue() override = default;
 
-    static ValueComparingNonnullRefPtr<GridTrackSizeListStyleValue const> make_auto();
-    static ValueComparingNonnullRefPtr<GridTrackSizeListStyleValue const> make_none();
-
-    CSS::GridTrackSizeList grid_track_size_list() const;
-
-    // NB: Reads the Rust data directly; grid_track_size_list() materializes the whole list.
     bool is_empty() const { return !m_value->grid_track_size_list.is_subgrid && m_value->grid_track_size_list.entries.length == 0; }
-
-    void serialize(StringBuilder&, SerializationMode) const;
-
-    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
-
-    bool properties_equal(GridTrackSizeListStyleValue const& other) const { return grid_track_size_list() == other.grid_track_size_list(); }
 
 private:
     friend class StyleValue;
-
-    explicit GridTrackSizeListStyleValue(CSS::GridTrackSizeList grid_track_size_list)
-        : StyleValueWithDefaultOperators(Type::GridTrackSizeList, make_grid_track_size_list_data(grid_track_size_list))
-    {
-    }
 
     explicit GridTrackSizeListStyleValue(StyleValueFFI::StyleValueData const* data)
         : StyleValueWithDefaultOperators(Type::GridTrackSizeList, data)
     {
     }
-
-    static StyleValueFFI::StyleValueData const* make_grid_track_size_list_data(CSS::GridTrackSizeList const&);
 };
 
 }

@@ -7,7 +7,7 @@
 #include <AK/StringBuilder.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/Layout/SVGGraphicsBox.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/SVG/SVGGElement.h>
 
 namespace Web::SVG {
@@ -19,9 +19,9 @@ SVGGElement::SVGGElement(DOM::Document& document, DOM::QualifiedName qualified_n
 {
 }
 
-RefPtr<Layout::Node> SVGGElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+Layout::Node* SVGGElement::create_layout_node(CSS::LayoutStyle style)
 {
-    return make_ref_counted<Layout::SVGGraphicsBox>(document(), *this, style);
+    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGGraphicsBox);
 }
 
 }

@@ -15,8 +15,8 @@
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Infra/Strings.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/WebGL/EventNames.h>
 #include <LibWeb/WebGL/RemoteWebGLTransport.h>
 #include <LibWeb/WebGL/WebGLContextEvent.h>
@@ -166,12 +166,9 @@ void WebGLRenderingContext::did_update_canvas_content()
 {
     m_canvas_element->set_canvas_content_dirty();
 
-    // NB: Invalidate the cached DrawCanvas command so that if another change causes the display list to be
-    //     recorded, it contains the new content generation and damages the canvas. Don't request a display list
-    //     recording here: the new content reaches the compositor through the canvas surface registry when the
-    //     canvas is presented.
-    if (auto paintable = m_canvas_element->unsafe_paintable())
-        paintable->invalidate_paint_cache();
+    // NB: Don't request a display list recording here: the new content reaches the compositor through the canvas
+    //     surface registry when the canvas is presented, and the cached DrawCanvas command is invalidated when the
+    //     content generation moves in prepare_for_compositing.
     m_canvas_element->set_needs_repaint(InvalidateDisplayList::No);
 }
 

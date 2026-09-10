@@ -5,6 +5,7 @@
  */
 
 #include <LibGC/Heap.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/HTMLButtonElement.h>
 #include <LibWeb/HTML/HTMLFieldSetElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
@@ -13,7 +14,8 @@
 #include <LibWeb/HTML/HTMLOutputElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
-#include <LibWeb/Layout/FieldSetBox.h>
+#include <LibWeb/Layout/BlockContainer.h>
+#include <LibWeb/Painting/PaintFacts.h>
 
 namespace Web::HTML {
 
@@ -52,17 +54,42 @@ bool HTMLFieldSetElement::is_disabled() const
     return false;
 }
 
+void HTMLFieldSetElement::inserted()
+{
+    Base::inserted();
+
+    if (is_connected())
+        document().set_has_form_or_fieldset_element();
+}
+
 void HTMLFieldSetElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
-    if (name == HTML::AttributeNames::disabled) {
-        for_each_in_subtree_of_type<HTMLElement>([](auto& element) {
-            if (element.is_form_associated_custom_element())
-                element.update_face_disabled_state();
-            return TraversalDecision::Continue;
-        });
-    }
+    if (name == HTML::AttributeNames::disabled)
+        refresh_disabled_state_of_descendant_form_controls();
+}
+
+void HTMLFieldSetElement::children_changed(ChildrenChangedMetadata const& metadata)
+{
+    Base::children_changed(metadata);
+
+    if (metadata.type == ChildrenChangedMetadata::Type::Removal && is<HTMLLegendElement>(*metadata.node) && has_attribute(HTML::AttributeNames::disabled))
+        refresh_disabled_state_of_descendant_form_controls();
+}
+
+void HTMLFieldSetElement::refresh_disabled_state_of_descendant_form_controls()
+{
+    for_each_in_subtree_of_type<HTMLElement>([](auto& element) {
+        if (element.is_form_associated_custom_element())
+            element.update_face_disabled_state();
+        if (element.is_form_associated_element()) {
+            if (auto* input = as_if<HTMLInputElement>(element))
+                Painting::push_form_control_paint_facts(*input);
+            element.set_needs_repaint();
+        }
+        return TraversalDecision::Continue;
+    });
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-fieldset-elements
@@ -70,24 +97,29 @@ GC::Ptr<DOM::HTMLCollection> const& HTMLFieldSetElement::elements()
 {
     // The elements IDL attribute must return an HTMLCollection rooted at the fieldset element, whose filter matches listed elements.
     if (!m_elements) {
-        m_elements = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, [](DOM::Element const& element) {
+        auto filter = [](DOM::Element const& element) {
             if (auto const* form_associated_element = as_if<FormAssociatedElement>(element); form_associated_element && form_associated_element->is_listed())
                 return true;
 
             return false;
-        });
+        };
+        m_elements = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, move(filter), DOM::HTMLCollection::AttributeInvalidationType::FormControls, nullptr, DOM::HTMLCollection::Kind::FormControls);
     }
     return m_elements;
 }
 
-Layout::FieldSetBox* HTMLFieldSetElement::layout_node()
+Layout::Node* HTMLFieldSetElement::create_layout_node(CSS::LayoutStyle style)
 {
-    return static_cast<Layout::FieldSetBox*>(Node::layout_node());
-}
-
-RefPtr<Layout::Node> HTMLFieldSetElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
-{
-    return make_ref_counted<Layout::FieldSetBox>(document(), *this, style);
+    auto& fieldset_box = Layout::allocate_layout_node<Layout::BlockContainer>(document(), this, style, Layout::RustFFI::NodeKind::FieldSetBox);
+    // https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements
+    // If the computed outer display type is inline, the fieldset is expected to behave as inline-block. Otherwise, it
+    // is expected to behave as flow-root. This does not change the computed value.
+    if (fieldset_box.display().is_flow_inside()) {
+        fieldset_box.modify_computed_values([&](auto& values) {
+            values.set_display(CSS::Display { fieldset_box.display().outside(), CSS::DisplayInside::FlowRoot });
+        });
+    }
+    return &fieldset_box;
 }
 
 }

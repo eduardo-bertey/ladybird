@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/Optional.h>
 #include <AK/RefCounted.h>
@@ -20,6 +19,7 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/DocumentState.h>
+#include <LibWeb/HTML/SessionHistoryEntryIdentity.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
@@ -57,7 +57,6 @@ struct SessionHistoryDocumentStateDescriptor {
     DocumentResource resource;
     bool reload_pending { false };
     bool ever_populated { false };
-    bool is_provisional { false };
     Utf16String navigable_target_name;
     Vector<SessionHistoryNestedHistoryDescriptor> nested_histories;
 };
@@ -66,13 +65,29 @@ struct SessionHistoryDocumentStateDescriptor {
 struct SessionHistoryEntryScrollPositionData {
     // FIXME: Track all restorable scrollable regions. Currently only the viewport is persisted.
     Optional<CSSPixelPoint> viewport_scroll_position;
+};
 
-    bool operator==(SessionHistoryEntryScrollPositionData const&) const = default;
+struct SessionHistoryEntryPersistedState {
+    // AD-HOC: Persisted state crosses the process boundary separately from its entry, so retain the entry's full
+    // identity instead of relying on its Navigation API key, which replaceState() can share with another entry.
+    SessionHistoryEntryIdentity entry_identity;
+    SessionHistoryEntryScrollPositionData scroll_position_data;
 };
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry
 struct SessionHistoryEntryDescriptor {
     i32 step { 0 };
+    URL::URL url;
+    SessionHistoryDocumentStateDescriptor document_state;
+    StorageSerializationRecord classic_history_api_state;
+    StorageSerializationRecord navigation_api_state;
+    Utf16String navigation_api_key;
+    Utf16String navigation_api_id;
+    ScrollRestorationMode scroll_restoration_mode { ScrollRestorationMode::Auto };
+    SessionHistoryEntryScrollPositionData scroll_position_data;
+};
+
+struct PendingSessionHistoryEntryDescriptor {
     URL::URL url;
     SessionHistoryDocumentStateDescriptor document_state;
     StorageSerializationRecord classic_history_api_state;
@@ -115,6 +130,8 @@ public:
 
     [[nodiscard]] RefPtr<HTML::DocumentState> document_state() const;
     void set_document_state(RefPtr<HTML::DocumentState>);
+
+    [[nodiscard]] UniqueNodeID document_id() const;
 
     [[nodiscard]] StorageSerializationRecord const& classic_history_api_state() const { return m_classic_history_api_state; }
     void set_classic_history_api_state(StorageSerializationRecord classic_history_api_state) { m_classic_history_api_state = move(classic_history_api_state); }
@@ -176,12 +193,26 @@ private:
 };
 
 WEB_API SessionHistoryEntryDescriptor create_session_history_entry_descriptor(SessionHistoryEntry const&);
-WEB_API bool session_history_entry_descriptors_match(SessionHistoryEntryDescriptor const&, SessionHistoryEntryDescriptor const&);
-enum class MatchNestedHistories {
-    Yes,
-    No,
+
+WEB_API SessionHistoryEntryDescriptor create_initial_session_history_entry_descriptor(CrossProcessId document_state_id, Optional<URL::Origin> opener_origin, Optional<URL::URL> opener_base_url, Utf16String navigable_target_name);
+WEB_API SessionHistoryDocumentStateDescriptor create_session_history_document_state_descriptor(DocumentState const&);
+WEB_API PendingSessionHistoryEntryDescriptor create_pending_session_history_entry_descriptor(SessionHistoryEntry const&);
+WEB_API PendingSessionHistoryEntryDescriptor create_pending_session_history_entry_descriptor(SessionHistoryEntryDescriptor);
+WEB_API SessionHistoryEntryDescriptor create_session_history_entry_descriptor(PendingSessionHistoryEntryDescriptor, i32 step);
+WEB_API Optional<SessionHistoryEntryPersistedState> create_session_history_entry_persisted_state(SessionHistoryEntry const&);
+WEB_API SessionHistoryEntryIdentity session_history_entry_identity(SessionHistoryEntry const&);
+WEB_API SessionHistoryEntryIdentity session_history_entry_identity(SessionHistoryEntryDescriptor const&);
+
+// Document states already reconstructed from the UI process's descriptors, so entries that share a document state
+// there share one here too.
+struct SessionHistoryEntryReconstructionState {
+    HashMap<CrossProcessId, RefPtr<DocumentState>> document_states;
 };
-WEB_API bool session_history_entry_matches_descriptor_ignoring_document_state_id(SessionHistoryEntry const&, SessionHistoryEntryDescriptor const&, MatchNestedHistories = MatchNestedHistories::Yes);
+
+WEB_API void apply_session_history_entry_descriptor_from_ui_process(SessionHistoryEntry&, SessionHistoryEntryDescriptor&);
+WEB_API void apply_session_history_document_state_descriptor_from_ui_process(DocumentState&, SessionHistoryDocumentStateDescriptor const&);
+WEB_API RefPtr<DocumentState> get_or_create_document_state_from_ui_process(SessionHistoryDocumentStateDescriptor const&, SessionHistoryEntryReconstructionState&);
+WEB_API NonnullRefPtr<SessionHistoryEntry> create_session_history_entry_from_ui_process(SessionHistoryEntryDescriptor, SessionHistoryEntryReconstructionState&);
 
 }
 
@@ -194,10 +225,22 @@ template<>
 WEB_API ErrorOr<Web::HTML::SessionHistoryEntryDescriptor> decode(Decoder&);
 
 template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::PendingSessionHistoryEntryDescriptor const&);
+
+template<>
+WEB_API ErrorOr<Web::HTML::PendingSessionHistoryEntryDescriptor> decode(Decoder&);
+
+template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryEntryScrollPositionData const&);
 
 template<>
 WEB_API ErrorOr<Web::HTML::SessionHistoryEntryScrollPositionData> decode(Decoder&);
+
+template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryEntryPersistedState const&);
+
+template<>
+WEB_API ErrorOr<Web::HTML::SessionHistoryEntryPersistedState> decode(Decoder&);
 
 template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryDocumentStateDescriptor const&);

@@ -13,7 +13,6 @@
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorInterpolationMethodStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
-#include <LibWeb/Painting/GradientPainting.h>
 
 namespace Web::CSS {
 
@@ -45,65 +44,22 @@ public:
         return adopt_ref(*new (nothrow) LinearGradientStyleValue(move(direction), move(color_stop_list), type, repeating, move(color_interpolation_method), any_non_legacy ? ColorSyntax::Modern : ColorSyntax::Legacy));
     }
 
-    void serialize(StringBuilder&, SerializationMode) const;
     virtual ~LinearGradientStyleValue() override = default;
-    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
-    bool equals(StyleValue const& other) const;
+    Optional<Painting::ImagePaint> image_paint(Painting::ImagePaintRequest const&) const override;
 
-    Vector<ColorStopListElement> color_stop_list() const
-    {
-        auto const& list = m_value->linear_gradient.color_stop_list;
-        return color_stops_from_rust_data(list.pointer, list.length);
-    }
-
-    GradientDirection direction() const
-    {
-        return m_direction;
-    }
-
-    // FIXME: This (and the any_non_legacy code in the constructor) is duplicated in the separate gradient classes,
-    // should this logic be pulled into some kind of GradientStyleValue superclass?
-    // It could also contain the "gradient related things" currently in AbstractImageStyleValue.h
-    ColorInterpolationMethodStyleValue::ColorInterpolationMethod interpolation_method() const
-    {
-        if (auto interpolation_method_value = color_interpolation_method_value())
-            return interpolation_method_value->as_color_interpolation_method().color_interpolation_method();
-
-        return ColorInterpolationMethodStyleValue::default_color_interpolation_method(gradient_color_syntax());
-    }
-
-    bool is_repeating() const { return m_value->linear_gradient.repeating; }
-
-    float angle_degrees(CSSPixelSize gradient_size) const;
-
-    void resolve_for_size(Layout::NodeWithStyle const&, CSSPixelSize) const override;
-
-    bool is_paintable(DOM::Document const&) const override { return true; }
-    void paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering image_rendering, PreferredColorScheme) const override;
+    bool is_paintable(GC::Ptr<HTML::DecodedImageData>) const override { return true; }
 
 private:
     friend class StyleValue;
 
     LinearGradientStyleValue(GradientDirection direction, Vector<ColorStopListElement> color_stop_list, GradientType type, GradientRepeating repeating, ValueComparingRefPtr<StyleValue const> color_interpolation_method, ColorSyntax color_syntax)
         : AbstractImageStyleValue(Type::LinearGradient, make_linear_gradient_data(direction, color_stop_list, type, repeating, color_interpolation_method, color_syntax))
-        , m_direction(move(direction))
-        , m_color_interpolation_method(move(color_interpolation_method))
     {
     }
 
     explicit LinearGradientStyleValue(StyleValueFFI::StyleValueData const*);
 
     static StyleValueFFI::StyleValueData const* make_linear_gradient_data(GradientDirection const&, Vector<ColorStopListElement> const&, GradientType, GradientRepeating, RefPtr<StyleValue const> const&, ColorSyntax);
-
-    ValueComparingRefPtr<StyleValue const> color_interpolation_method_value() const { return m_color_interpolation_method; }
-    GradientType gradient_type() const { return static_cast<GradientType>(m_value->linear_gradient.gradient_type); }
-    ColorSyntax gradient_color_syntax() const { return static_cast<ColorSyntax>(m_value->linear_gradient.color_syntax); }
-
-    GradientDirection m_direction;
-    ValueComparingRefPtr<StyleValue const> m_color_interpolation_method;
-
-    mutable Optional<CSSPixelSize> m_resolved_size;
-    mutable Optional<Painting::LinearGradientData> m_resolved;
 };
 
 }

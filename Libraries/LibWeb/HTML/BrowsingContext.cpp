@@ -358,21 +358,15 @@ GC::Ptr<BrowsingContext> BrowsingContext::top_level_browsing_context() const
     return navigable->active_browsing_context();
 }
 
-// https://html.spec.whatwg.org/multipage/document-sequences.html#active-document
+// https://html.spec.whatwg.org/multipage/browsers.html#active-document
 DOM::Document const* BrowsingContext::active_document() const
 {
-    // AD-HOC: The HTML Standard currently defines this as the active window's associated Document.
-    //         That changes too early when the initial about:blank Window is reused for its first
-    //         same-origin navigation, because create-and-initialize updates the associated Document
-    //         before the new Document is made active.
-    //         Spec issue: https://github.com/whatwg/html/issues/12415
     return m_active_document.ptr();
 }
 
-// https://html.spec.whatwg.org/multipage/document-sequences.html#active-document
+// https://html.spec.whatwg.org/multipage/browsers.html#active-document
 DOM::Document* BrowsingContext::active_document()
 {
-    // AD-HOC: See the const overload above.
     return m_active_document.ptr();
 }
 
@@ -565,7 +559,10 @@ SandboxingFlagSet determine_the_creation_sandboxing_flags(BrowsingContext const&
 
 bool BrowsingContext::has_navigable_been_destroyed() const
 {
-    auto navigable = active_document()->navigable();
+    auto const* document = active_document();
+    if (!document)
+        return true;
+    auto navigable = document->navigable();
     return !navigable || navigable->has_been_destroyed();
 }
 

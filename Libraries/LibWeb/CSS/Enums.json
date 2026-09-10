@@ -151,9 +151,34 @@
     "round",
     "space"
   ],
+  "box-decoration-break": [
+    "slice",
+    "clone"
+  ],
   "box-sizing": [
     "border-box",
     "content-box"
+  ],
+  "break-between": [
+    "auto",
+    "avoid",
+    "avoid-page",
+    "page",
+    "left",
+    "right",
+    "recto",
+    "verso",
+    "avoid-column",
+    "column",
+    "avoid-region",
+    "region"
+  ],
+  "break-inside": [
+    "auto",
+    "avoid",
+    "avoid-page",
+    "avoid-column",
+    "avoid-region"
   ],
   "caption-side": [
     "top",
@@ -187,6 +212,11 @@
     "linearrgb",
     "srgb"
   ],
+  "column-fill": [
+    "auto",
+    "balance",
+    "balance-all"
+  ],
   "column-span": [
     "none",
     "all"
@@ -219,6 +249,12 @@
   "contextual-alt-value": [
     "contextual",
     "no-contextual"
+  ],
+  "continue-value": [
+    "auto",
+    "discard",
+    "collapse",
+    "-webkit-legacy"
   ],
   "coord-box": [
     "content-box",
@@ -578,6 +614,12 @@
     "auto",
     "none"
   ],
+  "font-smoothing": [
+    "auto",
+    "none",
+    "antialiased",
+    "subpixel-antialiased"
+  ],
   "font-style-keyword": [
     "normal",
     "italic",
@@ -810,6 +852,11 @@
     "scroll",
     "visible"
   ],
+  "overflow-wrap": [
+    "normal",
+    "break-word",
+    "anywhere"
+  ],
   "page-size": [
     "a5",
     "a4",
@@ -961,6 +1008,28 @@
   "scroll-behavior": [
     "auto",
     "smooth"
+  ],
+  "scroll-snap-align": [
+    "none",
+    "start",
+    "end",
+    "center"
+  ],
+  "scroll-snap-axis": [
+    "x",
+    "y",
+    "block",
+    "inline",
+    "both"
+  ],
+  "scroll-snap-stop": [
+    "normal",
+    "always"
+  ],
+  "scroll-snap-strictness": [
+    "none",
+    "proximity",
+    "mandatory"
   ],
   "scrollbar-gutter": [
     "auto",
@@ -1173,6 +1242,10 @@
     "collapse",
     "hidden",
     "visible"
+  ],
+  "webkit-box-orient": [
+    "horizontal",
+    "vertical"
   ],
   "white-space": [
     "normal",

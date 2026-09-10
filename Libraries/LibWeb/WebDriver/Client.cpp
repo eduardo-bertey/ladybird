@@ -17,12 +17,13 @@
 #include <AK/StringBuilder.h>
 #include <AK/StringView.h>
 #include <AK/Time.h>
+#include <LibCore/Promise.h>
 #include <LibHTTP/Status.h>
 #include <LibWeb/WebDriver/Client.h>
 
 namespace Web::WebDriver {
 
-using RouteHandler = Response (*)(Client&, Parameters, JsonValue);
+using RouteHandler = Client::ResponsePromise (*)(Client&, Parameters, JsonValue);
 
 struct Route {
     HTTP::HttpRequest::Method method {};
@@ -33,6 +34,7 @@ struct Route {
 struct MatchedRoute {
     RouteHandler handler;
     Vector<String> parameters;
+    bool is_session_command { false };
 };
 
 #define ROUTE(method, path, handler)                              \
@@ -74,7 +76,6 @@ static constexpr auto s_webdriver_endpoints = Array {
     ROUTE(POST, "/session/:session_id/ladybird/crash-current-page"sv, crash_current_page),
     ROUTE(POST, "/session/:session_id/ladybird/load-url-from-ui"sv, load_url_from_ui),
     ROUTE(POST, "/session/:session_id/ladybird/traverse-history-from-ui"sv, traverse_history_from_ui),
-    ROUTE(POST, "/session/:session_id/ladybird/mark-web-content-session-history-stale"sv, mark_web_content_session_history_stale),
     ROUTE(GET, "/session/:session_id/ladybird/session-history"sv, get_session_history),
     ROUTE(POST, "/session/:session_id/element"sv, find_element),
     ROUTE(POST, "/session/:session_id/elements"sv, find_elements),
@@ -167,7 +168,11 @@ static ErrorOr<MatchedRoute, Error> match_route(HTTP::HttpRequest const& request
 
         if (*match) {
             dbgln_if(WEBDRIVER_ROUTE_DEBUG, "- Found match with parameters={}", parameters);
-            return MatchedRoute { route.handler, move(parameters) };
+            return MatchedRoute {
+                route.handler,
+                move(parameters),
+                route.path.starts_with("/session/:session_id"sv),
+            };
         }
     }
 
@@ -179,6 +184,13 @@ static JsonValue make_success_response(JsonValue value)
     JsonObject result;
     result.set("value"sv, move(value));
     return result;
+}
+
+static bool is_keep_alive_request(HTTP::HttpRequest const& request)
+{
+    if (auto it = request.headers().headers().find_if([](auto& header) { return header.name.equals_ignoring_ascii_case("Connection"sv); }); !it.is_end())
+        return it->value.trim_whitespace().equals_ignoring_ascii_case("keep-alive"sv);
+    return false;
 }
 
 Client::Client(NonnullOwnPtr<Core::BufferedTCPSocket> socket)
@@ -197,6 +209,13 @@ Client::~Client()
 
 void Client::die()
 {
+    if (m_is_dying)
+        return;
+    m_is_dying = true;
+
+    // A dying connection will never service its queued requests, so drop them.
+    m_pending_requests.clear();
+
     // We defer removing this connection to avoid closing its socket while we are inside the on_ready_to_read callback.
     deferred_invoke([this] {
         if (on_death)
@@ -227,25 +246,73 @@ ErrorOr<void, Client::WrappedError> Client::on_ready_to_read()
 
     auto parsed_request = HTTP::HttpRequest::from_raw_request(m_remaining_request.string_view().bytes());
 
-    // If the request is not complete, we need to wait for more data to arrive.
-    if (parsed_request.is_error() && parsed_request.error() == HTTP::HttpRequest::ParseError::RequestIncomplete)
+    if (parsed_request.is_error()) {
+        // If the request is not complete, we need to wait for more data to arrive.
+        if (parsed_request.error() == HTTP::HttpRequest::ParseError::RequestIncomplete)
+            return {};
+
+        m_remaining_request.clear();
+        handle_error(HTTP::HttpRequest { HTTP::HeaderList::create() }, parsed_request.release_error());
         return {};
+    }
 
     m_remaining_request.clear();
-    auto request = parsed_request.release_value();
+    auto pending_request = adopt_ref(*new PendingRequest(parsed_request.release_value()));
+    m_pending_requests.enqueue(move(pending_request));
 
-    deferred_invoke([this, request = move(request)]() {
-        auto body = read_body_as_json(request);
+    if (m_pending_requests.size() == 1)
+        process_next_pending_request();
+
+    return {};
+}
+
+void Client::process_next_pending_request()
+{
+    if (m_is_dying)
+        return;
+
+    deferred_invoke([this_ref = NonnullRefPtr { *this }] {
+        if (this_ref->m_is_dying)
+            return;
+
+        auto pending_request = this_ref->m_pending_requests.head();
+        auto body = read_body_as_json(pending_request->http_request);
         if (body.is_error()) {
-            handle_error(request, body.release_error());
+            this_ref->handle_error(pending_request->http_request, body.release_error());
+            this_ref->dequeue_current_pending_request();
             return;
         }
 
-        if (auto result = handle_request(request, body.release_value()); result.is_error())
-            handle_error(request, result.release_error());
-    });
+        auto initial_result = this_ref->handle_request(pending_request->http_request, body.release_value());
+        if (initial_result.is_error()) {
+            this_ref->handle_error(pending_request->http_request, initial_result.release_error());
+            this_ref->dequeue_current_pending_request();
+            return;
+        }
 
-    return {};
+        auto promise = initial_result.release_value();
+        promise->when_resolved([this_ref, pending_request](JsonValue& value) {
+                   auto response_error = this_ref->send_success_response(pending_request->http_request, value);
+                   if (response_error.is_error())
+                       this_ref->handle_error(pending_request->http_request, response_error.release_error());
+
+                   this_ref->dequeue_current_pending_request();
+               })
+            .when_rejected([this_ref, pending_request](Error& error) {
+                this_ref->handle_error(pending_request->http_request, error);
+                this_ref->dequeue_current_pending_request();
+            });
+    });
+}
+
+void Client::dequeue_current_pending_request()
+{
+    if (m_is_dying)
+        return;
+
+    (void)m_pending_requests.dequeue();
+    if (!m_pending_requests.is_empty())
+        process_next_pending_request();
 }
 
 ErrorOr<JsonValue, Client::WrappedError> Client::read_body_as_json(HTTP::HttpRequest const& request)
@@ -254,7 +321,7 @@ ErrorOr<JsonValue, Client::WrappedError> Client::read_body_as_json(HTTP::HttpReq
     // FIXME: Check the Content-Type is actually application/json.
     size_t content_length = 0;
 
-    for (auto const& header : request.headers()) {
+    for (auto const& header : request.headers().headers()) {
         if (header.name.equals_ignoring_ascii_case("Content-Length"sv)) {
             content_length = header.value.to_number<size_t>(TrimWhitespace::Yes).value_or(0);
             break;
@@ -267,40 +334,47 @@ ErrorOr<JsonValue, Client::WrappedError> Client::read_body_as_json(HTTP::HttpReq
     return TRY(JsonValue::from_string(request.body()));
 }
 
-ErrorOr<void, Client::WrappedError> Client::handle_request(HTTP::HttpRequest const& request, JsonValue body)
+ErrorOr<Client::ResponsePromise, Client::WrappedError> Client::handle_request(HTTP::HttpRequest const& request, JsonValue body)
 {
     if constexpr (WEBDRIVER_DEBUG) {
         dbgln("Got HTTP request: {} {}", request.method_name(), request.resource());
         dbgln("Body: {}", body);
     }
 
-    auto [handler, parameters] = TRY(match_route(request));
-    auto result = TRY((*handler)(*this, move(parameters), move(body)));
-    return send_success_response(request, move(result));
+    auto [handler, parameters, is_session_command] = TRY(match_route(request));
+    if (!is_session_command)
+        return (*handler)(*this, move(parameters), move(body));
+
+    VERIFY(!parameters.is_empty());
+    auto session_id = parameters[0];
+    auto request_handler = [this_ref = NonnullRefPtr { *this }, handler, parameters = move(parameters), body = move(body)]() mutable {
+        return (*handler)(*this_ref, move(parameters), move(body));
+    };
+    return enqueue_session_request(session_id, move(request_handler));
 }
 
 void Client::handle_error(HTTP::HttpRequest const& request, WrappedError const& error)
 {
     error.visit(
-        [](AK::Error const& error) {
+        [&](AK::Error const& error) {
             warnln("Internal error: {}", error);
+            die();
         },
-        [](HTTP::HttpRequest::ParseError const& error) {
+        [&](HTTP::HttpRequest::ParseError const& error) {
             warnln("HTTP request parsing error: {}", HTTP::HttpRequest::parse_error_to_string(error));
+            die();
         },
         [&](WebDriver::Error const& error) {
-            if (send_error_response(request, error).is_error())
+            if (send_error_response(request, error).is_error()) {
                 warnln("Could not send error response");
+                die();
+            }
         });
-
-    die();
 }
 
 ErrorOr<void, Client::WrappedError> Client::send_success_response(HTTP::HttpRequest const& request, JsonValue result)
 {
-    bool keep_alive = false;
-    if (auto it = request.headers().headers().find_if([](auto& header) { return header.name.equals_ignoring_ascii_case("Connection"sv); }); !it.is_end())
-        keep_alive = it->value.trim_whitespace().equals_ignoring_ascii_case("keep-alive"sv);
+    auto keep_alive = is_keep_alive_request(request);
 
     result = make_success_response(move(result));
     auto content = result.serialized();
@@ -332,6 +406,7 @@ ErrorOr<void, Client::WrappedError> Client::send_error_response(HTTP::HttpReques
     // FIXME: Implement to spec.
     dbgln_if(WEBDRIVER_DEBUG, "Sending error response: {} {}: {}", error.http_status, error.error, error.message);
     auto reason = HTTP::reason_phrase_for_code(error.http_status);
+    auto keep_alive = is_keep_alive_request(request);
 
     JsonObject error_response;
     error_response.set("error"sv, error.error);
@@ -347,6 +422,8 @@ ErrorOr<void, Client::WrappedError> Client::send_error_response(HTTP::HttpReques
 
     StringBuilder builder;
     builder.appendff("HTTP/1.1 {} {}\r\n", error.http_status, reason);
+    if (keep_alive)
+        builder.append("Connection: keep-alive\r\n"sv);
     builder.append("Cache-Control: no-cache\r\n"sv);
     builder.append("Content-Type: application/json; charset=utf-8\r\n"sv);
     builder.appendff("Content-Length: {}\r\n", content.byte_count());
@@ -354,6 +431,9 @@ ErrorOr<void, Client::WrappedError> Client::send_error_response(HTTP::HttpReques
     builder.append(content);
 
     TRY(m_socket->write_until_depleted(builder.string_view()));
+
+    if (!keep_alive)
+        die();
 
     log_response(request, error.http_status);
     return {};

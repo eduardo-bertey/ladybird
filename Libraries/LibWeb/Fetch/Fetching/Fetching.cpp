@@ -169,7 +169,7 @@ static void store_response_in_cache(HTTP::MemoryCache& http_cache, Infrastructur
 }
 
 // https://fetch.spec.whatwg.org/#concept-fetch
-GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure::Request& request, Infrastructure::FetchAlgorithms const& algorithms, UseParallelQueue use_parallel_queue)
+GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure::Request& request, Infrastructure::FetchAlgorithms const& algorithms, UseParallelQueue use_parallel_queue, CreateResponseBodyTransferLease create_response_body_transfer_lease)
 {
     dbgln_if(WEB_FETCH_DEBUG, "Fetch: Running 'fetch' with: request @ {}", &request);
 
@@ -216,6 +216,7 @@ GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure:
     fetch_params->set_algorithms(algorithms);
     fetch_params->set_task_destination(task_destination);
     fetch_params->set_cross_origin_isolated_capability(cross_origin_isolated_capability);
+    fetch_params->set_has_response_body_transfer_lease(create_response_body_transfer_lease == CreateResponseBodyTransferLease::Yes);
 
     // 9. If request’s body is a byte sequence, then set request’s body to request’s body as a body.
     if (auto const* buffer = request.body().get_pointer<ByteBuffer>())
@@ -375,7 +376,7 @@ void populate_request_from_client(Infrastructure::Request& request)
             //    user prompts to global’s navigable’s traversable navigable.
             if (auto const* window = HTML::window_from_global_object(global)) {
                 if (window->navigable())
-                    request.set_traversable_for_user_prompts(window->navigable()->traversable_navigable());
+                    request.set_traversable_for_user_prompts(GC::Ptr<HTML::Navigable> { window->navigable()->traversable_navigable() });
             }
         }
     }
@@ -678,11 +679,16 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
             // 17. Set internalResponse’s redirect taint to request’s redirect-taint.
             internal_response->set_redirect_taint(request->redirect_taint());
 
-            // 18. If request’s timing allow failed flag is unset, then set internalResponse’s timing allow passed flag.
+            // 18. If request is a navigation request, then set internalResponse's navigation timing allow values list
+            //     to a clone of request's navigation timing allow values list.
+            if (request->is_navigation_request())
+                internal_response->set_navigation_timing_allow_values_list(request->navigation_timing_allow_values_list());
+
+            // 19. If request’s timing allow failed flag is unset, then set internalResponse’s timing allow passed flag.
             if (!request->timing_allow_failed())
                 internal_response->set_timing_allow_passed(true);
 
-            // 19. If response is not a network error and any of the following returns blocked
+            // 20. If response is not a network error and any of the following returns blocked
             if (!response->is_network_error() && (
                     // - should internalResponse to request be blocked as mixed content
                     MixedContent::should_response_to_request_be_blocked_as_mixed_content(request, internal_response) == Infrastructure::RequestOrResponseBlocking::Blocked
@@ -696,7 +702,7 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
                 response = internal_response = Infrastructure::Response::network_error("Response was blocked"_string);
             }
 
-            // 20. If response’s type is "opaque", internalResponse’s status is 206, internalResponse’s range-requested
+            // 21. If response’s type is "opaque", internalResponse’s status is 206, internalResponse’s range-requested
             //     flag is set, and request’s header list does not contain `Range`, then set response and
             //     internalResponse to a network error.
             // NOTE: Traditionally, APIs accept a ranged response even if a range was not requested. This prevents a
@@ -709,14 +715,14 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
                 response = internal_response = Infrastructure::Response::network_error("Response has status 206 and 'range-requested' flag set, but request has no 'Range' header"_string);
             }
 
-            // 21. If response is not a network error and either request’s method is `HEAD` or `CONNECT`, or
+            // 22. If response is not a network error and either request’s method is `HEAD` or `CONNECT`, or
             //     internalResponse’s status is a null body status, set internalResponse’s body to null and disregard
             //     any enqueuing toward it (if any).
             // NOTE: This standardizes the error handling for servers that violate HTTP.
             if (!response->is_network_error() && (request->method().is_one_of("HEAD"sv, "CONNECT"sv) || Infrastructure::is_null_body_status(internal_response->status())))
                 internal_response->set_body({});
 
-            // 22. If request’s integrity metadata is not the empty string, then:
+            // 23. If request’s integrity metadata is not the empty string, then:
             if (!request->integrity_metadata().is_empty()) {
                 // 1. Let processBodyError be this step: run fetch response handover given fetchParams and a network
                 //    error.
@@ -748,7 +754,7 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
                 // 4. Fully read response’s body given processBody and processBodyError.
                 response->body()->fully_read(realm, process_body, process_body_error, fetch_params.task_destination());
             }
-            // 23. Otherwise, run fetch response handover given fetchParams and response.
+            // 24. Otherwise, run fetch response handover given fetchParams and response.
             else {
                 fetch_response_handover(realm, fetch_params, *response);
             }
@@ -791,7 +797,16 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
             timing_info->set_server_timing_headers(server_timing_headers.release_value());
     }
 
-    // AD-HOC: We extract steps 1-3 of processResponseEndOfBody into a separate lambda so we can also call it from
+    // https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object
+    // NOTE: The create and initialize a Document object algorithm extracts full timing info for navigation requests
+    //       whose destination can also be "embed", "frame", "iframe", or "object".
+
+    // 3. If fetchParams's request's destination is "document", then set fetchParams's controller's full timing info
+    //    to fetchParams's timing info.
+    if (fetch_params.request()->is_navigation_request())
+        fetch_params.controller()->set_full_timing_info(fetch_params.timing_info());
+
+    // AD-HOC: We extract steps 1-2 of processResponseEndOfBody into a separate lambda so we can also call it from
     //         the error path. The fetch spec only runs processResponseEndOfBody on successful body read (via the
     //         transform stream's flush algorithm). However, processResponseConsumeBody is called for both success
     //         and failure, and specs like HTML's preload algorithm expect to be able to call reportTiming from
@@ -801,12 +816,7 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
         // 1. Let unsafeEndTime be the unsafe shared current time.
         auto unsafe_end_time = HighResolutionTime::unsafe_shared_current_time();
 
-        // 2. If fetchParams’s request’s destination is "document", then set fetchParams’s controller’s full timing
-        //    info to fetchParams’s timing info.
-        if (fetch_params.request()->destination() == Infrastructure::Request::Destination::Document)
-            fetch_params.controller()->set_full_timing_info(fetch_params.timing_info());
-
-        // 3. Set fetchParams’s controller’s report timing steps to the following steps given a global object global:
+        // 2. Set fetchParams’s controller’s report timing steps to the following steps given a global object global:
         fetch_params.controller()->set_report_timing_steps([&response, &fetch_params, timing_info, unsafe_end_time](JS::Object& global) mutable {
             // 1. If fetchParams’s request’s URL’s scheme is not an HTTP(S) scheme, then return.
             if (!Infrastructure::is_http_or_https_scheme(fetch_params.request()->url().scheme()))
@@ -862,7 +872,7 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
 
     // 3. Let processResponseEndOfBody be the following steps:
     auto process_response_end_of_body = [&fetch_params, &response, setup_report_timing_steps] {
-        // 1-3. (See setup_report_timing_steps above)
+        // 1-2. (See setup_report_timing_steps above)
         setup_report_timing_steps();
 
         // 4. Let processResponseEndOfBodyTask be the following steps:
@@ -1403,11 +1413,16 @@ GC::Ref<PendingResponse> http_fetch(JS::Realm& realm, Infrastructure::FetchParam
 
         // 6. If internalResponse’s status is a redirect status:
         if (Infrastructure::is_redirect_status(internal_response->status())) {
-            // FIXME: 1. If internalResponse’s status is not 303, request’s body is non-null, and the connection uses HTTP/2,
+            // 1. If request is a navigation request, then append to request's navigation timing allow values list
+            //    given request and internalResponse.
+            if (request->is_navigation_request())
+                request->append_to_navigation_timing_allow_values_list(*internal_response);
+
+            // FIXME: 2. If internalResponse’s status is not 303, request’s body is non-null, and the connection uses HTTP/2,
             //           then user agents may, and are even encouraged to, transmit an RST_STREAM frame.
             // NOTE: 303 is excluded as certain communities ascribe special status to it.
 
-            // 2. Switch on request’s redirect mode:
+            // 3. Switch on request’s redirect mode:
             switch (request->redirect_mode()) {
             // -> "error"
             case Infrastructure::Request::RedirectMode::Error:
@@ -1475,10 +1490,10 @@ GC::Ptr<PendingResponse> http_redirect_fetch(JS::Realm& realm, Infrastructure::F
     if (!location_url_or_error.is_error() && !location_url_or_error.value().has_value())
         return PendingResponse::create(request, response);
 
-    // AD-HOC: Navigation responses are kept alive in RequestServer so they can be transferred to the UI process if
-    //         they become downloads. This response will be discarded in favor of either a network error or the
-    //         redirect response, so release that hold and stop the request if it is still active.
-    internal_response->release_request_for_transfer();
+    // AD-HOC: Navigation responses have a RequestServer transfer lease so they can move through the UI process.
+    //         This response will be discarded in favor of either a network error or the redirect response, so
+    //         release its lease and stop the request if it is still active.
+    internal_response->release_request_transfer_lease();
     if (auto const& request_server_request = internal_response->request_server_request(); request_server_request.has_value() && request_server_request->request)
         request_server_request->request->stop();
 
@@ -1767,7 +1782,7 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
         // 15. If httpRequest’s header list does not contain `User-Agent`, then user agents should append
         //     (`User-Agent`, default `User-Agent` value) to httpRequest’s header list.
         if (!http_request->header_list()->contains("User-Agent"sv))
-            http_request->header_list()->append({ "User-Agent"sv, Infrastructure::default_user_agent_value() });
+            http_request->header_list()->append({ "User-Agent"sv, Infrastructure::default_user_agent_value(http_request->current_url()) });
 
         // 16. If httpRequest’s cache mode is "default" and httpRequest’s header list contains `If-Modified-Since`,
         //     `If-None-Match`, `If-Unmodified-Since`, `If-Match`, or `If-Range`, then set httpRequest’s cache mode to
@@ -2002,7 +2017,7 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
         if (response->status() == 401
             && http_request->response_tainting() != Infrastructure::Request::ResponseTainting::CORS
             && include_credentials == HTTP::Cookie::IncludeCredentials::Yes
-            && request->traversable_for_user_prompts().has<GC::Ptr<HTML::LocalTraversableNavigable>>()
+            && request->traversable_for_user_prompts().has<GC::Ptr<HTML::Navigable>>()
             && www_authenticate_has_credential_based_scheme()) {
             // 1. Needs testing: multiple `WWW-Authenticate` headers, missing, parsing issues.
             // (Red box in the spec, no-op)
@@ -2037,15 +2052,11 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
 
                 // FIXME: 2. Let username and password be the result of prompting the end user for a username and password,
                 //           respectively, in request’s window.
-                dbgln("Fetch: Username/password prompt is not implemented, using empty strings. This request will probably fail.");
-                auto username = ByteString::empty();
-                auto password = ByteString::empty();
-
-                // 3. Set the username given request’s current URL and username.
-                request->current_url().set_username(username);
-
-                // 4. Set the password given request’s current URL and password.
-                request->current_url().set_password(password);
+                // FIXME: 3. Set the username given request’s current URL and username.
+                // FIXME: 4. Set the password given request’s current URL and password.
+                dbgln("Fetch: Username/password prompt is not implemented. Aborting the request.");
+                returned_pending_response->resolve(Infrastructure::Response::aborted_network_error());
+                return;
             }
 
             // 4. Set response to the result of running HTTP-network-or-cache fetch given fetchParams and true.
@@ -2168,8 +2179,6 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
 
     (void)include_credentials;
     (void)is_new_connection_fetch;
-    (void)fetch_timing_info;
-    (void)cross_origin_isolated_capability;
 
     auto request = fetch_params.request();
 
@@ -2299,11 +2308,11 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
         fetched_data_receiver->set_cached_response_body(move(data));
     });
 
-    auto on_complete = GC::create_function(GC::Heap::the(), [&realm, pending_response, stream, fetched_data_receiver](bool success, Requests::RequestTimingInfo const&, Optional<StringView> error_message) {
-        // FIXME: Implement on_complete timing info for unbuffered requests
+    auto on_complete = GC::create_function(GC::Heap::the(), [&realm, pending_response, stream, fetched_data_receiver, fetch_timing_info, cross_origin_isolated_capability](bool success, Requests::RequestTimingInfo const& timing_info, Optional<StringView> error_message) {
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
         if (success) {
+            fetch_timing_info->update_final_timings(timing_info, cross_origin_isolated_capability);
             fetched_data_receiver->handle_network_data(realm, Requests::ResponseData::from_bytes({}), FetchedDataReceiver::NetworkState::Complete);
         } else {
             // 16.1.2.2. Otherwise, if stream is readable, error stream with a TypeError.
@@ -2317,11 +2326,12 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
         }
     });
 
-    auto keep_alive_for_transfer = request->destination() == Infrastructure::Request::Destination::Document
-        ? Requests::RequestClient::KeepAliveForTransfer::Yes
-        : Requests::RequestClient::KeepAliveForTransfer::No;
-    auto network_request = ResourceLoader::the().load(load_request, on_headers_received, on_data_received, on_cached_body_available, on_complete, keep_alive_for_transfer);
-    if (network_request && request->destination() == Infrastructure::Request::Destination::Document)
+    auto transfer_lease = fetch_params.has_response_body_transfer_lease()
+        ? Requests::RequestClient::TransferLease::Yes
+        : Requests::RequestClient::TransferLease::No;
+    auto network_request = ResourceLoader::the().load(load_request, on_headers_received, on_data_received, on_cached_body_available, on_complete, transfer_lease);
+    fetched_data_receiver->set_network_request(network_request);
+    if (network_request && fetch_params.has_response_body_transfer_lease())
         network_request->set_body_delivery_paused(true);
     fetch_params.controller()->set_pending_request(network_request);
 

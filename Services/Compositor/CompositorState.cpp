@@ -73,7 +73,9 @@ void CompositorState::create_context(Web::Compositor::CompositorContextId contex
         VERIFY(context_id == Web::Compositor::compositor_context_id_for_page(*page_id));
 
     auto& context = *m_contexts.ensure(context_id, [&] {
-        return make<ContextState>(page_id, web_content_client, m_canvas_surface_registry, m_async_scrolling_enabled);
+        return make<ContextState>(context_id, page_id, web_content_client, m_canvas_surface_registry, m_async_scrolling_enabled, [this, context_id](Gfx::IntRect damage_rect) {
+            schedule_caret_repaint(context_id, damage_rect);
+        });
     });
     resize_backing_stores_if_needed(context_id, context);
 }
@@ -94,7 +96,7 @@ void CompositorState::destroy_context(Web::Compositor::CompositorContextId conte
             possible_child_context.set_parent_context({});
     }
     m_contexts.remove(context_id);
-    update_video_sink_ticking_states();
+    update_unpainted_video_update_scheduling();
 }
 
 void CompositorState::set_parent_context(Web::Compositor::CompositorContextId context_id, Optional<Web::Compositor::CompositorContextId> parent_context_id)
@@ -139,17 +141,22 @@ void CompositorState::update_display_list(Web::Compositor::CompositorContextId c
     auto* context = context_if_present(context_id);
     VERIFY(context);
 
-    if (display_list->compatible_visual_context_tree_version() != visual_context_tree.version()) {
-        dbgln("Compositor: Dropping inconsistent display list update (display list version {}, tree version {})",
-            display_list->compatible_visual_context_tree_version(),
-            visual_context_tree.version());
+    if (display_list->compatible_visual_context_tree_structural_epoch() != visual_context_tree.structural_epoch()) {
+        dbgln("Compositor: Dropping inconsistent display list update (display list epoch {}, tree epoch {})",
+            display_list->compatible_visual_context_tree_structural_epoch(),
+            visual_context_tree.structural_epoch());
+        return;
+    }
+    if (auto validation = Web::Painting::validate_display_list_references_live_visual_context_nodes(*display_list, visual_context_tree); validation.is_error()) {
+        dbgln("Compositor: Dropping display list update: {}", validation.error());
         return;
     }
 
     context->apply_display_list_resource_transaction(move(resource_transaction));
     context->install_display_list_update(move(display_list), move(visual_context_tree), move(scroll_state_snapshot));
     resolve_video_sinks(*context);
-    update_video_sink_ticking_states();
+
+    update_unpainted_video_update_scheduling();
 }
 
 void CompositorState::update_image_frame_resources(Web::Compositor::CompositorContextId context_id, Vector<Web::Painting::DisplayListImageFrameResource> image_frames)
@@ -159,12 +166,12 @@ void CompositorState::update_image_frame_resources(Web::Compositor::CompositorCo
     context->update_image_frame_resources(move(image_frames));
 }
 
-void CompositorState::update_visual_context_tree(Web::Compositor::CompositorContextId context_id, Web::Painting::AccumulatedVisualContextTree visual_context_tree)
+void CompositorState::update_visual_context_tree(Web::Compositor::CompositorContextId context_id, Web::Painting::AccumulatedVisualContextTree visual_context_tree, Web::Painting::DisplayListResourceTransaction&& resource_transaction)
 {
     auto* context = context_if_present(context_id);
     VERIFY(context);
 
-    context->update_visual_context_tree(move(visual_context_tree));
+    context->update_visual_context_tree(move(visual_context_tree), move(resource_transaction));
 }
 
 void CompositorState::update_scroll_state(Web::Compositor::CompositorContextId context_id, Web::Painting::ScrollStateSnapshot&& scroll_state_snapshot)
@@ -202,24 +209,23 @@ void CompositorState::remove_video_sink(CompositorStateWebContentClient& client,
     client.release_video_edge(handle);
 }
 
-void CompositorState::set_video_update_flags(CompositorStateWebContentClient& client, Media::VideoSinkHandle handle, Web::Compositor::VideoUpdateFlags update_flags)
+void CompositorState::set_video_sink_ticking(CompositorStateWebContentClient& client, Media::VideoSinkHandle handle, bool should_tick)
 {
     auto* sink_state = video_sink_state(client, handle);
     if (!sink_state)
         return;
-    sink_state->update_flags = update_flags;
-    if (update_flags != Web::Compositor::VideoUpdateFlags::None && sink_state->sink)
+    sink_state->should_tick = should_tick;
+    if (should_tick && sink_state->sink)
         present_contexts_drawing_video_sink(client, handle);
-    update_video_sink_ticking_states();
+    update_unpainted_video_update_scheduling();
 }
 
-bool CompositorState::video_sink_updates_are_admitted(VideoSinkState const& sink_state, bool painted)
+// The client decides this and we apply it, so that the two processes can never disagree about whether a sink is
+// ticked. All we add is that a sink with no edge yet cannot be ticked, which can only delay ticking rather than
+// stop it, and resolves as soon as the edge is created.
+bool CompositorState::video_sink_updates_are_needed(VideoSinkState const& sink_state)
 {
-    if (sink_state.sink == nullptr)
-        return false;
-    if (has_flag(sink_state.update_flags, Web::Compositor::VideoUpdateFlags::Captured))
-        return true;
-    return has_flag(sink_state.update_flags, Web::Compositor::VideoUpdateFlags::Visible) && painted;
+    return sink_state.sink != nullptr && sink_state.should_tick;
 }
 
 void CompositorState::on_video_sink_ready(CompositorStateWebContentClient& client, Media::VideoSinkHandle handle, NonnullRefPtr<Media::DisplayingVideoSink> const& sink)
@@ -236,28 +242,22 @@ void CompositorState::on_video_sink_ready(CompositorStateWebContentClient& clien
             resolve_video_sinks(*context_entry.value);
     }
     present_contexts_drawing_video_sink(client, handle);
-    update_video_sink_ticking_states();
+    update_unpainted_video_update_scheduling();
 }
 
-void CompositorState::update_video_sink_ticking_states()
+void CompositorState::update_unpainted_video_update_scheduling()
 {
-    auto const& painted_by_client = painted_video_sink_handles_by_client();
-    auto any_unpainted_sink_admits_updates = false;
     for (auto& client_entry : m_video_sink_states) {
-        auto client_painted = painted_by_client.get(client_entry.key);
         for (auto& sink_entry : client_entry.value) {
             auto& sink_state = sink_entry.value;
-            auto is_painted = client_painted.has_value() && client_painted->contains(sink_entry.key);
-            auto ticking = video_sink_updates_are_admitted(sink_state, is_painted);
-            any_unpainted_sink_admits_updates |= ticking && !is_painted;
-            if (ticking == sink_state.ticking)
+            if (!video_sink_updates_are_needed(sink_state))
                 continue;
-            sink_state.ticking = ticking;
-            client_entry.key->set_video_sink_ticking(sink_entry.key, ticking);
+            if (!video_sink_is_painted_by_any_context(client_entry.key, sink_entry.key)) {
+                schedule_unpainted_video_updates();
+                return;
+            }
         }
     }
-    if (any_unpainted_sink_admits_updates)
-        schedule_unpainted_video_updates();
 }
 
 void CompositorState::present_contexts_drawing_video_sink(CompositorStateWebContentClient& client, Media::VideoSinkHandle handle)
@@ -265,6 +265,8 @@ void CompositorState::present_contexts_drawing_video_sink(CompositorStateWebCont
     for (auto& context_entry : m_contexts) {
         auto& context = *context_entry.value;
         if (&context.web_content_client() != &client)
+            continue;
+        if (!context_is_effectively_visible(context))
             continue;
         for (auto const& resource_entry : context.video_sink_handles()) {
             if (resource_entry.value == handle) {
@@ -285,16 +287,18 @@ void CompositorState::resolve_video_sinks(ContextState& context)
     }
 }
 
-HashMap<CompositorStateWebContentClient*, HashTable<Media::VideoSinkHandle>> const& CompositorState::painted_video_sink_handles_by_client() const
+bool CompositorState::video_sink_is_painted_by_any_context(CompositorStateWebContentClient* client, Media::VideoSinkHandle handle) const
 {
-    m_painted_video_sink_handles_by_client.clear_with_capacity();
     for (auto const& context_entry : m_contexts) {
-        auto& context = *context_entry.value;
-        auto& handles = m_painted_video_sink_handles_by_client.ensure(&context.web_content_client());
-        for (auto const& resource_entry : context.video_sink_handles())
-            handles.set(resource_entry.value);
+        auto const& context = *context_entry.value;
+        if (&context.web_content_client() != client)
+            continue;
+        for (auto const& resource_entry : context.video_sink_handles()) {
+            if (resource_entry.value == handle)
+                return true;
+        }
     }
-    return m_painted_video_sink_handles_by_client;
+    return false;
 }
 
 int CompositorState::unpainted_video_update_interval_ms() const
@@ -325,14 +329,12 @@ void CompositorState::update_unpainted_video_sinks()
 CompositorState::VideoSinkUpdateResult CompositorState::update_all_video_sinks()
 {
     auto now = MonotonicTime::now();
-    auto const& painted_by_client = painted_video_sink_handles_by_client();
     auto result = VideoSinkUpdateResult::NoUnpaintedSinkRequiresUpdates;
     for (auto& client_entry : m_video_sink_states) {
-        auto client_painted = painted_by_client.get(client_entry.key);
         for (auto& sink_entry : client_entry.value) {
             auto& sink_state = sink_entry.value;
-            auto is_painted = client_painted.has_value() && client_painted->contains(sink_entry.key);
-            sink_state.requires_updates = video_sink_updates_are_admitted(sink_state, is_painted)
+            auto is_painted = video_sink_is_painted_by_any_context(client_entry.key, sink_entry.key);
+            sink_state.requires_updates = video_sink_updates_are_needed(sink_state)
                 && sink_state.sink->update(now).may_require_updates;
             if (!is_painted && sink_state.requires_updates)
                 result = VideoSinkUpdateResult::UnpaintedSinkRequiresUpdates;
@@ -348,12 +350,14 @@ void CompositorState::update_video_sinks_for_display(Optional<u64> display_id)
     // Keep this display's vsync ticking while any sink painted on it may require updates.
     for (auto& context_entry : m_contexts) {
         auto& context = *context_entry.value;
-        if (context.display_id() != display_id)
+        if (display_id_for_context(context) != display_id)
+            continue;
+        if (!context_is_effectively_visible(context))
             continue;
         for (auto const& resource_entry : context.video_sink_handles()) {
             auto* sink_state = video_sink_state(context.web_content_client(), resource_entry.value);
             if (sink_state != nullptr && sink_state->requires_updates) {
-                vsync_scheduler_for_display(display_id).schedule(context.display_refresh_rate());
+                vsync_scheduler_for_display(display_id).schedule(display_refresh_rate_for_context(context));
                 break;
             }
         }
@@ -372,6 +376,25 @@ Optional<u64> CompositorState::display_id_for_context(ContextState const& contex
         current_context = context_if_present(*parent_context_id);
     }
     return {};
+}
+
+ContextState const* CompositorState::root_context_of(ContextState const& context) const
+{
+    auto const* current_context = &context;
+    while (true) {
+        auto parent_context_id = current_context->parent_context_id();
+        if (!parent_context_id.has_value())
+            return current_context;
+        auto const* parent_context = context_if_present(*parent_context_id);
+        if (!parent_context)
+            return current_context;
+        current_context = parent_context;
+    }
+}
+
+bool CompositorState::context_is_effectively_visible(ContextState const& context) const
+{
+    return root_context_of(context)->visibility() == Web::Compositor::ContextVisibility::Visible;
 }
 
 double CompositorState::display_refresh_rate_for_context(ContextState const& context) const
@@ -423,7 +446,7 @@ bool CompositorState::handle_pinch_event(Web::Compositor::CompositorContextId co
     return apply_context_update_result(context_id, *context, context->handle_pinch_event(event));
 }
 
-Web::Compositor::AsyncScrollEnqueueResult CompositorState::async_scroll_by(Web::Compositor::CompositorContextId context_id, Web::UniqueNodeID expected_document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::AsyncScrollOperationTracking operation_tracking)
+Web::Compositor::AsyncScrollEnqueueResult CompositorState::async_scroll_by(Web::Compositor::CompositorContextId context_id, Web::UniqueNodeID expected_document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::SnapContainerHandling snap_container_handling, Web::Compositor::AsyncScrollOperationTracking operation_tracking)
 {
     if (!m_async_scrolling_enabled)
         return {};
@@ -431,13 +454,14 @@ Web::Compositor::AsyncScrollEnqueueResult CompositorState::async_scroll_by(Web::
     auto* context = context_if_present(context_id);
     VERIFY(context);
 
-    auto result = context->async_scroll_by(expected_document_id, position, delta, viewport_rect, operation_tracking);
+    auto result = context->async_scroll_by(expected_document_id, position, delta, viewport_rect, snap_container_handling, operation_tracking);
     if (result.frame_to_present.has_value())
         schedule_present_frame(context_id, *context, *result.frame_to_present);
+    publish_pending_async_scroll_updates(context_id, *context);
     return result.enqueue_result;
 }
 
-Web::Compositor::AsyncScrollEnqueueResult CompositorState::smooth_scroll_to(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel)
+Web::Compositor::AsyncScrollEnqueueResult CompositorState::smooth_scroll_to(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel, Web::Compositor::ScrollAnimationKind animation_kind)
 {
     if (!m_async_scrolling_enabled)
         return {};
@@ -445,9 +469,10 @@ Web::Compositor::AsyncScrollEnqueueResult CompositorState::smooth_scroll_to(Web:
     auto* context = context_if_present(context_id);
     VERIFY(context);
 
-    auto result = context->smooth_scroll_to(stable_node_id, offset, viewport_rect, device_pixels_per_css_pixel);
+    auto result = context->smooth_scroll_to(stable_node_id, offset, main_thread_offset, viewport_rect, device_pixels_per_css_pixel, animation_kind);
     if (result.frame_to_present.has_value())
         schedule_present_frame(context_id, *context, *result.frame_to_present);
+    publish_pending_async_scroll_updates(context_id, *context);
     return result.enqueue_result;
 }
 
@@ -457,9 +482,10 @@ void CompositorState::cancel_smooth_scroll(Web::Compositor::CompositorContextId 
     if (!context)
         return;
     context->cancel_smooth_scroll(stable_node_id);
+    publish_pending_async_scroll_updates(context_id, *context);
 }
 
-bool CompositorState::async_scroll_by(Web::Compositor::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta)
+bool CompositorState::async_scroll_by(Web::Compositor::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::Compositor::SnapContainerHandling snap_container_handling)
 {
     if (!m_async_scrolling_enabled)
         return false;
@@ -468,7 +494,7 @@ bool CompositorState::async_scroll_by(Web::Compositor::CompositorContextId conte
     if (!context)
         return false;
 
-    return apply_context_update_result(context_id, *context, context->async_scroll_by(position, delta));
+    return apply_context_update_result(context_id, *context, context->async_scroll_by(position, delta, snap_container_handling));
 }
 
 Web::Compositor::PendingAsyncScrollUpdates CompositorState::take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id)
@@ -479,6 +505,13 @@ Web::Compositor::PendingAsyncScrollUpdates CompositorState::take_pending_async_s
     return context->take_pending_async_scroll_updates();
 }
 
+void CompositorState::publish_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id, ContextState& context)
+{
+    if (!context.has_pending_async_scroll_updates())
+        return;
+    context.web_content_client().async_scroll_updates(context_id, context.take_pending_async_scroll_updates());
+}
+
 void CompositorState::viewport_size_updated(Web::Compositor::CompositorContextId context_id, Gfx::IntSize viewport_size, Web::Compositor::WindowResizingInProgress window_resize_in_progress)
 {
     auto* context = context_if_present(context_id);
@@ -487,8 +520,24 @@ void CompositorState::viewport_size_updated(Web::Compositor::CompositorContextId
 
     context->viewport_size_updated(viewport_size, window_resize_in_progress);
     resize_backing_stores_if_needed(context_id, *context);
+    if (context->paused_debugger_overlay_visible()) {
+        if (auto viewport_rect = context->viewport_rect_for_ui_overlay(); viewport_rect.has_value())
+            schedule_present_frame(context_id, *context, *viewport_rect);
+    }
     if (context->should_shrink_backing_stores_after_resize())
         schedule_backing_store_shrink(context_id, *context);
+}
+
+void CompositorState::set_paused_debugger_overlay(Web::Compositor::CompositorContextId context_id, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<WebView::PausedDebuggerOverlayAction> hovered_action)
+{
+    auto* context = context_if_present(context_id);
+    if (!context)
+        return;
+    if (!context->set_paused_debugger_overlay(visible, device_pixel_ratio, move(font_family), hovered_action))
+        return;
+
+    if (auto viewport_rect = context->viewport_rect_for_ui_overlay(); viewport_rect.has_value())
+        schedule_present_frame(context_id, *context, *viewport_rect);
 }
 
 void CompositorState::set_display_metadata(Web::Compositor::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
@@ -506,33 +555,106 @@ void CompositorState::set_display_metadata(Web::Compositor::CompositorContextId 
         if (m_unpainted_video_update_timer)
             m_unpainted_video_update_timer->set_interval(unpainted_video_update_interval_ms());
     }
+
+    if (context->rendering_opportunity_requested() && context_is_effectively_visible(*context))
+        vsync_scheduler_for_display(display_id_for_context(*context)).schedule(display_refresh_rate_for_context(*context));
 }
 
-void CompositorState::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
+void CompositorState::set_context_visibility(Web::Compositor::CompositorContextId context_id, Web::Compositor::ContextVisibility visibility)
+{
+    auto* context = context_if_present(context_id);
+    if (!context)
+        return;
+    if (!context->set_visibility(visibility))
+        return;
+
+    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Context {} became {}", context_id, visibility == Web::Compositor::ContextVisibility::Visible ? "visible" : "hidden");
+
+    if (visibility == Web::Compositor::ContextVisibility::Visible)
+        resume_presentation_after_becoming_visible(context_id, *context);
+}
+
+void CompositorState::resume_presentation_after_becoming_visible(Web::Compositor::CompositorContextId root_context_id, ContextState& root_context)
+{
+    for (auto& context_entry : m_contexts) {
+        auto& context = *context_entry.value;
+        if (root_context_of(context) != &root_context)
+            continue;
+        if (context.has_active_smooth_scroll_animations() || context.has_active_visual_animations())
+            vsync_scheduler_for_display(display_id_for_context(context)).schedule(display_refresh_rate_for_context(context));
+        if (context.rendering_opportunity_requested())
+            vsync_scheduler_for_display(display_id_for_context(context)).schedule(display_refresh_rate_for_context(context));
+    }
+
+    if (auto frame_rect_to_present = root_context.frame_rect_to_repaint(); frame_rect_to_present.has_value())
+        schedule_present_frame(root_context_id, root_context, *frame_rect_to_present);
+}
+
+void CompositorState::request_rendering_opportunity(Web::Compositor::CompositorContextId context_id, double maximum_frames_per_second)
 {
     auto* context = context_if_present(context_id);
     VERIFY(context);
-    if (context->should_defer_main_thread_present_for_async_scroll()) {
-        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Main thread deferred present while async scroll is pending");
-        // NB: The in-flight compositor frame may have been rasterized before the
-        //     main thread installed its new display list. Preserve the present as
-        //     a full repaint so that it uses both the new list and the latest
-        //     compositor scroll state once presentation is unblocked.
-        schedule_present_frame(context_id, *context, viewport_rect);
+
+    if (!context->request_rendering_opportunity(maximum_frames_per_second))
+        return;
+    if (!context_is_effectively_visible(*context))
+        return;
+
+    auto display_id = display_id_for_context(*context);
+    auto display_refresh_rate = display_refresh_rate_for_context(*context);
+    auto& scheduler = vsync_scheduler_for_display(display_id);
+    // INTEROP: Like Chromium's missed BeginFrame delivery, reuse a recent display tick when a context requests its
+    //          next opportunity after the tick has already happened. This keeps heavy frames from waiting an extra tick.
+    if (auto frame_time = scheduler.most_recent_tick_time(MonotonicTime::now(), display_refresh_rate);
+        frame_time.has_value() && context->rendering_opportunity_is_due(*frame_time, display_refresh_rate)) {
+        auto frame_interval = context->rendering_opportunity_frame_interval(display_refresh_rate);
+        context->did_deliver_rendering_opportunity(*frame_time);
+        context->web_content_client().rendering_opportunity(context_id, frame_time->nanoseconds(), frame_interval);
         return;
     }
-    damage_rect.intersect({ {}, viewport_rect.size() });
-    schedule_present_frame(context_id, *context, ContextState::PendingFrame { viewport_rect, damage_rect });
+
+    scheduler.schedule(display_refresh_rate);
 }
 
-void CompositorState::present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context, ContextState::PendingFrame pending_frame)
+void CompositorState::hurry_rendering_opportunity(Web::Compositor::CompositorContextId context_id)
+{
+    auto* context = context_if_present(context_id);
+    if (!context || !context->rendering_opportunity_requested() || !context_is_effectively_visible(*context))
+        return;
+    auto display_refresh_rate = display_refresh_rate_for_context(*context);
+    auto frame_interval = context->rendering_opportunity_frame_interval(display_refresh_rate);
+    auto frame_time = MonotonicTime::now();
+    context->did_deliver_rendering_opportunity(frame_time);
+    context->web_content_client().rendering_opportunity(context_id, frame_time.nanoseconds(), frame_interval);
+}
+
+void CompositorState::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect)
+{
+    auto* context = context_if_present(context_id);
+    VERIFY(context);
+    // The frame joins whatever is queued, so a frame queued earlier cannot be presented after it.
+    context->queue_present_frame({ viewport_rect, {} });
+    // A frame of a window being resized is rasterized as it arrives: waiting for the next display tick
+    // would show the previous size for one more tick. Presentation to the client still lands on a tick.
+    if (context->window_resize_in_progress() && context->presents_to_client() && context_is_effectively_visible(*context)
+        && !context->is_present_blocked()) {
+        if (auto pending_frame = context->take_pending_present_frame_if_unblocked(); pending_frame.has_value()) {
+            if (present_frame(context_id, *context, *pending_frame))
+                return;
+            context->queue_present_frame(*pending_frame);
+        }
+    }
+    schedule_pending_present_frame(context_id, *context);
+}
+
+bool CompositorState::present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context, ContextState::PendingFrame pending_frame)
 {
     auto composited_context_resolver = resolver_for(context_id);
     auto prepared_frame = context.prepare_frame(*m_display_list_player, pending_frame, &composited_context_resolver);
     if (!prepared_frame.has_value())
-        return;
+        return false;
 
-    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, pending_frame.damage_rect, prepared_frame->bitmap_id);
+    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id);
     auto* pending_present = &m_pending_async_presents.last();
 
     auto& event_loop = Core::EventLoop::current();
@@ -544,6 +666,7 @@ void CompositorState::present_frame(Web::Compositor::CompositorContextId context
     });
     context.did_submit_prepared_frame(pending_frame.viewport_rect);
     schedule_gpu_completion_check();
+    return true;
 }
 
 void CompositorState::schedule_present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context, ContextState::PendingFrame pending_frame)
@@ -554,10 +677,7 @@ void CompositorState::schedule_present_frame(Web::Compositor::CompositorContextI
 
 void CompositorState::schedule_present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context, Gfx::IntRect viewport_rect)
 {
-    schedule_present_frame(context_id, context, ContextState::PendingFrame {
-                                                    .viewport_rect = viewport_rect,
-                                                    .damage_rect = { {}, viewport_rect.size() },
-                                                });
+    schedule_present_frame(context_id, context, ContextState::PendingFrame::repainting_everything(viewport_rect));
 }
 
 void CompositorState::schedule_pending_present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context)
@@ -568,8 +688,8 @@ void CompositorState::schedule_pending_present_frame(Web::Compositor::Compositor
         // own async animations still need a vsync source. The containing frame
         // may already be up to date (and therefore not schedule a new present),
         // so explicitly keep the effective display's scheduler ticking while
-        // a nested smooth scroll is active.
-        if (context.has_active_smooth_scroll_animations())
+        // a nested animation is active.
+        if ((context.has_active_smooth_scroll_animations() || context.has_active_visual_animations()) && context_is_effectively_visible(context))
             vsync_scheduler_for_display(display_id_for_context(context)).schedule(display_refresh_rate_for_context(context));
         return;
     }
@@ -579,6 +699,8 @@ void CompositorState::schedule_pending_present_frame(Web::Compositor::Compositor
 
 void CompositorState::schedule_pending_present_frame_on_vsync(Web::Compositor::CompositorContextId, ContextState& context)
 {
+    if (!context_is_effectively_visible(context))
+        return;
     context.mark_pending_present_frame_scheduled();
     vsync_scheduler_for_display(context.display_id()).schedule(context.display_refresh_rate());
 }
@@ -599,45 +721,86 @@ void CompositorState::schedule_pending_present_frame_if_unblocked(Web::Composito
     if (!context.can_schedule_pending_present_frame_if_unblocked())
         return;
 
+    // A frame of a window being resized that waited for a backing store is rasterized as soon as
+    // one is free, not at the next display tick.
+    if (context.window_resize_in_progress() && context.presents_to_client() && context_is_effectively_visible(context)) {
+        if (auto pending_frame = context.take_pending_present_frame_if_unblocked(); pending_frame.has_value()) {
+            if (present_frame(context_id, context, *pending_frame))
+                return;
+            context.queue_present_frame(*pending_frame);
+        }
+    }
+
     schedule_pending_present_frame(context_id, context);
+}
+
+void CompositorState::schedule_caret_repaint(Web::Compositor::CompositorContextId context_id, Gfx::IntRect damage_rect)
+{
+    auto* context = context_if_present(context_id);
+    if (!context)
+        return;
+    auto viewport_rect = context->viewport_rect_for_ui_overlay();
+    if (!viewport_rect.has_value())
+        return;
+    schedule_present_frame(context_id, *context, { *viewport_rect, damage_rect });
 }
 
 VSyncScheduler& CompositorState::vsync_scheduler_for_display(Optional<u64> display_id)
 {
     return *m_vsync_schedulers_by_display.ensure(display_id, [this, display_id] {
-        return create_vsync_scheduler(display_id, [this, display_id] {
-            present_pending_frames_on_vsync(display_id);
+        return create_vsync_scheduler(display_id, [this, display_id](MonotonicTime frame_time) {
+            present_pending_frames_on_vsync(display_id, frame_time);
         });
     });
 }
 
-void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id)
+void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id, MonotonicTime frame_time)
 {
     update_video_sinks_for_display(display_id);
 
-    auto now = MonotonicTime::now();
     for (auto& context_entry : m_contexts) {
         auto context_id = context_entry.key;
         auto& context = *context_entry.value;
-        auto has_active_smooth_scroll_animation_on_display = context.has_active_smooth_scroll_animations() && display_id_for_context(context) == display_id;
-        if (!context.has_pending_present_frame_scheduled_on(display_id) && !has_active_smooth_scroll_animation_on_display)
+        if (!context_is_effectively_visible(context)) {
+            context.unschedule_pending_present_frame();
+            continue;
+        }
+
+        if (context.rendering_opportunity_requested() && display_id_for_context(context) == display_id) {
+            auto display_refresh_rate = display_refresh_rate_for_context(context);
+            if (context.rendering_opportunity_is_due(frame_time, display_refresh_rate)) {
+                auto frame_interval = context.rendering_opportunity_frame_interval(display_refresh_rate);
+                context.did_deliver_rendering_opportunity(frame_time);
+                context.web_content_client().rendering_opportunity(context_id, frame_time.nanoseconds(), frame_interval);
+            } else {
+                vsync_scheduler_for_display(display_id).schedule(display_refresh_rate);
+            }
+        }
+
+        auto has_active_animation_on_display = (context.has_active_smooth_scroll_animations() || context.has_active_visual_animations()) && display_id_for_context(context) == display_id;
+        if (!context.has_pending_present_frame_scheduled_on(display_id) && !has_active_animation_on_display)
             continue;
 
-        if (auto animation_frame = context.advance_smooth_scroll_animations(now); animation_frame.has_value())
-            context.queue_present_frame({
-                .viewport_rect = *animation_frame,
-                .damage_rect = { {}, animation_frame->size() },
-            });
+        if (auto animation_frame = context.advance_smooth_scroll_animations(frame_time); animation_frame.has_value())
+            context.queue_present_frame(ContextState::PendingFrame::repainting_changes(*animation_frame));
+        publish_pending_async_scroll_updates(context_id, context);
+        if (context.has_active_visual_animations()) {
+            context.advance_visual_animations(frame_time);
+            // Visual animation damage deliberately covers the full viewport until we track the animated nodes' bounds
+            // before and after sampling.
+            if (auto viewport_rect = context.viewport_rect_for_ui_overlay(); viewport_rect.has_value())
+                context.queue_present_frame(ContextState::PendingFrame::repainting_changes(*viewport_rect));
+        }
 
         auto pending_present_frame = context.take_pending_present_frame_if_unblocked();
         if (!pending_present_frame.has_value()) {
-            has_active_smooth_scroll_animation_on_display = context.has_active_smooth_scroll_animations() && display_id_for_context(context) == display_id;
-            if (context.has_pending_present_frame_scheduled_on(display_id) || has_active_smooth_scroll_animation_on_display)
+            has_active_animation_on_display = (context.has_active_smooth_scroll_animations() || context.has_active_visual_animations()) && display_id_for_context(context) == display_id;
+            if (context.has_pending_present_frame_scheduled_on(display_id) || has_active_animation_on_display)
                 vsync_scheduler_for_display(display_id).schedule(display_refresh_rate_for_context(context));
             continue;
         }
-        if (context.has_active_smooth_scroll_animations())
-            schedule_present_frame(context_id, context, pending_present_frame->viewport_rect);
+        if (context.has_active_smooth_scroll_animations() || context.has_active_visual_animations())
+            schedule_present_frame(context_id, context, ContextState::PendingFrame::repainting_changes(pending_present_frame->viewport_rect));
         present_frame(context_id, context, *pending_present_frame);
     }
 }
@@ -854,10 +1017,7 @@ void CompositorState::shrink_backing_stores_after_resize(Web::Compositor::Compos
 
 void CompositorState::present_current_frame(Web::Compositor::CompositorContextId context_id, ContextState& context)
 {
-    // A queued frame already captures the newest viewport rect and will pick up
-    // the updated resource when the outstanding bitmap is acknowledged.
-    auto frame_to_present = context.current_frame_rect_to_present();
-    if (frame_to_present.has_value())
+    if (auto frame_to_present = context.frame_rect_to_repaint(); frame_to_present.has_value())
         schedule_present_frame(context_id, context, *frame_to_present);
 }
 
@@ -868,6 +1028,7 @@ bool CompositorState::apply_context_update_result(
 {
     if (result.frame_to_present.has_value())
         schedule_present_frame(context_id, context, *result.frame_to_present);
+    publish_pending_async_scroll_updates(context_id, context);
     if (result.should_request_rendering_update)
         context.request_rendering_update();
     return result.accepted;

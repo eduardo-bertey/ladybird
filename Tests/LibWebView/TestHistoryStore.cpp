@@ -12,6 +12,7 @@
 #include <LibFileSystem/FileSystem.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
+#include <LibWebView/FaviconStore.h>
 #include <LibWebView/HistoryStore.h>
 
 static URL::URL parse_url(StringView url)
@@ -23,8 +24,16 @@ static URL::URL parse_url(StringView url)
 
 static NonnullOwnPtr<WebView::HistoryStore> create_persisted_store(Database::Database& database)
 {
+    VERIFY(MUST(WebView::FaviconStore::migrate_schema(database)) == Database::MigrationOutcome::Success);
     VERIFY(MUST(WebView::HistoryStore::migrate_schema(database)) == Database::MigrationOutcome::Success);
     return MUST(WebView::HistoryStore::create(database));
+}
+
+static String add_test_favicon(WebView::FaviconStore& favicon_store)
+{
+    auto hash = favicon_store.add_favicon(MUST(ByteBuffer::copy("foo"sv.bytes())));
+    VERIFY(hash.has_value());
+    return hash.release_value();
 }
 
 static void populate_history_for_url_autocomplete_tests(WebView::HistoryStore& store)
@@ -75,20 +84,21 @@ static void expect_history_autocomplete_requires_three_characters_for_non_prefix
     EXPECT_EQ(entries[0].url, "https://example.com/wip-path"_string);
 }
 
-static void expect_history_autocomplete_entries_include_metadata(WebView::HistoryStore& store)
+static void expect_history_autocomplete_entries_include_metadata(WebView::HistoryStore& store, String const& favicon_hash)
 {
     auto google_url = parse_url("https://www.google.com/"sv);
     auto github_url = parse_url("https://github.com/LadybirdBrowser/ladybird"sv);
 
     store.record_visit(google_url, "Google"_string, UnixDateTime::from_seconds_since_epoch(20));
-    store.update_favicon(google_url, "Zm9v"_string);
+    store.update_favicon(google_url, favicon_hash);
     store.record_visit(github_url, "Ladybird repository"_string, UnixDateTime::from_seconds_since_epoch(10));
 
     auto entries = store.autocomplete_entries("goo"sv, 8);
     VERIFY(entries.size() == 1);
     EXPECT_EQ(entries[0].url, "https://www.google.com/"_string);
     EXPECT_EQ(entries[0].title, Optional<String> { "Google"_string });
-    EXPECT_EQ(entries[0].favicon_base64_png, Optional<String> { "Zm9v"_string });
+    VERIFY(entries[0].favicon_png.has_value());
+    EXPECT(entries[0].favicon_png->bytes() == "foo"sv.bytes());
     EXPECT_EQ(entries[0].visit_count, 1u);
     EXPECT_EQ(entries[0].last_visited_time, UnixDateTime::from_seconds_since_epoch(20));
 }
@@ -349,109 +359,25 @@ TEST_CASE(history_autocomplete_requires_three_characters_for_non_prefix_url_matc
 
 TEST_CASE(history_favicon_updates_entry)
 {
-    auto store = WebView::HistoryStore::create();
+    auto favicon_store = WebView::FaviconStore::create();
+    auto store = WebView::HistoryStore::create(*favicon_store);
     auto url = parse_url("https://ladybird.dev/"sv);
 
     store->record_visit(url, "Ladybird"_string, UnixDateTime::from_seconds_since_epoch(10));
-    store->update_favicon(url, "Zm9v"_string);
+    store->update_favicon(url, add_test_favicon(*favicon_store));
 
     auto entry = store->entry_for_url(url);
     VERIFY(entry.has_value());
-    EXPECT_EQ(entry->favicon_base64_png, Optional<String> { "Zm9v"_string });
-}
-
-TEST_CASE(recently_closed_entries_are_reopened_in_lifo_order)
-{
-    auto store = WebView::HistoryStore::create();
-    auto first_url = parse_url("https://first.example.com/"sv);
-    auto second_url = parse_url("https://second.example.com/"sv);
-    auto third_url = parse_url("https://third.example.com/"sv);
-
-    EXPECT(!store->has_recently_closed_entries());
-
-    store->record_closed_tab(first_url, UnixDateTime::from_seconds_since_epoch(10));
-    store->record_closed_window({ second_url, third_url }, 1, UnixDateTime::from_seconds_since_epoch(20));
-
-    EXPECT(store->has_recently_closed_entries());
-
-    auto recently_closed_entry = store->pop_most_recently_closed_entry();
-    VERIFY(recently_closed_entry.has_value());
-    EXPECT(recently_closed_entry->was_window);
-    EXPECT_EQ(recently_closed_entry->active_tab_index, 1u);
-    EXPECT_EQ(recently_closed_entry->urls.size(), 2u);
-    EXPECT_EQ(recently_closed_entry->urls[0], second_url);
-    EXPECT_EQ(recently_closed_entry->urls[1], third_url);
-    EXPECT(store->has_recently_closed_entries());
-
-    recently_closed_entry = store->pop_most_recently_closed_entry();
-    VERIFY(recently_closed_entry.has_value());
-    EXPECT(!recently_closed_entry->was_window);
-    EXPECT_EQ(recently_closed_entry->active_tab_index, 0u);
-    EXPECT_EQ(recently_closed_entry->urls.size(), 1u);
-    EXPECT_EQ(recently_closed_entry->urls[0], first_url);
-    EXPECT(!store->has_recently_closed_entries());
-
-    EXPECT(!store->pop_most_recently_closed_entry().has_value());
-}
-
-TEST_CASE(recently_closed_entries_accessed_since_can_be_removed)
-{
-    auto store = WebView::HistoryStore::create();
-    auto older_url = parse_url("https://older.example.com/"sv);
-    auto newer_url = parse_url("https://newer.example.com/"sv);
-    auto newest_url = parse_url("https://newest.example.com/"sv);
-
-    store->record_closed_tab(older_url, UnixDateTime::from_seconds_since_epoch(10));
-    store->record_closed_window({ newer_url, newest_url }, 0, UnixDateTime::from_seconds_since_epoch(20));
-
-    store->remove_entries_accessed_since(UnixDateTime::from_seconds_since_epoch(15));
-
-    EXPECT(store->has_recently_closed_entries());
-
-    auto recently_closed_entry = store->pop_most_recently_closed_entry();
-    VERIFY(recently_closed_entry.has_value());
-    EXPECT_EQ(recently_closed_entry->urls.size(), 1u);
-    EXPECT_EQ(recently_closed_entry->urls[0], older_url);
-    EXPECT(!store->has_recently_closed_entries());
-}
-
-TEST_CASE(recently_closed_entries_can_be_peeked_without_popping)
-{
-    auto store = WebView::HistoryStore::create();
-    auto first_url = parse_url("https://peek.example.com/"sv);
-    auto second_url = parse_url("https://peek-two.example.com/"sv);
-
-    store->record_closed_window({ first_url, second_url }, 0, UnixDateTime::from_seconds_since_epoch(10));
-
-    auto recently_closed_entry = store->most_recently_closed_entry();
-    VERIFY(recently_closed_entry.has_value());
-    EXPECT(recently_closed_entry->was_window);
-    EXPECT_EQ(recently_closed_entry->urls.size(), 2u);
-    EXPECT_EQ(recently_closed_entry->urls[0], first_url);
-    EXPECT_EQ(recently_closed_entry->urls[1], second_url);
-    EXPECT(store->has_recently_closed_entries());
-}
-
-TEST_CASE(recently_closed_entries_are_cleared_with_history)
-{
-    auto store = WebView::HistoryStore::create();
-    auto first_url = parse_url("https://clear.example.com/"sv);
-    auto second_url = parse_url("https://clear-two.example.com/"sv);
-
-    store->record_closed_tab(first_url, UnixDateTime::from_seconds_since_epoch(10));
-    store->record_closed_window({ second_url }, 0, UnixDateTime::from_seconds_since_epoch(20));
-
-    store->remove_entries_accessed_since(UnixDateTime::earliest());
-
-    EXPECT(!store->has_recently_closed_entries());
-    EXPECT(!store->most_recently_closed_entry().has_value());
-    EXPECT(!store->pop_most_recently_closed_entry().has_value());
+    VERIFY(entry->favicon_png.has_value());
+    EXPECT(entry->favicon_png->bytes() == "foo"sv.bytes());
+    EXPECT(store->referenced_favicon_hashes().is_empty());
 }
 
 TEST_CASE(history_autocomplete_entries_include_metadata)
 {
-    auto store = WebView::HistoryStore::create();
-    expect_history_autocomplete_entries_include_metadata(*store);
+    auto favicon_store = WebView::FaviconStore::create();
+    auto store = WebView::HistoryStore::create(*favicon_store);
+    expect_history_autocomplete_entries_include_metadata(*store, add_test_favicon(*favicon_store));
 }
 
 TEST_CASE(history_ranking_signals_track_visit_intent)
@@ -558,8 +484,9 @@ TEST_CASE(persisted_history_survives_reopen)
     {
         auto database = TRY_OR_FAIL(Database::Database::create(database_directory, "HistoryStore"sv));
         auto store = create_persisted_store(*database);
+        auto favicon_store = TRY_OR_FAIL(WebView::FaviconStore::create(*database));
         store->record_visit(parse_url("https://persist.example.com/"sv), "Persisted title"_string, UnixDateTime::from_seconds_since_epoch(77));
-        store->update_favicon(parse_url("https://persist.example.com/"sv), "Zm9v"_string);
+        store->update_favicon(parse_url("https://persist.example.com/"sv), add_test_favicon(*favicon_store));
     }
 
     {
@@ -572,7 +499,8 @@ TEST_CASE(persisted_history_survives_reopen)
         EXPECT_EQ(entry->title, Optional<String> { "Persisted title"_string });
         EXPECT_EQ(entry->visit_count, 1u);
         EXPECT_EQ(entry->last_visited_time, UnixDateTime::from_seconds_since_epoch(77));
-        EXPECT_EQ(entry->favicon_base64_png, Optional<String> { "Zm9v"_string });
+        VERIFY(entry->favicon_png.has_value());
+        EXPECT(entry->favicon_png->bytes() == "foo"sv.bytes());
     }
 }
 
@@ -676,8 +604,44 @@ TEST_CASE(persisted_history_autocomplete_entries_include_metadata)
 
     auto database = TRY_OR_FAIL(Database::Database::create(database_directory, "HistoryStore"sv));
     auto store = create_persisted_store(*database);
+    auto favicon_store = TRY_OR_FAIL(WebView::FaviconStore::create(*database));
 
-    expect_history_autocomplete_entries_include_metadata(*store);
+    expect_history_autocomplete_entries_include_metadata(*store, add_test_favicon(*favicon_store));
+}
+
+TEST_CASE(persisted_history_reports_distinct_referenced_favicon_hashes)
+{
+    auto database = TRY_OR_FAIL(Database::Database::create_memory_backed());
+    auto store = create_persisted_store(*database);
+    auto favicon_store = TRY_OR_FAIL(WebView::FaviconStore::create(*database));
+    auto first_hash = favicon_store->add_favicon(MUST(ByteBuffer::copy("first"sv.bytes())));
+    auto second_hash = favicon_store->add_favicon(MUST(ByteBuffer::copy("second"sv.bytes())));
+    VERIFY(first_hash.has_value());
+    VERIFY(second_hash.has_value());
+
+    auto first_url = parse_url("https://first.example/"sv);
+    auto duplicate_url = parse_url("https://duplicate.example/"sv);
+    auto second_url = parse_url("https://second.example/"sv);
+    store->record_visit(first_url);
+    store->record_visit(duplicate_url);
+    store->record_visit(second_url);
+    store->update_favicon(first_url, *first_hash);
+    store->update_favicon(duplicate_url, *first_hash);
+    store->update_favicon(second_url, *second_hash);
+
+    HashTable<String> referenced_hashes;
+    for (auto& hash : store->referenced_favicon_hashes())
+        referenced_hashes.set(move(hash));
+    EXPECT_EQ(referenced_hashes.size(), 2uz);
+    EXPECT(referenced_hashes.contains(*first_hash));
+    EXPECT(referenced_hashes.contains(*second_hash));
+
+    store->remove_entry_for_url(second_url);
+    referenced_hashes.clear();
+    for (auto& hash : store->referenced_favicon_hashes())
+        referenced_hashes.set(move(hash));
+    EXPECT_EQ(referenced_hashes.size(), 1uz);
+    EXPECT(referenced_hashes.contains(*first_hash));
 }
 
 TEST_CASE(persisted_history_ranking_signals_track_visit_intent)
@@ -714,6 +678,36 @@ TEST_CASE(persisted_omnibox_engagements_are_normalized_and_accumulated)
     auto store = create_persisted_store(*database);
 
     expect_omnibox_engagements_are_normalized_and_accumulated(*store);
+}
+
+TEST_CASE(persisted_negative_usage_counters_are_ignored)
+{
+    auto database = TRY_OR_FAIL(Database::Database::create_memory_backed());
+    auto store = create_persisted_store(*database);
+
+    auto corrupt_url = parse_url("https://corrupt.example/"sv);
+    auto valid_url = parse_url("https://valid.example/"sv);
+    store->record_visit(corrupt_url, {}, UnixDateTime::from_seconds_since_epoch(1));
+    store->record_visit(valid_url, {}, UnixDateTime::from_seconds_since_epoch(2));
+    TRY_OR_FAIL(database->execute_raw("UPDATE History SET visit_count = -1, direct_visit_count = -1 WHERE url = 'https://corrupt.example/';"sv));
+
+    EXPECT(!store->entry_for_url(corrupt_url).has_value());
+    auto autocomplete_entries = store->autocomplete_entries("example"sv, 8);
+    EXPECT_EQ(autocomplete_entries.size(), 1uz);
+    EXPECT_EQ(autocomplete_entries[0].url, "https://valid.example/"sv);
+    auto listed_entries = store->list_entries(""sv, 0, 8);
+    EXPECT_EQ(listed_entries.size(), 1uz);
+    EXPECT_EQ(listed_entries[0].url, "https://valid.example/"sv);
+
+    store->record_omnibox_engagement({
+                                         .input = "corrupt"_string,
+                                         .destination_kind = WebView::OmniboxDestinationKind::URL,
+                                         .destination = "https://corrupt.example/"_string,
+                                         .was_explicit = true,
+                                     },
+        UnixDateTime::from_seconds_since_epoch(3));
+    TRY_OR_FAIL(database->execute_raw("UPDATE OmniboxEngagements SET explicit_use_count = -1;"sv));
+    EXPECT(store->omnibox_engagements("corrupt"sv).is_empty());
 }
 
 TEST_CASE(persisted_history_page_entries_are_paginated_and_searchable)
@@ -804,6 +798,17 @@ TEST_CASE(persisted_history_entries_for_same_site_can_be_removed)
     expect_history_entries_for_same_site_can_be_removed(*store);
 }
 
+TEST_CASE(persisted_history_requires_favicon_schema)
+{
+    auto database = TRY_OR_FAIL(Database::Database::create_memory_backed());
+
+    EXPECT_EQ(TRY_OR_FAIL(WebView::HistoryStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
+    EXPECT(WebView::HistoryStore::create(*database).is_error());
+
+    EXPECT_EQ(TRY_OR_FAIL(WebView::FaviconStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
+    EXPECT(!WebView::HistoryStore::create(*database).is_error());
+}
+
 TEST_CASE(newer_history_schema_reports_database_too_new)
 {
     auto database = TRY_OR_FAIL(Database::Database::create_memory_backed());
@@ -813,6 +818,59 @@ TEST_CASE(newer_history_schema_reports_database_too_new)
 
     EXPECT_EQ(TRY_OR_FAIL(WebView::HistoryStore::migrate_schema(*database)), Database::MigrationOutcome::DatabaseTooNew);
     EXPECT_EQ(TRY_OR_FAIL(WebView::HistoryStore::migrate_schema(*database, Database::MigrationMode::CheckOnly)), Database::MigrationOutcome::DatabaseTooNew);
+}
+
+TEST_CASE(history_favicon_store_migration_drops_legacy_favicons)
+{
+    auto database = TRY_OR_FAIL(Database::Database::create_memory_backed());
+    TRY_OR_FAIL(database->execute_raw(R"#(
+        CREATE TABLE SchemaVersions (store TEXT PRIMARY KEY, version INTEGER NOT NULL);
+        INSERT INTO SchemaVersions (store, version) VALUES ('History', 3);
+        CREATE TABLE History (
+            url TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            favicon TEXT,
+            visit_count INTEGER NOT NULL,
+            last_visited_time INTEGER NOT NULL,
+            direct_visit_count INTEGER NOT NULL DEFAULT 0,
+            last_qualifying_visit_time INTEGER NOT NULL DEFAULT 0,
+            last_direct_visit_time INTEGER NOT NULL DEFAULT 0,
+            decayed_visit_score REAL NOT NULL DEFAULT 0,
+            decayed_direct_score REAL NOT NULL DEFAULT 0,
+            score_updated_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX HistoryLastVisitedTimeIndex ON History(last_visited_time DESC);
+        CREATE TABLE OmniboxEngagements (
+            normalized_input TEXT NOT NULL,
+            destination_kind INTEGER NOT NULL,
+            destination_key TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            explicit_use_count INTEGER NOT NULL,
+            default_use_count INTEGER NOT NULL,
+            last_used_time INTEGER NOT NULL,
+            PRIMARY KEY (normalized_input, destination_kind, destination_key)
+        );
+        CREATE INDEX OmniboxEngagementsByInput
+        ON OmniboxEngagements(destination_kind, normalized_input);
+        INSERT INTO History (url, title, favicon, visit_count, last_visited_time)
+        VALUES ('https://example.com/', 'Example', 'Zm9v', 1, 123000);
+    )#"sv));
+
+    EXPECT_EQ(TRY_OR_FAIL(WebView::FaviconStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
+    EXPECT_EQ(TRY_OR_FAIL(WebView::HistoryStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
+    auto favicon_store = TRY_OR_FAIL(WebView::FaviconStore::create(*database));
+    auto history_store = TRY_OR_FAIL(WebView::HistoryStore::create(*database));
+    auto url = parse_url("https://example.com/"sv);
+
+    auto migrated_entry = history_store->entry_for_url(url);
+    VERIFY(migrated_entry.has_value());
+    EXPECT(!migrated_entry->favicon_png.has_value());
+
+    history_store->update_favicon(url, add_test_favicon(*favicon_store));
+    auto updated_entry = history_store->entry_for_url(url);
+    VERIFY(updated_entry.has_value());
+    VERIFY(updated_entry->favicon_png.has_value());
+    EXPECT(updated_entry->favicon_png->bytes() == "foo"sv.bytes());
 }
 
 TEST_CASE(history_ranking_signal_migration_preserves_existing_entries)
@@ -832,6 +890,7 @@ TEST_CASE(history_ranking_signal_migration_preserves_existing_entries)
         VALUES ('https://example.com/', 'Example', 12, 123000);
     )#"sv));
 
+    EXPECT_EQ(TRY_OR_FAIL(WebView::FaviconStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
     EXPECT_EQ(TRY_OR_FAIL(WebView::HistoryStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
     auto store = TRY_OR_FAIL(WebView::HistoryStore::create(*database));
     auto entry = store->entry_for_url(parse_url("https://example.com/"sv));

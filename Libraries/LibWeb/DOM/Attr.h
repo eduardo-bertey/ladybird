@@ -34,7 +34,7 @@ public:
     Utf16FlyString const& local_name() const { return m_qualified_name.local_name(); }
     Utf16FlyString const& name() const { return m_qualified_name.as_string(); }
 
-    Utf16String const& value() const { return m_value; }
+    Utf16String value() const;
     WebIDL::ExceptionOr<void> set_value(Utf16String value);
     WebIDL::ExceptionOr<void> set_value(Utf16View value) { return set_value(Utf16String::from_utf16(value)); }
     void change_attribute(Utf16String value);
@@ -43,13 +43,16 @@ public:
     Element* owner_element();
     Element const* owner_element() const;
     void set_owner_element(Element* owner_element);
+    static constexpr size_t owner_element_offset() { return offsetof(Attr, m_owner_element); }
 
     // Always returns true: https://dom.spec.whatwg.org/#dom-attr-specified
     constexpr bool specified() const { return true; }
 
-    void handle_attribute_changes(Element&, Optional<Utf16String> const& old_value, Optional<Utf16String> const& new_value);
-
 private:
+    friend class NamedNodeMap;
+
+    void detach_from_element(Utf16String value);
+
     Attr(Document&, QualifiedName, Utf16String value, GC::Ptr<Element>);
     virtual void visit_edges(Cell::Visitor&) override;
 

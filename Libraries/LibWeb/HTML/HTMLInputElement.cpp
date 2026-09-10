@@ -22,10 +22,11 @@
 #include <LibURL/Parser.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/SelectorMatching.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
@@ -46,6 +47,7 @@
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
+#include <LibWeb/HTML/RadioButtonGroupRegistry.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SelectedFile.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
@@ -53,16 +55,13 @@
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Layout/BlockContainer.h>
-#include <LibWeb/Layout/CheckBox.h>
-#include <LibWeb/Layout/ImageBox.h>
-#include <LibWeb/Layout/RadioButton.h>
-#include <LibWeb/Layout/RangeInputBox.h>
-#include <LibWeb/Layout/TextInputBox.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/MimeSniff/MimeType.h>
 #include <LibWeb/MimeSniff/Resource.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/InputEvent.h>
@@ -93,6 +92,11 @@ namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(HTMLInputElement);
 
+Layout::Node const* HTMLInputElement::image_provider_layout_node() const
+{
+    return unsafe_layout_node();
+}
+
 static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name, DOM::EventInit const& event_init = {})
 {
     return DOM::Event::create(
@@ -108,6 +112,17 @@ HTMLInputElement::HTMLInputElement(DOM::Document& document, DOM::QualifiedName q
 
 HTMLInputElement::~HTMLInputElement() = default;
 
+// `:user-valid` and `:user-invalid` turn on the first time the user has interacted with the
+// control, which no attribute and no value says. The style engine is told what the element now
+// holds rather than asking.
+void HTMLInputElement::set_user_validity(bool flag)
+{
+    if (m_user_validity == flag)
+        return;
+    m_user_validity = flag;
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
+}
+
 void HTMLInputElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -122,6 +137,7 @@ void HTMLInputElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_file_button);
     visitor.visit(m_file_label);
     visitor.visit(m_legacy_pre_activation_behavior_checked_element_in_group);
+    visitor.visit(m_radio_button_group_registry);
     visitor.visit(m_selected_files);
     visitor.visit(m_slider_runnable_track);
     visitor.visit(m_slider_progress_element);
@@ -140,11 +156,13 @@ void HTMLInputElement::adopted_from(DOM::Document& old_document)
 void HTMLInputElement::set_being_activated(bool activated)
 {
     Base::set_being_activated(activated);
-    if (first_is_one_of(type_state(), TypeAttributeState::Checkbox, TypeAttributeState::RadioButton))
+    if (first_is_one_of(type_state(), TypeAttributeState::Checkbox, TypeAttributeState::RadioButton)) {
+        Painting::push_form_control_paint_facts(*this);
         set_needs_repaint();
+    }
 }
 
-RefPtr<Layout::Node> HTMLInputElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+Layout::Node* HTMLInputElement::create_layout_node(CSS::LayoutStyle style)
 {
     if (type_state() == TypeAttributeState::Hidden)
         return nullptr;
@@ -152,17 +170,22 @@ RefPtr<Layout::Node> HTMLInputElement::create_layout_node(NonnullRefPtr<CSS::Com
     // NOTE: Image inputs are `appearance: none` per the default UA style,
     //       but we still need to create an ImageBox for them, or no image will get loaded.
     if (type_state() == TypeAttributeState::ImageButton) {
-        if (renders_as_alt_text() && !get_attribute_value(HTML::AttributeNames::alt).is_empty())
-            return Element::create_layout_node_for_display_type(document(), style->display(), style, this);
-        return make_ref_counted<Layout::ImageBox>(document(), *this, style, *this);
+        if (renders_as_alt_text() && !get_attribute_value(HTML::AttributeNames::alt).is_empty()) {
+            auto computed_style = this->computed_style();
+            VERIFY(computed_style);
+            return Element::create_layout_node_for_display_type(document(), computed_style->display(), style, this);
+        }
+        return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::ImageBox);
     }
 
     // https://drafts.csswg.org/css-ui/#appearance-switching
     // This specification introduces the appearance property to provide some control over this behavior.
     // In particular, using appearance: none allows authors to suppress the native appearance of widgets,
     // giving them a primitive appearance where CSS can be used to restyle them.
-    if (style->appearance() == CSS::Appearance::None) {
-        return Element::create_layout_node_for_display_type(document(), style->display(), style, this);
+    auto computed_style = this->computed_style();
+    VERIFY(computed_style);
+    if (computed_style->appearance() == CSS::Appearance::None) {
+        return Element::create_layout_node_for_display_type(document(), computed_style->display(), style, this);
     }
 
     switch (type_state()) {
@@ -170,18 +193,18 @@ RefPtr<Layout::Node> HTMLInputElement::create_layout_node(NonnullRefPtr<CSS::Com
     case TypeAttributeState::SubmitButton:
     case TypeAttributeState::Button:
     case TypeAttributeState::ResetButton:
-        return make_ref_counted<Layout::BlockContainer>(document(), this, style);
+        return &Layout::allocate_layout_node<Layout::BlockContainer>(document(), this, style);
     case TypeAttributeState::Checkbox:
-        return make_ref_counted<Layout::CheckBox>(document(), *this, style);
+        return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::CheckBox);
     case TypeAttributeState::RadioButton:
-        return make_ref_counted<Layout::RadioButton>(document(), *this, style);
+        return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::RadioButton);
     case TypeAttributeState::Range:
-        return make_ref_counted<Layout::RangeInputBox>(document(), *this, style);
+        return &Layout::allocate_layout_node<Layout::BlockContainer>(document(), *this, style, Layout::RustFFI::NodeKind::RangeInputBox);
     case TypeAttributeState::Color:
     case TypeAttributeState::FileUpload:
-        return Element::create_layout_node_for_display_type(document(), style->display(), style, this);
+        return Element::create_layout_node_for_display_type(document(), computed_style->display(), style, this);
     default:
-        return make_ref_counted<Layout::TextInputBox>(document(), *this, style);
+        return &Layout::allocate_layout_node<Layout::BlockContainer>(document(), *this, style, Layout::RustFFI::NodeKind::TextInputBox);
     }
 }
 
@@ -195,21 +218,32 @@ void HTMLInputElement::set_checked(bool checked)
 
     m_checked = checked;
 
-    CSS::Invalidation::invalidate_style_after_checked_state_change(*this, DOM::StyleInvalidationReason::HTMLInputElementSetChecked);
+    CSS::Invalidation::invalidate_style_after_checked_state_change(*this);
 
+    // Checkedness decides value-missing validity: for a checkbox its own, and for a radio button
+    // that of every member of its radio button group.
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
+
+    Painting::push_form_control_paint_facts(*this);
     set_needs_repaint();
 
-    // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
-    if (type_state() == TypeAttributeState::RadioButton && checked) {
-        // No point iterating the tree if we have an empty name.
-        if (!name().has_value() || name()->is_empty())
-            return;
-
+    // NB: The registry unchecks the other members of the group and republishes their validity. The tree walks
+    //     below are a fallback for radio buttons that have no registry.
+    if (m_radio_button_group_registry) {
+        m_radio_button_group_registry->checked_state_changed(m_radio_button_group_name, *this);
+    } else if (type_state() == TypeAttributeState::RadioButton && name().has_value() && !name()->is_empty()) {
         root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-            if (element.checked() && &element != this && is_in_same_radio_button_group_as(element))
-                element.set_checked(false);
+            if (&element != this && is_in_same_radio_button_group_as(element))
+                CSS::Invalidation::invalidate_style_after_validity_change(element);
             return TraversalDecision::Continue;
         });
+        if (checked) {
+            root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
+                if (element.checked() && &element != this && is_in_same_radio_button_group_as(element))
+                    element.set_checked(false);
+                return TraversalDecision::Continue;
+            });
+        }
     }
 }
 
@@ -224,7 +258,12 @@ bool HTMLInputElement::indeterminate() const
 void HTMLInputElement::set_indeterminate(bool value)
 {
     // The indeterminate setter steps are to set this's indeterminateness to the given value.
+    if (m_indeterminateness == value)
+        return;
     m_indeterminateness = value;
+    CSS::Invalidation::invalidate_style_after_indeterminate_state_change(*this, value);
+    Painting::push_form_control_paint_facts(*this);
+    set_needs_repaint();
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-list
@@ -326,7 +365,7 @@ FileFilter HTMLInputElement::parse_accept_attribute() const
 
     // If specified, the attribute must consist of a set of comma-separated tokens, each of which must be an ASCII
     // case-insensitive match for one of the following:
-    auto accept = get_attribute_value_view(HTML::AttributeNames::accept).value_or({});
+    auto accept = attribute(HTML::AttributeNames::accept).value_or({});
 
     accept.for_each_split_view(',', SplitBehavior::Nothing, [&](Utf16View value) {
         // The string "audio/*"
@@ -422,7 +461,7 @@ static void show_the_picker_if_applicable(HTMLInputElement& element)
             auto weak_element = GC::Weak<HTMLInputElement> { element };
 
             element.set_is_open(true);
-            element.document().browsing_context()->top_level_browsing_context()->page().did_request_file_picker(weak_element, accepted_file_types, allow_multiple_files);
+            element.document().page().did_request_file_picker(weak_element, accepted_file_types, allow_multiple_files);
         }
         // 4. If dismissed is true or if the user dismissed the prompt without changing their selection,
         //    then queue an element task on the user interaction task source given element to fire an event named cancel at element,
@@ -445,7 +484,7 @@ static void show_the_picker_if_applicable(HTMLInputElement& element)
         if (element.type_state() == HTMLInputElement::TypeAttributeState::Color) {
             auto weak_element = GC::Weak<HTMLInputElement> { element };
             element.set_is_open(true);
-            element.document().browsing_context()->top_level_browsing_context()->page().did_request_color_picker(weak_element, Color::from_utf16_string(element.value()).value_or(Color(0, 0, 0)));
+            element.document().page().did_request_color_picker(weak_element, Color::from_utf16_string(element.value()).value_or(Color(0, 0, 0)));
         }
     }
 }
@@ -772,9 +811,10 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16View value)
             if (m_text_node) {
                 m_text_node->set_data(m_value);
                 update_placeholder_visibility();
-
-                set_the_selection_range(m_text_node->length(), m_text_node->length());
             }
+
+            if (selection_or_range_applies())
+                set_the_selection_range(m_value.length_in_code_units(), m_value.length_in_code_units());
 
             update_shadow_tree();
         }
@@ -861,6 +901,7 @@ static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_visible()
     if (!style) {
         style = CSS::CSSStyleProperties::create({}, {});
         style->set_declarations_from_text(R"~~~(
+                display: block;
                 width: 100%;
                 height: 1lh;
                 overflow: hidden;
@@ -886,6 +927,10 @@ static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_hidden()
 
 void HTMLInputElement::update_placeholder_visibility()
 {
+    // Whether the placeholder shows is decided by the control's value, which no attribute carries,
+    // so `:placeholder-shown` moves with it and the style engine has to be told.
+    CSS::Invalidation::invalidate_style_after_placeholder_shown_change(*this);
+
     if (!m_placeholder_element)
         return;
     if (this->placeholder_value().has_value())
@@ -932,9 +977,9 @@ void HTMLInputElement::update_text_input_shadow_tree()
 {
     update_placeholder_visibility();
 
-    if (m_type == TypeAttributeState::Number) {
+    if (m_type == TypeAttributeState::Number && m_up_button_element && m_down_button_element) {
         // The `textfield` appearance is used to hide the stepper buttons.
-        if (auto style = computed_values(); style && style->appearance() == CSS::Appearance::Textfield) {
+        if (auto style = computed_style(); style && style->appearance() == CSS::Appearance::Textfield) {
             m_up_button_element->set_inline_style(stepper_button_style_when_hidden());
             m_down_button_element->set_inline_style(stepper_button_style_when_hidden());
         } else {
@@ -1033,7 +1078,7 @@ Utf16String HTMLInputElement::placeholder() const
 // https://html.spec.whatwg.org/multipage/input.html#attr-input-placeholder
 Optional<Utf16String> HTMLInputElement::placeholder_value() const
 {
-    if (!m_text_node || !m_text_node->data().is_empty())
+    if (!relevant_value().is_empty())
         return {};
     if (!is_allowed_to_have_placeholder(type_state()))
         return {};
@@ -1144,6 +1189,9 @@ void HTMLInputElement::remove_image_button_alt_text_shadow_tree()
 
 void HTMLInputElement::update_image_button_alt_text_shadow_tree()
 {
+    if (!shadow_root() && !has_style())
+        return;
+
     auto alt_text = get_attribute_value(HTML::AttributeNames::alt);
     if (type_state() != TypeAttributeState::ImageButton || !renders_as_alt_text() || alt_text.is_empty()) {
         remove_image_button_alt_text_shadow_tree();
@@ -1527,6 +1575,8 @@ void HTMLInputElement::user_interaction_did_change_input_value(Utf16FlyString co
     input_event_init.composed = true;
     input_event_init.input_type = input_type;
     input_event_init.data = data;
+    // https://w3c.github.io/uievents/#dom-inputevent-iscomposing
+    input_event_init.is_composing = document().is_input_method_composing();
     auto input_event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, input_event_init, {}, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
     dispatch_event(*input_event);
     // and any time the user commits the change, the user agent must queue an element task on the user interaction task source given the input
@@ -1646,6 +1696,16 @@ void HTMLInputElement::form_associated_element_attribute_changed(Utf16FlyString 
             m_value = value_sanitization_algorithm(m_value);
             update_shadow_tree();
         }
+    } else if (name == HTML::AttributeNames::size) {
+        // size feeds the element's default preferred width, which reaches layout only
+        // through the replaced-content facts; nothing else schedules a relayout.
+        if (old_value != value)
+            set_needs_layout_update(DOM::SetNeedsLayoutReason::DefaultPreferredSizeAttributeChange);
+    } else if (name == HTML::AttributeNames::name) {
+        update_radio_button_group_registration();
+    } else if (name == HTML::AttributeNames::required) {
+        if (m_radio_button_group_registry && old_value.has_value() != value.has_value())
+            m_radio_button_group_registry->required_state_changed(m_radio_button_group_name, *this);
     }
 
     // AD-HOC: A change to any of these attributes can change whether the element satisfies its constraints, and
@@ -1664,11 +1724,13 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
     if (old_state == new_state)
         return;
 
+    auto was_default = SelectorMatching::element_matches_state(*this, CSS::PseudoClass::Default);
+    auto was_read_write = SelectorMatching::element_matches_state(*this, CSS::PseudoClass::ReadWrite);
     auto new_value_attribute_mode = value_attribute_mode_for_type_state(new_state);
     auto old_value_attribute_mode = value_attribute_mode_for_type_state(old_state);
 
     if (checked_applies(old_state) != checked_applies(new_state)) {
-        CSS::Invalidation::invalidate_style_after_checked_state_change(*this, DOM::StyleInvalidationReason::HTMLInputElementSetType);
+        CSS::Invalidation::invalidate_style_after_checked_state_change(*this);
     }
 
     // 1. If the previous state of the element's type attribute put the value IDL attribute in the value mode, and the element's
@@ -1699,10 +1761,20 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
 
     // 4. Update the element's rendering and behavior to the new state's.
     m_type = new_state;
+    update_radio_button_group_registration();
+    if (auto* form = this->form(); form && (is_submit_button(old_state) || is_submit_button(new_state))) {
+        submit_button_state_changed();
+        form->default_button_state_maybe_changed(*this, was_default);
+    } else {
+        CSS::Invalidation::invalidate_style_after_default_state_change(*this, was_default);
+    }
+    CSS::Invalidation::invalidate_style_after_read_write_state_change(*this, was_read_write);
     clear_element_reference_pseudo_elements();
+    auto should_materialize_shadow_tree = shadow_root() || has_style();
     set_shadow_root(nullptr);
     m_image_button_alt_text_node = nullptr;
-    create_shadow_tree_if_needed();
+    if (should_materialize_shadow_tree)
+        create_shadow_tree_if_needed();
 
     // 5. Signal a type change for the element. (The Radio Button state uses this, in particular.)
     signal_a_type_change();
@@ -1738,6 +1810,10 @@ void HTMLInputElement::signal_a_type_change()
     // the checkedness state of all the other elements in the same radio button group must be set to false:
     // ...
     // - A type change is signalled for the element.
+    // NB: Registering the element with its new radio button group has already unchecked the other members of the
+    //     group. The tree walk below is a fallback for radio buttons that have no registry.
+    if (m_radio_button_group_registry)
+        return;
     if (type_state() == TypeAttributeState::RadioButton && checked()) {
         root().for_each_in_inclusive_subtree_of_type<HTMLInputElement>([&](auto& element) {
             if (element.checked() && &element != this && is_in_same_radio_button_group_as(element))
@@ -2051,14 +2127,14 @@ void HTMLInputElement::reset_algorithm()
     // The reset algorithm for input elements is to set its user validity, dirty value flag, and dirty checkedness flag back to false,
     m_user_validity = false;
     m_dirty_value = false;
-    m_dirty_checkedness = false;
 
     // set the value of the element to the value of the value content attribute, if there is one, or the empty string otherwise,
     auto old_value = move(m_value);
     m_value = get_attribute_value(AttributeNames::value);
 
     // set the checkedness of the element to true if the element has a checked content attribute and false if it does not,
-    m_checked = has_attribute(AttributeNames::checked);
+    set_checked(has_attribute(AttributeNames::checked));
+    m_dirty_checkedness = false;
 
     // empty the list of selected files,
     if (m_selected_files)
@@ -2086,14 +2162,14 @@ void HTMLInputElement::clear_algorithm()
 {
     // The clear algorithm for input elements is to set the dirty value flag and dirty checkedness flag back to false,
     m_dirty_value = false;
-    m_dirty_checkedness = false;
 
     // set the value of the element to an empty string,
     auto old_value = move(m_value);
     m_value = {};
 
     // set the checkedness of the element to true if the element has a checked content attribute and false if it does not,
-    m_checked = has_attribute(AttributeNames::checked);
+    set_checked(has_attribute(AttributeNames::checked));
+    m_dirty_checkedness = false;
 
     // empty the list of selected files,
     if (m_selected_files)
@@ -2117,24 +2193,76 @@ void HTMLInputElement::clear_algorithm()
     update_shadow_tree();
 }
 
+RadioButtonGroupRegistry* HTMLInputElement::radio_button_group_registry()
+{
+    // NB: A radio button group is scoped to the members' common form owner when they have one, and to the root of
+    //     the tree that contains them otherwise. Radio buttons in a detached subtree that is neither a shadow tree
+    //     nor the tree containing their form owner have no registry.
+    if (type_state() != TypeAttributeState::RadioButton)
+        return nullptr;
+    if (!name().has_value() || name()->is_empty())
+        return nullptr;
+    auto& root = this->root();
+    if (auto* form = this->form()) {
+        if (&form->root() != &root)
+            return nullptr;
+        return &form->ensure_radio_button_group_registry();
+    }
+    if (auto* shadow_root = as_if<DOM::ShadowRoot>(root))
+        return &shadow_root->ensure_radio_button_group_registry();
+    if (auto* document = as_if<DOM::Document>(root))
+        return &document->ensure_radio_button_group_registry();
+    return nullptr;
+}
+
+void HTMLInputElement::update_radio_button_group_registration()
+{
+    auto* registry = radio_button_group_registry();
+    auto group_name = registry ? name().value() : Utf16FlyString {};
+    if (registry == m_radio_button_group_registry.ptr() && group_name == m_radio_button_group_name)
+        return;
+
+    if (m_radio_button_group_registry)
+        m_radio_button_group_registry->remove_button(m_radio_button_group_name, *this);
+    m_radio_button_group_registry = registry;
+    m_radio_button_group_name = move(group_name);
+    if (m_radio_button_group_registry)
+        m_radio_button_group_registry->add_button(m_radio_button_group_name, *this);
+
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
+}
+
 void HTMLInputElement::form_associated_element_was_inserted()
 {
-    create_shadow_tree_if_needed();
+    // NB: The user-agent shadow tree is rendering state. It is created when a connected control first participates in
+    //     a style update, before computed properties are assigned. Creating it in the insertion steps would also
+    //     materialize controls in detached and short-lived trees.
 
-    if (is_connected()) {
-        // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
-        // When any of the following phenomena occur, if the element's checkedness state is true after the occurrence,
-        // the checkedness state of all the other elements in the same radio button group must be set to false:
-        // ...
-        // - The element becomes connected.
-        if (type_state() == TypeAttributeState::RadioButton && checked()) {
-            root().for_each_in_inclusive_subtree_of_type<HTMLInputElement>([&](auto& element) {
-                if (element.checked() && &element != this && is_in_same_radio_button_group_as(element))
-                    element.set_checked(false);
-                return TraversalDecision::Continue;
-            });
-        }
-    }
+    // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
+    // When any of the following phenomena occur, if the element's checkedness state is true after the occurrence,
+    // the checkedness state of all the other elements in the same radio button group must be set to false:
+    // ...
+    // - The element becomes connected.
+    // NB: Registering the element with its radio button group sets the checkedness of the other elements in the
+    //     group to false.
+    update_radio_button_group_registration();
+}
+
+void HTMLInputElement::form_associated_element_was_removed(DOM::Node* old_parent)
+{
+    FormAssociatedElement::form_associated_element_was_removed(old_parent);
+    update_radio_button_group_registration();
+}
+
+void HTMLInputElement::form_associated_element_was_moved(GC::Ptr<DOM::Node> old_parent)
+{
+    FormAssociatedElement::form_associated_element_was_moved(old_parent);
+    update_radio_button_group_registration();
+}
+
+void HTMLInputElement::form_associated_element_form_owner_changed()
+{
+    update_radio_button_group_registration();
 }
 
 EventResult HTMLInputElement::handle_return_key(Utf16FlyString const&)
@@ -2277,13 +2405,17 @@ void HTMLInputElement::legacy_pre_activation_behavior()
     //    element's radio button group that has its checkedness set to true, if any, and then set this element's
     //    checkedness to true.
     if (type_state() == TypeAttributeState::RadioButton) {
-        root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-            if (element.checked() && is_in_same_radio_button_group_as(element)) {
-                m_legacy_pre_activation_behavior_checked_element_in_group = &element;
-                return TraversalDecision::Break;
-            }
-            return TraversalDecision::Continue;
-        });
+        if (m_radio_button_group_registry) {
+            m_legacy_pre_activation_behavior_checked_element_in_group = m_radio_button_group_registry->checked_button(m_radio_button_group_name);
+        } else {
+            root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
+                if (element.checked() && is_in_same_radio_button_group_as(element)) {
+                    m_legacy_pre_activation_behavior_checked_element_in_group = &element;
+                    return TraversalDecision::Break;
+                }
+                return TraversalDecision::Continue;
+            });
+        }
 
         set_checked(true);
     }
@@ -2414,8 +2546,8 @@ WebIDL::UnsignedLong HTMLInputElement::height() const
         return 0;
 
     // Return the rendered height of the image, in CSS pixels, if the image is being rendered.
-    if (auto paintable_box = this->paintable_box())
-        return paintable_box->content_height().to_int();
+    if (auto const* layout_node = this->layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+        return Painting::content_height(*layout_node).to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
     if (auto height_string = get_attribute(HTML::AttributeNames::height); height_string.has_value()) {
@@ -2449,8 +2581,8 @@ WebIDL::UnsignedLong HTMLInputElement::width() const
         return 0;
 
     // Return the rendered width of the image, in CSS pixels, if the image is being rendered.
-    if (auto paintable_box = this->paintable_box())
-        return paintable_box->content_width().to_int();
+    if (auto const* layout_node = this->layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+        return Painting::content_width(*layout_node).to_int();
 
     // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
     if (auto width_string = get_attribute(HTML::AttributeNames::width); width_string.has_value()) {
@@ -2540,7 +2672,7 @@ Optional<double> HTMLInputElement::convert_time_string_to_number(Utf16View input
     // The algorithm to convert a string to a number, given a string input, is as follows: If parsing a time from input
     // results in an error, then return an error; otherwise, return the number of milliseconds elapsed from midnight to
     // the parsed time on a day with no time changes.
-    auto maybe_time = parse_time_string_value(MUST(input.to_utf8()));
+    auto maybe_time = parse_time_string_value(input);
     if (maybe_time.is_exception())
         return {};
     return maybe_time.value();
@@ -3251,10 +3383,15 @@ bool HTMLInputElement::is_button() const
 
 bool HTMLInputElement::is_submit_button() const
 {
+    return is_submit_button(type_state());
+}
+
+bool HTMLInputElement::is_submit_button(TypeAttributeState type_state)
+{
     // https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit):concept-submit-button
     // https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):concept-submit-button
-    return type_state() == TypeAttributeState::SubmitButton
-        || type_state() == TypeAttributeState::ImageButton;
+    return type_state == TypeAttributeState::SubmitButton
+        || type_state == TypeAttributeState::ImageButton;
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#text-(type=text)-state-and-search-state-(type=search)
@@ -3627,6 +3764,8 @@ bool HTMLInputElement::suffering_from_being_missing() const
         // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type%3Dradio)%3Asuffering-from-being-missing
         // If an element in the radio button group is required, and all of the input elements in the radio button group
         // have a checkedness that is false, then the element is suffering from being missing.
+        if (m_radio_button_group_registry)
+            return m_radio_button_group_registry->group_is_suffering_from_being_missing(m_radio_button_group_name);
         root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
             if (is_in_same_radio_button_group_as(element)) {
                 if (element.checked())
@@ -3913,7 +4052,7 @@ void HTMLInputElement::set_is_open(bool is_open)
         return;
 
     m_is_open = is_open;
-    CSS::Invalidation::invalidate_style_after_input_open_state_change(*this);
+    CSS::Invalidation::invalidate_style_after_input_open_state_change(*this, is_open);
 }
 
 bool HTMLInputElement::is_mutable() const

@@ -1610,27 +1610,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rejects_unavailable_interpreter_register_during_allocation() {
-        let error = build(
-            vec![instruction!(
-                Operation::Move(IntegerWidth::U64),
-                SourceOperand::InterpreterRegister(InterpreterRegister::Int32TagShifted,),
-                immediate(0)
-            )],
-            Architecture::Aarch64,
-        )
-        .unwrap_err();
-
-        assert_eq!(error.stage, CompileStage::Allocation);
-        assert_eq!(error.handler.as_deref(), Some("Test"));
-        assert!(
-            error
-                .message
-                .contains("interpreter register 'int32_tag_shifted' is unavailable on Aarch64")
-        );
-    }
-
     fn build(
         instructions: Vec<SourceInstruction>,
         arch: Architecture,
@@ -2679,7 +2658,7 @@ mod tests {
                 instruction!(Operation::Move(IntegerWidth::U64), register("dividend"), immediate(1)),
                 instruction!(Operation::Move(IntegerWidth::U64), register("divisor"), immediate(2)),
                 instruction!(
-                    Operation::Modulo,
+                    Operation::Modulo(IntegerWidth::U32),
                     register("rem"),
                     register("dividend"),
                     register("divisor")
@@ -2690,7 +2669,7 @@ mod tests {
             ],
             Architecture::X86_64,
         );
-        let names = find_operation(&out, Operation::Modulo)
+        let names = find_operation(&out, Operation::Modulo(IntegerWidth::U32))
             .operands
             .iter()
             .map(|operand| operand.register_name().unwrap_or("<non-reg>"))

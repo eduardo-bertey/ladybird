@@ -10,6 +10,7 @@
 #include <AK/StringView.h>
 #include <AK/Vector.h>
 #include <LibCore/ArgsParser.h>
+#include <LibCore/CrashHandler.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
@@ -48,7 +49,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     bool wait_for_debugger = false;
     bool disable_sandbox = false;
 
+    int crash_report_fd = -1;
     Core::ArgsParser args_parser;
+    args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
     args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
     args_parser.add_option(http_disk_cache_mode, "HTTP disk cache mode", "http-disk-cache-mode", 0, "mode");
@@ -57,6 +60,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
     args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
     args_parser.parse(arguments);
+
+    if (crash_report_fd >= 0) {
+        if (auto result = Core::CrashHandler::initialize(crash_report_fd); result.is_error())
+            warnln("Could not install crash report handler: {}", result.error());
+    }
 
     if (wait_for_debugger)
         Core::Process::wait_for_debugger_and_break();
@@ -109,12 +117,14 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     // Connections are stored on the stack to ensure they are destroyed before static destruction begins. This prevents
     // crashes from notifiers trying to unregister from already-destroyed thread data during process exit.
     RequestServer::ConnectionFromClient::ConnectionMap connections;
+    RequestServer::ConnectionFromClient::RequestTransferLeaseMap request_transfer_leases;
 
     auto client = TRY(IPC::take_over_accepted_client_from_system_server<RequestServer::ConnectionFromClient>(
         mach_server_name,
         RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes,
         RequestServer::IsPrivate::No,
         connections,
+        request_transfer_leases,
         disk_cache,
         LexicalPath::join(cache_path, "alt-svc-cache.txt"sv).string()));
 

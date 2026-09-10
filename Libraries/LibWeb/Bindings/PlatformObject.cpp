@@ -47,16 +47,36 @@ JS::ThrowCompletionOr<bool> ordinary_define_own_property_and_preserve_wrapper_if
 PlatformObject::PlatformObject(JS::Realm& realm, MayInterfereWithIndexedPropertyAccess may_interfere_with_indexed_property_access)
     : JS::Object(realm, nullptr, may_interfere_with_indexed_property_access)
 {
+    set_is_platform_object();
     set_requires_slow_add_own_property();
 }
 
 PlatformObject::PlatformObject(JS::Object& prototype, MayInterfereWithIndexedPropertyAccess may_interfere_with_indexed_property_access)
     : JS::Object(ConstructWithPrototypeTag::Tag, prototype, may_interfere_with_indexed_property_access)
 {
+    set_is_platform_object();
     set_requires_slow_add_own_property();
 }
 
+PlatformObject::PlatformObject(JS::Realm& realm, GC::Ref<Bindings::Wrappable> wrappable, MayInterfereWithIndexedPropertyAccess may_interfere_with_indexed_property_access)
+    : PlatformObject(realm, may_interfere_with_indexed_property_access)
+{
+    m_wrappable = wrappable;
+}
+
+PlatformObject::PlatformObject(JS::Object& prototype, GC::Ref<Bindings::Wrappable> wrappable, MayInterfereWithIndexedPropertyAccess may_interfere_with_indexed_property_access)
+    : PlatformObject(prototype, may_interfere_with_indexed_property_access)
+{
+    m_wrappable = wrappable;
+}
+
 PlatformObject::~PlatformObject() = default;
+
+void PlatformObject::visit_edges(JS::Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(m_wrappable);
+}
 
 void PlatformObject::finalize()
 {
@@ -274,6 +294,16 @@ WebIDL::ExceptionOr<void> PlatformObject::invoke_named_property_setter(Utf16FlyS
 
     // 6. Otherwise, operation was defined with an identifier. Perform the method steps of operation with O as this and « P, value » as the argument values.
     return set_value_of_named_property(realm(), property_name, value);
+}
+
+bool PlatformObject::is_cacheable_for_inherited_property() const
+{
+    if (!is_legacy_platform_object())
+        return true;
+    if (!m_legacy_platform_object_flags->supports_named_properties
+        || !m_legacy_platform_object_flags->has_legacy_override_built_ins_interface_extended_attribute)
+        return true;
+    return is<DOM::Document>(wrappable_impl()) && host_defined_wrapper_world(realm()).is_main_world();
 }
 
 // https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty
@@ -530,7 +560,7 @@ JS::ThrowCompletionOr<GC::RootVector<JS::Value>> PlatformObject::internal_own_pr
 
     // 5. For each P of O’s own property keys that is a Symbol, in ascending chronological order of property creation, append P to keys.
     shape().for_each_property_in_insertion_order([&](auto const& property_key, auto const&) {
-        if (property_key.is_symbol())
+        if (property_key.is_symbol() && !property_key.is_private())
             keys.append(property_key.to_value(vm));
     });
 

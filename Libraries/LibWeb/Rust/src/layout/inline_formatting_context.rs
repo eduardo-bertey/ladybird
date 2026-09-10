@@ -4,76 +4,314 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use super::*;
+
 const ELLIPSIS_CODE_POINT: u32 = 0x2026;
 
-pub(crate) trait EllipsisFontProvider {
-    fn font_glyph_width(&self, font: *const c_void, code_point: u32) -> f32;
-    fn font_glyph_id(&self, font: *const c_void, code_point: u32) -> u32;
+fn truncate_line_at_glyph_boundary(
+    line: &mut line_box::LineBoxData,
+    available_inline_size: CssPixels,
+    line_direction: u8,
+) -> Option<(usize, CssPixels)> {
+    let index = line.fragments.iter().position(|fragment| {
+        !fragment.is_fully_truncated
+            && (fragment.has_text_overflow_ellipsis
+                || fragment.inline_offset + fragment.inline_length > available_inline_size)
+    })?;
+    let fragment = &mut line.fragments[index];
+    if fragment.has_text_overflow_ellipsis {
+        if index == 0 {
+            return Some((index, fragment.inline_offset));
+        }
+        fragment.glyphs.as_mut().unwrap().glyphs.pop();
+        fragment.has_text_overflow_ellipsis = false;
+    }
+    let available = available_inline_size - fragment.inline_offset;
+    let Some(glyphs) = fragment.glyphs.as_mut().filter(|_| available > CssPixels::default()) else {
+        return (index > 0).then_some((index, fragment.inline_offset));
+    };
+    let glyph_end =
+        |glyph: &libgfx_rust::text_layout::DrawGlyph| CssPixels::nearest_value_for_f32(glyph.x + glyph.glyph_width);
+    let keep_from_end = fragment.current_insert_direction == direction::RTL && line_direction == direction::RTL;
+    let (mut start, mut end) = if keep_from_end {
+        (
+            glyphs.glyphs.partition_point(|glyph| {
+                fragment.record.inline_length - CssPixels::nearest_value_for_f32(glyph.x) > available
+            }),
+            glyphs.glyphs.len(),
+        )
+    } else {
+        (0, glyphs.glyphs.partition_point(|glyph| glyph_end(glyph) <= available))
+    };
+    while end > start && end < glyphs.glyphs.len() && glyphs.glyphs[end].length_in_code_units == 0 {
+        end -= 1;
+    }
+    while start < end && glyphs.glyphs[start].length_in_code_units == 0 {
+        start += 1;
+    }
+    if start == end {
+        return (index > 0).then_some((index, fragment.inline_offset));
+    }
+    let origin = CssPixels::nearest_value_for_f32(glyphs.glyphs[start].x);
+    let inline_size = glyph_end(&glyphs.glyphs[end - 1]) - origin;
+    glyphs.glyphs.drain(end..);
+    glyphs.glyphs.drain(..start);
+    for glyph in &mut glyphs.glyphs {
+        glyph.x -= origin.to_double() as f32;
+    }
+    let length = glyphs.glyphs.iter().map(|glyph| glyph.length_in_code_units).sum();
+    glyphs.width = inline_size.to_double() as f32;
+    if fragment.current_insert_direction == direction::RTL && !keep_from_end {
+        fragment.start += fragment.length_in_code_units - length;
+    }
+    fragment.length_in_code_units = length;
+    fragment.inline_length = inline_size;
+    fragment.trailing_whitespace = Default::default();
+    Some((index + 1, fragment.inline_offset + inline_size))
 }
 
-pub(crate) fn apply(line_boxes: &mut [LineBoxData], provider: &impl EllipsisFontProvider) {
-    for line in line_boxes {
-        if !matches!(line.original_available_inline_size, AvailableSize::Definite(_)) {
+fn apply_text_overflow_to_line(line: &mut line_box::LineBoxData) {
+    if !matches!(line.original_available_inline_size, AvailableSize::Definite(_)) {
+        return;
+    }
+    let available_inline_size = line.original_available_inline_size.to_px_or_zero();
+    if line.inline_length <= available_inline_size || line.fragments.is_empty() {
+        return;
+    }
+
+    let mut line_has_visible_content = false;
+    for index in 0..line.fragments.len() {
+        let fragment_start = line.fragments[index].inline_offset;
+        if fragment_start + line.fragments[index].inline_length <= available_inline_size {
+            line_has_visible_content = true;
             continue;
         }
-        let available_inline_size = line.original_available_inline_size.to_px_or_zero();
-        if line.inline_length <= available_inline_size || line.fragments.is_empty() {
+        let Some(glyph_data) = &line.fragments[index].glyphs else {
             continue;
+        };
+        let font = glyph_data.font.clone();
+        let ellipsis_inline_size = font.glyph_width(ELLIPSIS_CODE_POINT);
+        let available_in_fragment = (available_inline_size - fragment_start).raw_value() as f32 / 64.0;
+        let max_text_inline_size = available_in_fragment - ellipsis_inline_size;
+
+        let glyphs = &line.fragments[index].glyphs.as_ref().unwrap().glyphs;
+        let mut keep_count = 0usize;
+        let mut last_kept_end = 0.0f32;
+        let mut glyph_block_offset = 0.0f32;
+        for glyph in glyphs {
+            let glyph_end = glyph.x + glyph.glyph_width;
+            if glyph_end > max_text_inline_size && (keep_count > 0 || line_has_visible_content) {
+                break;
+            }
+            keep_count += 1;
+            last_kept_end = glyph_end;
+            glyph_block_offset = glyph.y;
         }
 
-        let mut line_has_visible_content = false;
-        for index in 0..line.fragments.len() {
-            let fragment_start = line.fragments[index].inline_offset;
-            let fragment_end = fragment_start + line.fragments[index].inline_length;
-            if fragment_end <= available_inline_size {
-                line_has_visible_content = true;
-                continue;
-            }
-            let Some(glyph_data) = &line.fragments[index].glyphs else {
-                continue;
-            };
-            let font = glyph_data.font;
-            let ellipsis_inline_size = provider.font_glyph_width(font, ELLIPSIS_CODE_POINT);
-            let available_in_fragment = (available_inline_size - fragment_start).raw_value() as f32 / 64.0;
-            let max_text_inline_size = available_in_fragment - ellipsis_inline_size;
-
-            let glyphs = &line.fragments[index].glyphs.as_ref().unwrap().glyphs;
-            let mut keep_count = 0usize;
-            let mut last_kept_end = 0.0f32;
-            let mut glyph_block_offset = 0.0f32;
-            for glyph in glyphs {
-                let glyph_end = glyph.x + glyph.glyph_width;
-                if glyph_end > max_text_inline_size && (keep_count > 0 || line_has_visible_content) {
-                    break;
-                }
-                keep_count += 1;
-                last_kept_end = glyph_end;
-                glyph_block_offset = glyph.y;
-            }
-
-            let glyph_data = line.fragments[index].glyphs.as_mut().unwrap();
-            glyph_data.glyphs.truncate(keep_count);
-            glyph_data.glyphs.push(FfiDrawGlyph {
-                x: last_kept_end,
-                y: glyph_block_offset,
-                length_in_code_units: 1,
-                glyph_width: ellipsis_inline_size,
-                glyph_id: provider.font_glyph_id(font, ELLIPSIS_CODE_POINT),
-                should_paint: true,
-            });
-            line.fragments[index].inline_length =
-                CssPixels::nearest_value_for_f32(last_kept_end + ellipsis_inline_size);
-            for later in &mut line.fragments[index + 1..] {
-                later.is_fully_truncated = true;
-            }
-            line.inline_length = available_inline_size;
-            line.clamp_static_position_markers_to_inline_length();
-            break;
+        let glyph_data = line.fragments[index].glyphs.as_mut().unwrap();
+        glyph_data.glyphs.truncate(keep_count);
+        glyph_data.glyphs.push(libgfx_rust::text_layout::DrawGlyph {
+            x: last_kept_end,
+            y: glyph_block_offset,
+            length_in_code_units: 1,
+            glyph_width: ellipsis_inline_size,
+            glyph_id: font.glyph_id_for_code_point(ELLIPSIS_CODE_POINT),
+            should_paint: true,
+        });
+        line.fragments[index].inline_length = CssPixels::nearest_value_for_f32(last_kept_end + ellipsis_inline_size);
+        line.fragments[index].has_text_overflow_ellipsis = true;
+        for later in &mut line.fragments[index + 1..] {
+            later.is_fully_truncated = true;
         }
+        line.inline_length = available_inline_size;
+        line.clamp_static_position_markers_to_inline_length();
+        break;
     }
 }
 
-pub(crate) fn apply_to_fragments(text_justify: u8, line: &mut LineBoxData, is_last_line: bool) {
+// https://drafts.csswg.org/css-overflow-4/#block-ellipsis
+// The user agent makes room as necessary of the block overflow ellipsis by displacing content from the end of the
+// line as if wrapping, until the last soft wrap opportunity that would still allow the entire block overflow
+// ellipsis to fit on the line.
+fn apply_block_ellipsis(
+    line: &mut line_box::LineBoxData,
+    context: &InlineFormattingContext<'_>,
+    ellipsis_text: &[u16],
+) {
+    let (style_source, style) = (context.containing_block, context.style(context.containing_block));
+    let first_code_point = char::decode_utf16(ellipsis_text.iter().copied())
+        .next()
+        .map_or(char::REPLACEMENT_CHARACTER, |result| {
+            result.unwrap_or(char::REPLACEMENT_CHARACTER)
+        }) as u32;
+    let presentation = libgfx_rust::font::emoji_presentation_for_code_point(first_code_point, None);
+    let font = style
+        .font_cascade_list()
+        .font_for_code_point(first_code_point, presentation, None);
+    let shaped_ellipsis = libgfx_rust::text_layout::shape_text(
+        &font,
+        ellipsis_text,
+        libgfx_rust::text_layout::TextType::Common,
+        0.0,
+        style.letter_spacing().to_double() as f32,
+        style.word_spacing().to_double() as f32,
+    );
+    let ellipsis_width = shaped_ellipsis.width();
+    let ellipsis_inline_size = CssPixels::nearest_value_for_f32(ellipsis_width);
+    let available_inline_size = match line.original_available_inline_size {
+        AvailableSize::Definite(size) => size,
+        _ => line.inline_length + ellipsis_inline_size,
+    };
+    line.inline_length_before_block_ellipsis = Some(line.inline_length);
+    line.trim_trailing_whitespace_before_block_ellipsis();
+    let available_for_content = (available_inline_size - ellipsis_inline_size).max(CssPixels::default());
+    let has_text_overflow_ellipsis = line
+        .visible_fragments()
+        .any(|fragment| fragment.has_text_overflow_ellipsis);
+    let opportunity = line.fragments.iter().enumerate().rev().find_map(|(index, fragment)| {
+        let trailing = fragment.trailing_whitespace;
+        let inline_size = fragment.inline_length - trailing.inline_size;
+        let inline_offset = fragment.inline_offset + inline_size;
+        (fragment.has_soft_wrap_opportunity_after && inline_offset <= available_for_content).then_some((
+            index + 1,
+            inline_offset,
+            fragment.length_in_code_units - trailing.length_in_code_units,
+            inline_size,
+        ))
+    });
+    let (first_displaced_fragment, retained_inline_size) = if line.inline_length <= available_for_content
+        && !has_text_overflow_ellipsis
+    {
+        (line.fragments.len(), line.inline_length)
+    } else if let Some((fragment_count, inline_offset, length, inline_size)) = opportunity {
+        let last_retained_fragment = &mut line.fragments[fragment_count - 1];
+        if last_retained_fragment.length_in_code_units > length || last_retained_fragment.has_text_overflow_ellipsis {
+            let mut retained_code_units = 0usize;
+            if let Some(glyphs) = &mut last_retained_fragment.glyphs {
+                glyphs.glyphs.retain(|glyph| {
+                    retained_code_units += glyph.length_in_code_units;
+                    retained_code_units <= length
+                });
+                glyphs.width = inline_size.to_double() as f32;
+            }
+            last_retained_fragment.length_in_code_units = length;
+            last_retained_fragment.inline_length = inline_size;
+            last_retained_fragment.trailing_whitespace = Default::default();
+            last_retained_fragment.has_text_overflow_ellipsis = false;
+        }
+        (fragment_count, inline_offset)
+    } else {
+        // INTEROP: Legacy -webkit-line-clamp truncates unbreakable text at a glyph boundary when no soft wrap exists.
+        // NB: Trailing inline box edges can overflow available_for_content even when every content fragment fits.
+        //     Preserve those fragments if glyph truncation therefore finds no boundary to remove.
+        let mut retained_inline_size: Option<CssPixels> = None;
+        let mut all_content_fits = true;
+        for fragment in line.visible_fragments() {
+            let content_inline_size = if fragment.is_atomic_inline {
+                Some(fragment.inline_length)
+            } else {
+                fragment
+                    .glyphs
+                    .as_ref()
+                    .filter(|glyphs| !glyphs.glyphs.is_empty())
+                    .map(|glyphs| CssPixels::nearest_value_for_f32(glyphs.width))
+            };
+            let Some(content_inline_size) = content_inline_size else {
+                continue;
+            };
+            let fragment_end = fragment.inline_offset + content_inline_size;
+            if fragment_end > available_for_content {
+                all_content_fits = false;
+                break;
+            }
+            retained_inline_size = Some(retained_inline_size.unwrap_or_default().max(fragment_end));
+        }
+        let preserve_existing_fragments = retained_inline_size
+            .filter(|_| all_content_fits)
+            .map(|retained_inline_size| (line.fragments.len(), retained_inline_size));
+        truncate_line_at_glyph_boundary(line, available_for_content, line.direction)
+            .or(preserve_existing_fragments)
+            .unwrap_or_default()
+    };
+    for fragment in &mut line.fragments[first_displaced_fragment..] {
+        fragment.is_fully_truncated = true;
+        if fragment.is_atomic_inline {
+            context.hide_atomic_inline_for_line_clamp(fragment.layout_node);
+        }
+    }
+    line.static_position_markers
+        .retain(|marker| marker.inline_offset <= retained_inline_size);
+
+    // https://drafts.csswg.org/css-overflow-4/#block-ellipsis
+    // For bidi purposes, the block overflow ellipsis must be treated as an anonymous inline with unicode-bidi:
+    // isolate, with the same embedding level as the bidi paragraph, and which inherits direction from the bidi
+    // paragraph.
+    let ellipsis_precedes_content = line.direction == direction::RTL
+        && line
+            .visible_fragments()
+            .next_back()
+            .is_none_or(|fragment| fragment.current_insert_direction != direction::LTR);
+    let (content_inline_start, ellipsis_inline_offset) = if ellipsis_precedes_content {
+        (ellipsis_inline_size, CssPixels::default())
+    } else {
+        (CssPixels::default(), retained_inline_size)
+    };
+    for fragment in &mut line.fragments {
+        fragment.inline_offset += content_inline_start;
+    }
+    for marker in &mut line.static_position_markers {
+        marker.inline_offset += content_inline_start;
+    }
+    line.inline_length = retained_inline_size + ellipsis_inline_size;
+
+    let baseline = CssPixels::nearest_value_for_f32(style.font_ascent())
+        + (style.line_height() - CssPixels::nearest_value_for_f32(style.font_ascent() + style.font_descent())) / 2;
+    let boundary_fragment = line.visible_fragments().next_back().or_else(|| line.fragments.first());
+    let layout_node =
+        boundary_fragment.map_or_else(|| context.first_child(style_source), |fragment| fragment.layout_node);
+    let start = boundary_fragment.map_or(0, |fragment| {
+        if fragment.is_fully_truncated {
+            fragment.start
+        } else {
+            fragment.start + fragment.length_in_code_units
+        }
+    });
+    let mut ellipsis = line_box_fragment::LineBoxFragmentData::new(
+        layout_node,
+        start,
+        ellipsis_text.len(),
+        ellipsis_inline_offset,
+        CssPixels::default(),
+        ellipsis_inline_size,
+        line_builder::normal_line_height(style),
+        CssPixels::default(),
+        line.direction,
+        line.writing_mode,
+        Some(line_box_fragment::GlyphData {
+            glyphs: shaped_ellipsis.into_glyphs(),
+            font,
+            text_type: line_box_fragment::GLYPH_TEXT_TYPE_COMMON,
+            width: ellipsis_width,
+        }),
+        line_box_fragment::FragmentBuildFacts {
+            style_source,
+            is_atomic_inline: false,
+            white_space_collapse: style.white_space_collapse(),
+            text_utf16: std::ptr::null(),
+            text_length_in_code_units: 0,
+        },
+    );
+    // https://drafts.csswg.org/css-overflow-4/#block-ellipsis
+    // The block overflow ellipsis is wrapped in an anonymous inline whose parent is the block container's root
+    // inline box. This inline is assigned line-height: 0.
+    // NB: The fragment is inserted after line sizing, so its recorded block length is only used to align its glyphs
+    //     and cannot increase the line box's block size.
+    ellipsis.baseline = baseline;
+    ellipsis.is_block_ellipsis = true;
+    line.fragments.push(ellipsis);
+}
+
+pub(crate) fn apply_to_fragments(text_justify: u8, line: &mut line_box::LineBoxData, is_last_line: bool) {
     if text_justify == text_justify::NONE || is_last_line || line.has_forced_break {
         return;
     }
@@ -86,7 +324,7 @@ pub(crate) fn apply_to_fragments(text_justify: u8, line: &mut LineBoxData, is_la
     let mut excess_inline_space_including_whitespace = excess_inline_space;
     let mut whitespace_count = 0usize;
     for fragment in &line.fragments {
-        if fragment.is_justifiable_whitespace() {
+        if !fragment.is_fully_truncated && fragment.is_justifiable_whitespace() {
             whitespace_count += 1;
             excess_inline_space_including_whitespace += fragment.inline_length;
         }
@@ -99,6 +337,9 @@ pub(crate) fn apply_to_fragments(text_justify: u8, line: &mut LineBoxData, is_la
 
     let mut running_diff = CssPixels::default();
     for fragment in &mut line.fragments {
+        if fragment.is_fully_truncated {
+            continue;
+        }
         fragment.inline_offset += running_diff;
         if fragment.is_justifiable_whitespace() && fragment.inline_length != justified_space_inline_size {
             let diff = justified_space_inline_size - fragment.inline_length;
@@ -120,35 +361,17 @@ pub(crate) const EDGE_RIGHT: u8 = 1 << 1;
 pub(crate) const EDGE_BOTTOM: u8 = 1 << 2;
 pub(crate) const EDGE_LEFT: u8 = 1 << 3;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct InlineCssPixelRect {
-    pub(crate) x: CssPixels,
-    pub(crate) y: CssPixels,
-    pub(crate) width: CssPixels,
-    pub(crate) height: CssPixels,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct InlineBoxPieceData {
-    pub(crate) node: Node,
-    pub(crate) first_fragment_index: u32,
-    pub(crate) fragment_count: u32,
-    pub(crate) border_box_rect: InlineCssPixelRect,
-    pub(crate) relpos_delta: FfiCssPixelPoint,
-    pub(crate) present_edges: u8,
-    pub(crate) is_geometry_only_placeholder: bool,
-}
+pub(crate) use inline_content::InlineBoxPieceRecord as InlineBoxPieceData;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StagedPiece {
     pub(crate) piece: InlineBoxPieceData,
-    pub(crate) line_index: u32,
     pub(crate) depth: u32,
     pub(crate) discovery_index: usize,
 }
 
 pub(crate) fn sort_for_emission(pieces: &mut [StagedPiece]) {
-    pieces.sort_by_key(|piece| (piece.line_index, piece.depth, piece.discovery_index));
+    pieces.sort_by_key(|piece| (piece.piece.line_index, piece.depth, piece.discovery_index));
 }
 
 #[derive(Debug)]
@@ -239,7 +462,7 @@ fn edge_bits(horizontal: bool, low: bool, high: bool) -> u8 {
 
 pub(crate) struct InlineContainingBlockRectCandidate {
     pub(crate) inline_containing_block: Node,
-    pub(crate) rect: PhysicalRect,
+    pub(crate) rect: formatting_context::PhysicalRect,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -264,17 +487,17 @@ pub(crate) fn compute(
         .run
         .fragments
         .as_deref()
-        .is_some_and(RunFragmentBuilder::any_pending_abspos_has_inline_containing_block);
-    let container_inline_axis_is_reverse = collect_inline_containing_block_rects
-        && context.facts(context.containing_block).inline_axis_is_reverse();
+        .is_some_and(fragment_tree::RunFragmentBuilder::any_pending_abspos_has_inline_containing_block);
+    let container_inline_axis_is_reverse =
+        collect_inline_containing_block_rects && context.facts(context.containing_block).inline_axis_is_reverse();
     let mut inline_containing_block_rect_candidates = Vec::<InlineContainingBlockRectCandidate>::new();
     let mut per_nodes = Vec::<PerNode>::new();
-    let mut node_to_index = HashMap::<Node, usize>::new();
+    let mut node_to_index = HashMap::<Node, usize>::default();
 
     let mut committed_fragment_index = 0u32;
     for (line_index, line) in context.line_data().line_boxes.iter().enumerate() {
         for fragment in &line.fragments {
-            if fragment.is_fully_truncated {
+            if fragment.is_fully_truncated || fragment.is_block_ellipsis {
                 continue;
             }
             let fragment_index = committed_fragment_index;
@@ -449,27 +672,38 @@ pub(crate) fn compute(
         let mut corners = FirstAndLastContentLineCorners::default();
 
         for line in lines {
+            let inline_box_anchor = || {
+                let line_data = context.line_data();
+                let line_box = &line_data.line_boxes[line.line_index];
+                line_box.inline_box_baseline(node).map_or(
+                    (line_box.block_start + line_box.baseline, CssPixels::default()),
+                    |entry| (entry.baseline, entry.accumulated_vertical_shift),
+                )
+            };
             let Some((contributions_inline_start, contributions_inline_end)) = line.contributions_inline_range else {
                 if let Some((position, extent)) = line.interrupting_block {
                     if node_is_inline_containing_block {
                         corners.first.get_or_insert(extent);
                         corners.last = Some(extent);
                     }
+                    let (inline_box_baseline, inline_box_vertical_shift) = inline_box_anchor();
                     staged.push(StagedPiece {
                         piece: InlineBoxPieceData {
                             node,
                             first_fragment_index: line.first_fragment_index.unwrap_or(0),
                             fragment_count: line.fragment_count,
-                            border_box_rect: InlineCssPixelRect {
+                            line_index: line.line_index as u32,
+                            border_box_rect: FfiCssPixelRect {
                                 x: position.0,
                                 y: position.1,
                                 ..Default::default()
                             },
                             relpos_delta: FfiCssPixelPoint::default(),
+                            baseline: inline_box_baseline,
+                            accumulated_vertical_shift: inline_box_vertical_shift,
                             present_edges: edge_bits(horizontal, true, true),
                             is_geometry_only_placeholder: true,
                         },
-                        line_index: line.line_index as u32,
                         depth,
                         discovery_index: node_index,
                     });
@@ -503,15 +737,16 @@ pub(crate) fn compute(
                 };
             let border_block_start = content_block_start - border_padding_block_low;
             let border_block_length = content_block_length + border_padding_block_low + border_padding_block_high;
+            let (inline_box_baseline, inline_box_vertical_shift) = inline_box_anchor();
             let rect = if horizontal {
-                InlineCssPixelRect {
+                FfiCssPixelRect {
                     x: border_inline_start,
                     y: border_block_start,
                     width: border_inline_end - border_inline_start,
                     height: border_block_length,
                 }
             } else {
-                InlineCssPixelRect {
+                FfiCssPixelRect {
                     x: border_block_start,
                     y: border_inline_start,
                     width: border_block_length,
@@ -523,12 +758,14 @@ pub(crate) fn compute(
                     node,
                     first_fragment_index: line.first_fragment_index.unwrap_or(0),
                     fragment_count: line.fragment_count,
+                    line_index: line.line_index as u32,
                     border_box_rect: rect,
                     relpos_delta: FfiCssPixelPoint::default(),
+                    baseline: inline_box_baseline,
+                    accumulated_vertical_shift: inline_box_vertical_shift,
                     present_edges: edge_bits(horizontal, has_low_edge, has_high_edge),
                     is_geometry_only_placeholder: false,
                 },
-                line_index: line.line_index as u32,
                 depth,
                 discovery_index: node_index,
             });
@@ -578,12 +815,12 @@ pub(crate) fn compute(
         context.used(node);
         let line_height = context.style(node).line_height();
         let placeholder_rect = if horizontal {
-            InlineCssPixelRect {
+            FfiCssPixelRect {
                 height: line_height,
                 ..Default::default()
             }
         } else {
-            InlineCssPixelRect {
+            FfiCssPixelRect {
                 width: line_height,
                 ..Default::default()
             }
@@ -597,7 +834,7 @@ pub(crate) fn compute(
         {
             inline_containing_block_rect_candidates.push(InlineContainingBlockRectCandidate {
                 inline_containing_block: node,
-                rect: PhysicalRect {
+                rect: formatting_context::PhysicalRect {
                     x: placeholder_rect.x,
                     y: placeholder_rect.y,
                     width: placeholder_rect.width,
@@ -610,12 +847,14 @@ pub(crate) fn compute(
                 node,
                 first_fragment_index: 0,
                 fragment_count: 0,
+                line_index: 0,
                 border_box_rect: placeholder_rect,
                 relpos_delta: FfiCssPixelPoint::default(),
+                baseline: CssPixels::default(),
+                accumulated_vertical_shift: CssPixels::default(),
                 present_edges: edge_bits(horizontal, true, true),
                 is_geometry_only_placeholder: true,
             },
-            line_index: 0,
             depth: nesting_depth(context, node),
             discovery_index: per_nodes.len() + index,
         });
@@ -631,7 +870,7 @@ fn padding_box_rect_spanning_first_and_last_content_lines(
     horizontal: bool,
     inline_axis_is_reverse: bool,
     container_inline_axis_is_reverse: bool,
-) -> Option<PhysicalRect> {
+) -> Option<formatting_context::PhysicalRect> {
     let first = corners.first?;
     let last = corners.last?;
 
@@ -670,14 +909,14 @@ fn padding_box_rect_spanning_first_and_last_content_lines(
         (start - size, size)
     };
     Some(if horizontal {
-        PhysicalRect {
+        formatting_context::PhysicalRect {
             x: inline_low,
             y: block_start,
             width: inline_size,
             height: block_size,
         }
     } else {
-        PhysicalRect {
+        formatting_context::PhysicalRect {
             x: block_start,
             y: inline_low,
             width: block_size,
@@ -697,7 +936,7 @@ pub(crate) struct InlineAncestorChainRelativeOffset {
 /// the first ancestor that is not inline-flow.
 pub(crate) fn accumulated_relative_insets_from_inline_ancestor_chain(
     records: &RunRecords,
-    callbacks: &FfiLayoutFcCallbacks,
+    callbacks: &LayoutPass<'_>,
     first_ancestor: Node,
     stop_at: Node,
 ) -> InlineAncestorChainRelativeOffset {
@@ -728,27 +967,28 @@ pub(crate) fn accumulated_relative_insets_from_inline_ancestor_chain(
 }
 
 pub(crate) struct InlineFormattingContext<'context> {
-    pub(crate) run: &'context FormattingContextRun,
+    pub(crate) run: &'context FormattingContextRun<'context>,
     pub(crate) containing_block: Node,
     pub(crate) layout_mode: LayoutMode,
     pub(crate) input: LayoutInput,
-    pub(crate) callbacks: FfiLayoutFcCallbacks,
-    parent: &'context BlockFormattingContext,
+    pub(crate) callbacks: LayoutPass<'context>,
+    pub(crate) parent: &'context block_formatting_context::BlockFormattingContext<'context>,
     pub(crate) containing_used_values: std::rc::Rc<UsedValues>,
     pub(crate) fragmented_inlines_in_pre_order: Vec<Node>,
     pub(crate) automatic_content_inline_size: CssPixels,
+    pub(crate) min_content_inline_size_from_max_content_layout: Option<CssPixels>,
     pub(crate) automatic_content_block_size: CssPixels,
     block_axis_float_clearance: Cell<CssPixels>,
 }
 
 impl<'context> InlineFormattingContext<'context> {
     pub(crate) fn new_with_rust_parent(
-        run: &'context FormattingContextRun,
+        run: &'context FormattingContextRun<'context>,
         containing_block: Node,
         layout_mode: LayoutMode,
         input: LayoutInput,
-        callbacks: FfiLayoutFcCallbacks,
-        parent: &'context BlockFormattingContext,
+        callbacks: LayoutPass<'context>,
+        parent: &'context block_formatting_context::BlockFormattingContext<'context>,
     ) -> Self {
         let containing_used_values = run.records.used_values(containing_block);
         containing_used_values.line_data_cell();
@@ -762,6 +1002,7 @@ impl<'context> InlineFormattingContext<'context> {
             containing_used_values,
             fragmented_inlines_in_pre_order: Vec::new(),
             automatic_content_inline_size: CssPixels::default(),
+            min_content_inline_size_from_max_content_layout: None,
             automatic_content_block_size: CssPixels::default(),
             block_axis_float_clearance: Cell::new(CssPixels::default()),
         }
@@ -775,7 +1016,63 @@ impl<'context> InlineFormattingContext<'context> {
         self.block_axis_float_clearance.set(clearance);
     }
 
-    pub(crate) fn style(&self, node: Node) -> StyleValues<'static> {
+    fn hide_atomic_inline_for_line_clamp(&self, node: Node) {
+        if let Some(fragments) = self.run.fragments.as_deref() {
+            fragments.discard_unplaced_subtree(node);
+        }
+        self.used(node).is_invisible_for_line_clamp.set(true);
+    }
+
+    pub(crate) fn prepare_line_for_line_clamp(
+        &self,
+        line_index: usize,
+        has_immediate_continuation: bool,
+        line_block_end: CssPixels,
+    ) {
+        let content_box_position_in_bfc_root = self
+            .input
+            .content_box_position_in_bfc_root
+            .expect("line clamping requires the containing block position in the BFC root");
+        let block_offset_adjustment = self
+            .parent
+            .block_offset_adjustment_from_pending_ancestor_block_start_margins(self.containing_block);
+        let line_block_end_in_bfc_root = content_box_position_in_bfc_root.y + block_offset_adjustment + line_block_end;
+        let mut line_data = self.line_data_mut();
+        let line = &mut line_data.line_boxes[line_index];
+        if self.parent.register_line_for_line_clamp(
+            self.containing_block,
+            line,
+            has_immediate_continuation,
+            line_block_end_in_bfc_root,
+        ) {
+            line.trim_trailing_whitespace();
+            if self.text_overflow_applies() {
+                apply_text_overflow_to_line(line);
+            }
+            let ellipsis_text = match self.style(self.containing_block).block_ellipsis() {
+                crate::css::style_value::StyleValueData::Keyword { keyword: code } if *code == keyword::NO_ELLIPSIS => {
+                    None
+                }
+                crate::css::style_value::StyleValueData::Keyword { keyword: code } if *code == keyword::AUTO => {
+                    Some(vec![ELLIPSIS_CODE_POINT as u16])
+                }
+                crate::css::style_value::StyleValueData::String { string, .. } => Some(
+                    crate::css::serialize::with_fly_string_units(string, |units| match units {
+                        crate::css::serialize::StringUnits::Ascii(bytes) => {
+                            bytes.iter().map(|byte| u16::from(*byte)).collect()
+                        }
+                        crate::css::serialize::StringUnits::Utf16(code_units) => code_units.to_vec(),
+                    }),
+                ),
+                _ => unreachable!("computed block-ellipsis is no-ellipsis, auto, or a string"),
+            };
+            if let Some(ellipsis_text) = ellipsis_text.filter(|text| !text.is_empty()) {
+                apply_block_ellipsis(line, self, &ellipsis_text);
+            }
+        }
+    }
+
+    pub(crate) fn style(&self, node: Node) -> StyleValues<'context> {
         StyleValues::for_node(&self.callbacks, node)
     }
 
@@ -791,12 +1088,17 @@ impl<'context> InlineFormattingContext<'context> {
         }
     }
 
-    pub(crate) fn line_data(&self) -> Ref<'_, LineData> {
-        self.containing_used_values.line_data_cell().borrow()
+    pub(crate) fn line_data(&self) -> Ref<'_, used_values::LineData> {
+        Ref::map(self.containing_used_values.line_data_cell().borrow(), |shared| {
+            shared.building()
+        })
     }
 
-    pub(crate) fn line_data_mut(&self) -> RefMut<'_, LineData> {
-        self.containing_used_values.line_data_cell().borrow_mut()
+    pub(crate) fn line_data_mut(&self) -> RefMut<'_, used_values::LineData> {
+        RefMut::map(
+            self.containing_used_values.line_data_cell().borrow_mut(),
+            used_values::LineDataState::building_mut,
+        )
     }
 
     pub(crate) fn containing_used(&self) -> std::rc::Rc<UsedValues> {
@@ -856,7 +1158,12 @@ impl<'context> InlineFormattingContext<'context> {
 
     pub(crate) fn compute_inset(&self, node: Node) {
         let used = self.containing_used();
-        crate::layout::compute_inset_native(self.run, node, used.content_inline_size.get(), used.content_block_size.get());
+        abspos_engine::compute_inset_native(
+            self.run,
+            node,
+            used.content_inline_size.get(),
+            used.content_block_size.get(),
+        );
     }
 
     pub(crate) fn parent_commit_pending_margin_before_inline_content(&self) -> CssPixels {
@@ -893,12 +1200,12 @@ impl<'context> InlineFormattingContext<'context> {
         &self,
         block_offset: CssPixels,
         line_block_size: CssPixels,
-    ) -> crate::layout::AvailableSize {
+    ) -> AvailableSize {
         if !matches!(self.input.available_space.inline_size, AvailableSize::Definite(_)) {
             return self.input.available_space.inline_size;
         }
         let intrusions = self.intrusion_by_floats_into_containing_block(block_offset, block_offset + line_block_size);
-        crate::layout::AvailableSize::definite(
+        AvailableSize::definite(
             self.input.available_space.inline_size.to_px_or_zero() - intrusions.left - intrusions.right,
         )
     }
@@ -938,14 +1245,21 @@ impl<'context> InlineFormattingContext<'context> {
             self.input.containing_block_constraints,
             ParticipationInParentFormattingContext::AtomicInline,
         );
-        match crate::layout::layout_inside_child(self.run, Some(self.parent), None, node, self.layout_mode, input, false)
-        {
-            crate::layout::ChildLayoutOutcome::Created(result) => result.baselines,
-            crate::layout::ChildLayoutOutcome::ReenterCurrent => {
+        match formatting_context::layout_inside_child(
+            self.run,
+            Some(self.parent),
+            None,
+            node,
+            self.layout_mode,
+            input,
+            false,
+        ) {
+            ChildLayoutOutcome::Created(result) => result.baselines,
+            ChildLayoutOutcome::ReenterCurrent => {
                 self.parent.run(self.run, input);
                 self.used(node).content_baselines_from_cells()
             }
-            crate::layout::ChildLayoutOutcome::Skipped => self.used(node).content_baselines_from_cells(),
+            ChildLayoutOutcome::Skipped => self.used(node).content_baselines_from_cells(),
         }
     }
 
@@ -957,8 +1271,8 @@ impl<'context> InlineFormattingContext<'context> {
             // SAFETY: The callback table and layout node remain live for this
             // synchronous formatting-context run.
             unsafe {
-                (self.callbacks.report_unexpected_fragmented_inline)(
-                    self.callbacks.context,
+                (self.callbacks.host.report_unexpected_fragmented_inline)(
+                    self.callbacks.host.context,
                     self.callbacks.shell(node),
                 );
             }
@@ -972,6 +1286,18 @@ impl<'context> InlineFormattingContext<'context> {
             "atomic inline-level run left its root's inline size unresolved"
         );
         content_baselines
+    }
+
+    pub(crate) fn sizing(&self) -> sizing_context::SizingContext<'context> {
+        self.parent.sizing()
+    }
+
+    pub(crate) fn paired_min_content_inline_size_for_atomic_root(&self, node: Node) -> Option<CssPixels> {
+        self.parent.sizing().paired_min_content_inline_size_for_atomic_root(
+            node,
+            self.input.available_space,
+            self.input.containing_block_constraints,
+        )
     }
 
     fn clear_floating_boxes(&self, node: Node) -> bool {
@@ -1000,19 +1326,288 @@ impl<'context> InlineFormattingContext<'context> {
         style.text_overflow() == text_overflow::ELLIPSIS && style.overflow_x() != overflow::VISIBLE
     }
 
+    fn reusable_atomic_line_prefix(
+        &self,
+        previous: &inline_content::InlineContent,
+        iterator: &inline_level_iterator::InlineLevelIterator,
+    ) -> (Vec<line_box::LineBoxData>, usize) {
+        if self.containing_block != self.run.box_
+            || !previous.inline_box_pieces.is_empty()
+            || previous
+                .lines
+                .iter()
+                .any(|line| line.writing_mode != writing_mode::HORIZONTAL_TB)
+            || iterator
+                .items()
+                .iter()
+                .any(|item| item.type_ != inline_level_iterator::ItemType::Element)
+        {
+            return (Vec::new(), 0);
+        }
+
+        let mut item_index = 0usize;
+        let mut reused_lines = Vec::new();
+        let mut item_count_before_last_line = 0usize;
+        let mut fragment_start = 0;
+        for retained_line in &previous.lines {
+            if !retained_line.reusable_atomic_prefix {
+                break;
+            }
+            let fragment_end = fragment_start + retained_line.fragment_count as usize;
+            let line = line_box::LineBoxData {
+                record: *retained_line,
+                fragments: previous.fragments[fragment_start..fragment_end]
+                    .iter()
+                    .map(|fragment| line_box_fragment::LineBoxFragmentData::with_record(fragment.clone(), None))
+                    .collect(),
+                static_position_markers: Vec::new(),
+                inline_box_baselines: Vec::new(),
+            };
+            fragment_start = fragment_end;
+            let line_item_start = item_index;
+            let mut running_inline_length = CssPixels::default();
+            let mut matched = true;
+            for fragment in &line.fragments {
+                let Some(item) = iterator.items().get(item_index) else {
+                    matched = false;
+                    break;
+                };
+                let used = self.used(item.node);
+                let expected_inline_offset =
+                    running_inline_length + item.margin_start + item.border_start + item.padding_start;
+                if !fragment.is_atomic_inline
+                    || fragment.layout_node != item.node
+                    || fragment.inline_offset != expected_inline_offset
+                    || fragment.inline_length != item.inline_size
+                    || fragment.block_length != used.content_block_size.get()
+                    || fragment.content_baselines != Some(item.content_baselines)
+                    || fragment.border_box_block_start != used.border_box_top(false)
+                {
+                    matched = false;
+                    break;
+                }
+                running_inline_length += item.margin_start
+                    + item.border_start
+                    + item.padding_start
+                    + item.inline_size
+                    + item.padding_end
+                    + item.border_end
+                    + item.margin_end;
+                item_index += 1;
+            }
+            if !matched || running_inline_length != line.inline_length {
+                item_index = line_item_start;
+                break;
+            }
+            item_count_before_last_line = line_item_start;
+            reused_lines.push(line);
+        }
+
+        // Changed content can fit on the last reused line, including when an insertion
+        // precedes an existing line. Removing all following lines also changes its final-break
+        // state. Resume there even if all its old fragments still match.
+        if !reused_lines.is_empty()
+            && (item_index < iterator.items().len() || reused_lines.len() < previous.lines.len())
+        {
+            reused_lines.pop();
+            item_index = item_count_before_last_line;
+        }
+        (reused_lines, item_index)
+    }
+
+    pub(crate) fn min_content_inline_size_from_max_content_items(
+        &self,
+        items: &[inline_level_iterator::Item],
+    ) -> Option<CssPixels> {
+        if self.input.available_space.inline_size != AvailableSize::MaxContent {
+            return None;
+        }
+        if self.facts(self.containing_block).is_scroll_container() {
+            return None;
+        }
+        if self.style(self.containing_block).writing_mode() != writing_mode::HORIZONTAL_TB {
+            return None;
+        }
+
+        let containing_style = self.style(self.containing_block);
+        let containing_inline_size = self.input.containing_block_constraints.inline_basis();
+        if containing_style.text_indent().to_px(containing_inline_size) != CssPixels::default() {
+            return None;
+        }
+
+        let wraps = containing_style.text_wrap_mode() == text_wrap_mode::WRAP;
+        let mut maximum = CssPixels::default();
+        let mut current = CssPixels::default();
+        let mut line_has_content = false;
+        let finish_line = |maximum: &mut CssPixels, current: &mut CssPixels, line_has_content: &mut bool| {
+            *maximum = (*maximum).max(*current);
+            *current = CssPixels::default();
+            *line_has_content = false;
+        };
+        for item in items {
+            match item.type_ {
+                inline_level_iterator::ItemType::Element => {
+                    if item.has_box_model_metrics() {
+                        return None;
+                    }
+                    if wraps && line_has_content {
+                        finish_line(&mut maximum, &mut current, &mut line_has_content);
+                    }
+                    current += item.min_content_inline_size?;
+                    line_has_content = true;
+                }
+                inline_level_iterator::ItemType::Text => {
+                    if item.has_box_model_metrics() || item.contains_tab(self) {
+                        return None;
+                    }
+                    if item.length_in_node == 0 && item.inline_size == CssPixels::default() {
+                        continue;
+                    }
+                    let parent_style = self.style(self.parent_node(item.node));
+                    let wraps = parent_style.text_wrap_mode() == text_wrap_mode::WRAP;
+                    if wraps && breaks_between_graphemes(parent_style) {
+                        return None;
+                    }
+                    if !wraps {
+                        current += item.inline_size;
+                        line_has_content = true;
+                        continue;
+                    }
+                    if item.is_ascii_whitespace(self) {
+                        if !item.is_collapsible_whitespace {
+                            return None;
+                        }
+                        if line_has_content {
+                            finish_line(&mut maximum, &mut current, &mut line_has_content);
+                        }
+                        continue;
+                    }
+                    if item.trailing_whitespace.inline_size != CssPixels::default() {
+                        return None;
+                    }
+                    if item.can_break_before && line_has_content {
+                        finish_line(&mut maximum, &mut current, &mut line_has_content);
+                    }
+                    current += item.inline_size;
+                    line_has_content = true;
+                }
+                inline_level_iterator::ItemType::ForcedBreak => {
+                    finish_line(&mut maximum, &mut current, &mut line_has_content);
+                }
+                inline_level_iterator::ItemType::BlockLevelBox
+                | inline_level_iterator::ItemType::AbsolutelyPositionedElement
+                | inline_level_iterator::ItemType::FloatingElement => {
+                    return None;
+                }
+            }
+        }
+        finish_line(&mut maximum, &mut current, &mut line_has_content);
+        Some(maximum)
+    }
+
+    pub(crate) fn overflow_break_applies(&self, text_node: Node) -> bool {
+        self.overflow_break_applies_to_style(self.style(self.parent_node(text_node)))
+    }
+
+    pub(crate) fn overflow_break_applies_to_style(&self, style: StyleValues<'_>) -> bool {
+        if style.text_wrap_mode() != text_wrap_mode::WRAP {
+            return false;
+        }
+        breaks_between_graphemes(style)
+            || (style.overflow_wrap() == overflow_wrap::BREAK_WORD
+                && self.input.available_space.inline_size != AvailableSize::MinContent)
+    }
+
+    fn break_overflowing_text_item(
+        &self,
+        line_builder: &mut line_builder::LineBuilder<'_, '_>,
+        item: &mut inline_level_iterator::Item,
+    ) {
+        if line_builder
+            .remaining_inline_size_for_overflow_break()
+            .is_none_or(|remaining_inline_size| item.border_box_inline_size() <= remaining_inline_size)
+        {
+            return;
+        }
+        let style = self.style(self.parent_node(item.node));
+        let text_content = self.callbacks.text_content(item.node);
+        let letter_spacing = style.letter_spacing().to_double() as f32;
+        let word_spacing = style.word_spacing().to_double() as f32;
+        loop {
+            let Some(remaining_inline_size) = line_builder.remaining_inline_size_for_overflow_break() else {
+                return;
+            };
+            if item.border_box_inline_size() <= remaining_inline_size {
+                return;
+            }
+            let line_is_empty = self.line_data().line_boxes.last().is_some_and(|line| line.is_empty());
+            if line_is_empty && line_builder.current_line_has_no_space_left_by_floats() {
+                line_builder.break_line(line_builder::ForcedBreak::No, NodeSlotId::INVALID, None);
+                continue;
+            }
+            let split_item = item.split_for_overflow_break(
+                &text_content.text,
+                text_content.grapheme_segmenter(),
+                letter_spacing,
+                word_spacing,
+                remaining_inline_size,
+                line_is_empty,
+            );
+            let Some(mut prefix) = split_item else {
+                if line_is_empty {
+                    return;
+                }
+                line_builder.break_line(
+                    line_builder::ForcedBreak::No,
+                    NodeSlotId::INVALID,
+                    Some(item.border_box_inline_size()),
+                );
+                continue;
+            };
+            line_builder.append_text_item(&mut prefix, style.line_height());
+            line_builder.break_line(line_builder::ForcedBreak::No, NodeSlotId::INVALID, None);
+        }
+    }
+
     pub(crate) fn generate_line_boxes(&mut self) {
-        self.line_data_mut().line_boxes.clear();
-        self.line_data_mut().inline_box_pieces.clear();
-        let mut iterator = InlineLevelIterator::new(self);
+        let mut iterator = inline_level_iterator::InlineLevelIterator::new(self);
+        self.min_content_inline_size_from_max_content_layout =
+            self.min_content_inline_size_from_max_content_items(iterator.items());
         self.fragmented_inlines_in_pre_order = iterator.take_visited_fragmented_inlines();
-        let mut line_builder = LineBuilder::new(self);
+        let (reused_lines, reused_item_count) = if self.parent.has_line_clamp() {
+            Default::default()
+        } else {
+            self.run
+                .previous_line_data
+                .as_deref()
+                .map(|previous| self.reusable_atomic_line_prefix(previous, &iterator))
+                .unwrap_or_default()
+        };
+        {
+            let mut data = self.line_data_mut();
+            data.line_boxes = reused_lines;
+            data.inline_box_pieces.clear();
+        }
+        iterator.skip_items(reused_item_count);
+        let reused_line_count = self.line_data().line_boxes.len();
+        let mut line_builder = if reused_line_count == 0 {
+            line_builder::LineBuilder::new(self)
+        } else {
+            line_builder::LineBuilder::new_after_reused_lines(self)
+        };
 
         let mut leading_margin = CssPixels::default();
         let mut leading_border = CssPixels::default();
         let mut leading_padding = CssPixels::default();
         let mut absolute_boxes = Vec::new();
 
-        while let Some(mut item) = iterator.next() {
+        let mut previous_text_item_allows_overflow_break_after = false;
+        while !self.parent.line_clamp_reached() {
+            let Some(mut item) = iterator.next() else {
+                break;
+            };
+            let can_break_after_previous_overflow_item =
+                std::mem::take(&mut previous_text_item_allows_overflow_break_after);
             let line_starts_with_whitespace = self
                 .line_data()
                 .line_boxes
@@ -1020,7 +1615,7 @@ impl<'context> InlineFormattingContext<'context> {
                 .is_none_or(|line| line.is_empty_or_ends_in_whitespace() || line.has_block_level_box);
             if item.is_collapsible_whitespace && line_starts_with_whitespace {
                 if self.style(self.style_source(item.node)).text_wrap_mode() == text_wrap_mode::WRAP {
-                    let next_inline_size = iterator.next_non_whitespace_sequence_inline_size(self);
+                    let next_inline_size = iterator.next_inline_run_size(self).unwrap_or_default();
                     if next_inline_size > CssPixels::default() {
                         line_builder.prepare_to_append_inline_content();
                         line_builder.break_if_needed(next_inline_size);
@@ -1040,14 +1635,15 @@ impl<'context> InlineFormattingContext<'context> {
             leading_padding = CssPixels::default();
 
             match item.type_ {
-                ItemType::ForcedBreak => {
-                    line_builder.break_line(ForcedBreak::Yes, None);
+                inline_level_iterator::ItemType::ForcedBreak => {
+                    let continuation = iterator.next_inline_run_size(self);
+                    line_builder.break_line(line_builder::ForcedBreak::Yes, item.node, continuation);
                     if !item.node.is_invalid() && self.clear_floating_boxes(item.node) {
                         line_builder.did_introduce_clearance(self.block_axis_float_clearance.get());
                         self.reset_parent_margin_state();
                     }
                 }
-                ItemType::Element => {
+                inline_level_iterator::ItemType::Element => {
                     line_builder.prepare_to_append_inline_content();
                     self.compute_inset(item.node);
                     if self.style(self.containing_block).text_wrap_mode() == text_wrap_mode::WRAP {
@@ -1059,6 +1655,10 @@ impl<'context> InlineFormattingContext<'context> {
                             minimum += item.margin_end;
                         }
                         line_builder.break_if_needed(minimum);
+                        line_builder.note_soft_wrap_opportunity();
+                    }
+                    if self.parent.line_clamp_reached() {
+                        break;
                     }
                     line_builder.append_box(
                         item.node,
@@ -1069,11 +1669,14 @@ impl<'context> InlineFormattingContext<'context> {
                         item.content_baselines,
                     );
                 }
-                ItemType::BlockLevelBox => {
+                inline_level_iterator::ItemType::BlockLevelBox => {
                     leading_margin += item.margin_start;
                     leading_border += item.border_start;
                     leading_padding += item.padding_start;
                     line_builder.finish_current_line_before_block_level_box();
+                    if self.parent.line_clamp_reached() {
+                        continue;
+                    }
                     self.parent.layout_interrupting_block_inside_inline_context(
                         self.run,
                         item.node,
@@ -1082,7 +1685,7 @@ impl<'context> InlineFormattingContext<'context> {
                         &mut line_builder,
                     );
                 }
-                ItemType::AbsolutelyPositionedElement => {
+                inline_level_iterator::ItemType::AbsolutelyPositionedElement => {
                     if !self.facts(item.node).is_box() {
                         continue;
                     }
@@ -1093,12 +1696,12 @@ impl<'context> InlineFormattingContext<'context> {
                     line_builder.append_static_position_marker(item.node, preceded);
                     absolute_boxes.push(item.node);
                 }
-                ItemType::FloatingElement => {
+                inline_level_iterator::ItemType::FloatingElement => {
                     line_builder.commit_pending_margin_before_float();
                     self.create_used_values(item.node, self.input.containing_block_constraints);
                     self.clear_floating_boxes(item.node);
                     line_builder.set_unbreakable_run_inline_size_interrupted_by_float(
-                        iterator.next_non_whitespace_sequence_inline_size(self),
+                        iterator.next_unbreakable_run_inline_size(self),
                     );
                     self.parent.layout_floating_box(
                         self.run,
@@ -1108,65 +1711,117 @@ impl<'context> InlineFormattingContext<'context> {
                         Some(&mut line_builder),
                     );
                 }
-                ItemType::Text => {
+                inline_level_iterator::ItemType::Text => {
                     line_builder.prepare_to_append_inline_content();
-                    if self.style(self.parent_node(item.node)).text_wrap_mode() == text_wrap_mode::WRAP {
-                        let is_whitespace =
-                            item.is_collapsible_whitespace || iterator.item_is_ascii_whitespace(self, &item);
+                    let style = self.style(self.parent_node(item.node));
+                    if style.text_wrap_mode() == text_wrap_mode::WRAP {
+                        let is_whitespace = item.is_collapsible_whitespace || item.is_ascii_whitespace(self);
+                        let item_inline_size = item.border_box_inline_size();
                         let next_inline_size = if is_whitespace {
-                            iterator.next_non_whitespace_sequence_inline_size(self)
+                            iterator.next_inline_run_size(self).unwrap_or_default()
                         } else {
                             CssPixels::default()
                         };
-                        if is_whitespace
-                            && next_inline_size > CssPixels::default()
-                            && line_builder.break_if_needed(item.border_box_inline_size() + next_inline_size)
-                        {
-                            line_builder.set_trailing_whitespace_on_previous_line();
-                            continue;
+                        if is_whitespace && next_inline_size > CssPixels::default() {
+                            let sequence_inline_size = item_inline_size + next_inline_size;
+                            let broke_line = if iterator.next_non_whitespace_text_allows_overflow_break(self) {
+                                line_builder.break_if_needed_before_overflow_breakable_item(sequence_inline_size)
+                            } else {
+                                line_builder.break_if_needed(sequence_inline_size)
+                            };
+                            if broke_line {
+                                line_builder.set_trailing_whitespace_on_previous_line();
+                                continue;
+                            }
                         }
-                        let line_is_empty = self.line_data().line_boxes.last().is_some_and(LineBoxData::is_empty);
-                        if !is_whitespace && (item.can_break_before || line_is_empty) {
-                            line_builder.break_if_needed(item.border_box_inline_size());
+                        let overflow_break_allowed = !is_whitespace && self.overflow_break_applies_to_style(style);
+                        let line_is_empty_or_ends_in_whitespace = self
+                            .line_data()
+                            .line_boxes
+                            .last()
+                            .is_some_and(line_box::LineBoxData::is_empty_or_ends_in_whitespace);
+                        let can_break_before_item = item.can_break_before
+                            || (can_break_after_previous_overflow_item && !overflow_break_allowed)
+                            || line_is_empty_or_ends_in_whitespace;
+                        if !is_whitespace && can_break_before_item {
+                            if overflow_break_allowed {
+                                line_builder.break_if_needed_before_overflow_breakable_item(item_inline_size);
+                            } else {
+                                line_builder.break_if_needed(item_inline_size);
+                            }
+                            line_builder.note_soft_wrap_opportunity();
+                        }
+                        if overflow_break_allowed {
+                            self.break_overflowing_text_item(&mut line_builder, &mut item);
+                            previous_text_item_allows_overflow_break_after = true;
                         }
                     }
-                    let line_height = self.style(self.parent_node(item.node)).line_height();
-                    line_builder.append_text_chunk(
-                        item.node,
-                        item.offset_in_node,
-                        item.length_in_node,
-                        item.border_start + item.padding_start,
-                        item.padding_end + item.border_end,
-                        item.margin_start,
-                        item.margin_end,
-                        item.inline_size,
-                        line_height,
-                        item.glyphs.take().unwrap(),
-                        item.trailing_whitespace,
-                    );
+                    if self.parent.line_clamp_reached() {
+                        break;
+                    }
+                    line_builder.append_text_item(&mut item, style.line_height());
                 }
             }
         }
 
+        if self.parent.line_clamp_reached() {
+            for item in iterator.items() {
+                if item.type_ == inline_level_iterator::ItemType::Element {
+                    self.hide_atomic_inline_for_line_clamp(item.node);
+                } else if item.type_ == inline_level_iterator::ItemType::AbsolutelyPositionedElement
+                    && self.facts(item.node).is_box()
+                    && self.line_data().line_boxes.iter().any(|line| {
+                        line.visible_fragments().any(|fragment| {
+                            self.callbacks
+                                .is_ancestor(self.callbacks.parent(item.node), fragment.layout_node)
+                        })
+                    })
+                {
+                    line_builder.append_static_position_marker(item.node, false);
+                    absolute_boxes.push(item.node);
+                }
+            }
+        }
+        if self.parent.has_line_clamp() {
+            line_builder.update_last_line(false);
+        }
         let line_count = self.line_data().line_boxes.len();
-        for line_index in 0..line_count {
-            self.line_data_mut().line_boxes[line_index].trim_trailing_whitespace();
+        for line_index in reused_line_count..line_count {
+            if self.line_data().line_boxes[line_index]
+                .inline_length_before_block_ellipsis
+                .is_none()
+            {
+                self.line_data_mut().line_boxes[line_index].trim_trailing_whitespace();
+            }
         }
         if self.text_overflow_applies() {
-            apply(self.line_data_mut().line_boxes.as_mut_slice(), self);
+            for line_index in reused_line_count..line_count {
+                if self.line_data().line_boxes[line_index]
+                    .inline_length_before_block_ellipsis
+                    .is_none()
+                {
+                    apply_text_overflow_to_line(&mut self.line_data_mut().line_boxes[line_index]);
+                }
+            }
         }
         let containing_style = self.style(self.containing_block);
         if containing_style.text_align() == text_align::JUSTIFY {
             let line_count = self.line_data().line_boxes.len();
             for index in 0..line_count {
+                let is_last_line = index + 1 == line_count
+                    && self.line_data().line_boxes[index]
+                        .inline_length_before_block_ellipsis
+                        .is_none();
                 apply_to_fragments(
                     containing_style.text_justify(),
                     &mut self.line_data_mut().line_boxes[index],
-                    index + 1 == line_count,
+                    is_last_line,
                 );
             }
         }
-        line_builder.update_last_line();
+        if !self.parent.has_line_clamp() {
+            line_builder.update_last_line(false);
+        }
 
         for line_index in 0..self.line_data().line_boxes.len() {
             if self.line_data().line_boxes[line_index].has_block_level_box {
@@ -1179,11 +1834,11 @@ impl<'context> InlineFormattingContext<'context> {
                     continue;
                 }
                 let (x, y) = fragment.offset();
-                crate::layout::place_child(
+                formatting_context::place_child(
                     self.run,
                     fragment.layout_node,
                     FfiCssPixelPoint { x, y },
-                    Some(LineBoxFragmentCoordinate {
+                    Some(used_values::LineBoxFragmentCoordinate {
                         line_box_index: line_index,
                         fragment_index,
                     }),
@@ -1193,7 +1848,7 @@ impl<'context> InlineFormattingContext<'context> {
 
         if self.layout_mode == LayoutMode::Normal {
             for box_ in absolute_boxes {
-                let mut static_position = StaticPositionRect {
+                let mut static_position = abspos_inputs::StaticPositionRect {
                     rect: Default::default(),
                     inline_alignment: StaticPositionAlignment::Start,
                     block_alignment: StaticPositionAlignment::Start,
@@ -1204,7 +1859,10 @@ impl<'context> InlineFormattingContext<'context> {
                         if marker.box_ != box_ {
                             continue;
                         }
-                        if self.facts(box_).display_before_box_type_transformation_is_block_outside() {
+                        if self
+                            .facts(box_)
+                            .display_before_box_type_transformation_is_block_outside()
+                        {
                             let block_position = if marker.preceded_by_in_flow_content {
                                 line.physical_vertical_end()
                             } else {
@@ -1225,7 +1883,7 @@ impl<'context> InlineFormattingContext<'context> {
                         break 'lines;
                     }
                 }
-                crate::layout::register_contained_abspos_child(
+                formatting_context::register_contained_abspos_child(
                     &self.callbacks,
                     self.run.fragments.as_deref(),
                     self.containing_block,
@@ -1251,7 +1909,7 @@ impl<'context> InlineFormattingContext<'context> {
             if lines.iter().any(|line| line.has_block_level_box) {
                 lines
                     .last()
-                    .map_or(CssPixels::default(), LineBoxData::physical_vertical_end)
+                    .map_or(CssPixels::default(), |line| line.physical_vertical_end())
             } else {
                 lines
                     .iter()
@@ -1261,14 +1919,12 @@ impl<'context> InlineFormattingContext<'context> {
         self.automatic_content_inline_size = self
             .parent
             .greatest_child_inline_size_including_floats(self.containing_block);
-        let baselines = crate::layout::derive_baselines(&self.run.records, &self.callbacks, self.containing_block, false);
+        let baselines =
+            formatting_context::derive_baselines(self.run.records, &self.callbacks, self.containing_block, false);
         if self.containing_block == self.parent.root_box() {
             self.parent.record_derived_baselines_of_root_box(baselines);
         } else {
-            crate::layout::store_derived_baselines(
-                &self.used(self.containing_block),
-                baselines,
-            );
+            formatting_context::store_derived_baselines(&self.used(self.containing_block), baselines);
         }
     }
 
@@ -1277,7 +1933,7 @@ impl<'context> InlineFormattingContext<'context> {
         self.line_data_mut().inline_box_pieces = pieces;
         for candidate in inline_containing_block_rect_candidates {
             let relative_inset_chain = accumulated_relative_insets_from_inline_ancestor_chain(
-                &self.run.records,
+                self.run.records,
                 &self.callbacks,
                 candidate.inline_containing_block,
                 self.containing_block,
@@ -1286,7 +1942,11 @@ impl<'context> InlineFormattingContext<'context> {
             rect.x += relative_inset_chain.offset_x;
             rect.y += relative_inset_chain.offset_y;
             if let Some(fragments) = self.run.fragments.as_deref() {
-                fragments.register_inline_containing_block_rect(candidate.inline_containing_block, rect, self.containing_block);
+                fragments.register_inline_containing_block_rect(
+                    candidate.inline_containing_block,
+                    rect,
+                    self.containing_block,
+                );
             }
         }
     }
@@ -1300,13 +1960,13 @@ impl<'context> InlineFormattingContext<'context> {
         if data.inline_box_pieces.is_empty() {
             return;
         }
-        let mut accumulated_relative_offset_by_chain_start = HashMap::<Node, FfiCssPixelPoint>::new();
+        let mut accumulated_relative_offset_by_chain_start = HashMap::<Node, FfiCssPixelPoint>::default();
         let mut accumulated_relative_offset_from = |first_ancestor: Node| -> FfiCssPixelPoint {
             *accumulated_relative_offset_by_chain_start
                 .entry(first_ancestor)
                 .or_insert_with(|| {
                     let chain = accumulated_relative_insets_from_inline_ancestor_chain(
-                        &self.run.records,
+                        self.run.records,
                         &self.callbacks,
                         first_ancestor,
                         self.containing_block,
@@ -1331,79 +1991,21 @@ impl<'context> InlineFormattingContext<'context> {
     }
 }
 
-impl EllipsisFontProvider for InlineFormattingContext<'_> {
-    fn font_glyph_width(&self, font: *const c_void, code_point: u32) -> f32 {
-        font_glyph_width(font, code_point)
-    }
-
-    fn font_glyph_id(&self, font: *const c_void, code_point: u32) -> u32 {
-        font_glyph_id(font, code_point)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct FfiCssPixelRect {
-    pub x: CssPixels,
-    pub y: CssPixels,
-    pub width: CssPixels,
-    pub height: CssPixels,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SpaceUsedByFloats {
     pub left: CssPixels,
     pub right: CssPixels,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct FfiLineRecord {
-    pub rect: FfiCssPixelRect,
-    pub committed_fragment_count: u32,
+fn breaks_between_graphemes(style: StyleValues<'_>) -> bool {
+    style.overflow_wrap() == overflow_wrap::ANYWHERE || style.word_break() == word_break::BREAK_WORD
 }
 
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiCommittedFragment {
-    pub layout_node: *mut c_void,
-    pub offset: FfiCssPixelPoint,
-    pub size: FfiCssPixelPoint,
-    pub start: usize,
-    pub length_in_code_units: usize,
-    pub baseline: CssPixels,
-    pub writing_mode: u8,
-    pub has_trailing_whitespace: bool,
-    pub has_glyph_run: bool,
-    pub glyphs: *const FfiDrawGlyph,
-    pub glyph_count: usize,
-    pub glyph_font: *const c_void,
-    pub glyph_text_type: u8,
-    pub glyph_run_width: f32,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiInlineBoxPiece {
-    pub node: *mut c_void,
-    pub first_fragment_index: u32,
-    pub fragment_count: u32,
-    pub border_box_rect: FfiCssPixelRect,
-    pub present_edges: u8,
-    pub is_geometry_only_placeholder: bool,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiLineSinkCallbacks {
-    pub context: *mut c_void,
-    pub begin_line: unsafe extern "C" fn(*mut c_void, FfiLineRecord),
-    pub emit_fragment: unsafe extern "C" fn(*mut c_void, FfiCommittedFragment),
-    pub emit_inline_box_piece: unsafe extern "C" fn(*mut c_void, FfiInlineBoxPiece),
-}
-
-pub(crate) fn line_physical_horizontal_extent(line: &LineBoxData) -> CssPixels {
+pub(crate) fn line_physical_horizontal_extent(line: &line_box::LineBoxData) -> CssPixels {
     if line.has_block_level_box || line.writing_mode == writing_mode::HORIZONTAL_TB {
+        if let Some(ellipsis) = line.fragments.last().filter(|fragment| fragment.is_block_ellipsis) {
+            return line.inline_length - ellipsis.inline_length;
+        }
         return line.inline_length;
     }
     let Some(first) = line.fragments.first() else {
@@ -1419,8 +2021,33 @@ pub(crate) fn line_physical_horizontal_extent(line: &LineBoxData) -> CssPixels {
     right - left
 }
 
-fn line_rect(line: &LineBoxData, content_inline_size: CssPixels) -> FfiCssPixelRect {
-    let Some(first) = line.fragments.first() else {
+pub(crate) fn line_rect(line: &line_box::LineBoxData, content_inline_size: CssPixels) -> FfiCssPixelRect {
+    let mut rect = None::<FfiCssPixelRect>;
+    let mut include = |x, y, width, height| {
+        if width <= CssPixels::default() || height <= CssPixels::default() {
+            return;
+        }
+        rect = Some(if let Some(rect) = rect {
+            let right = (rect.x + rect.width).max(x + width);
+            let bottom = (rect.y + rect.height).max(y + height);
+            let x = rect.x.min(x);
+            let y = rect.y.min(y);
+            FfiCssPixelRect {
+                x,
+                y,
+                width: right - x,
+                height: bottom - y,
+            }
+        } else {
+            FfiCssPixelRect { x, y, width, height }
+        });
+    };
+    for fragment in line.visible_fragments() {
+        let (x, y) = fragment.offset();
+        let (width, height) = fragment.size();
+        include(x, y, width, height);
+    }
+    let Some(mut rect) = rect else {
         return FfiCssPixelRect {
             x: CssPixels::default(),
             y: line.physical_vertical_end() - line.physical_vertical_extent(),
@@ -1428,128 +2055,9 @@ fn line_rect(line: &LineBoxData, content_inline_size: CssPixels) -> FfiCssPixelR
             height: line.physical_vertical_extent(),
         };
     };
-    let (first_x, first_y) = first.offset();
-    let (first_width, first_height) = first.size();
-    let mut left = first_x;
-    let mut top = first_y;
-    let mut right = first_x + first_width;
-    let mut bottom = first_y + first_height;
-    let mut rect_is_empty = first_width <= CssPixels::default() || first_height <= CssPixels::default();
-    for fragment in &line.fragments[1..] {
-        let (x, y) = fragment.offset();
-        let (width, height) = fragment.size();
-        if rect_is_empty {
-            left = x;
-            top = y;
-            right = x + width;
-            bottom = y + height;
-            rect_is_empty = width <= CssPixels::default() || height <= CssPixels::default();
-            continue;
-        }
-        if width <= CssPixels::default() || height <= CssPixels::default() {
-            continue;
-        }
-        left = left.min(x);
-        top = top.min(y);
-        right = right.max(x + width);
-        bottom = bottom.max(y + height);
+    if line.writing_mode == writing_mode::HORIZONTAL_TB {
+        rect.y = line.physical_vertical_end() - line.physical_vertical_extent();
+        rect.height = line.physical_vertical_extent();
     }
-    if first.writing_mode == writing_mode::HORIZONTAL_TB {
-        top = line.physical_vertical_end() - line.physical_vertical_extent();
-        bottom = top + line.physical_vertical_extent();
-    }
-    FfiCssPixelRect {
-        x: left,
-        y: top,
-        width: right - left,
-        height: bottom - top,
-    }
-}
-
-pub(crate) fn push_line_data(
-    data: &LineData,
-    content_inline_size: CssPixels,
-    callbacks: &FfiLayoutFcCallbacks,
-    sink: FfiLineSinkCallbacks,
-) {
-    for line in &data.line_boxes {
-        let committed_fragment_count = line
-            .fragments
-            .iter()
-            .filter(|fragment| !fragment.is_fully_truncated)
-            .count() as u32;
-        // SAFETY: Sink callbacks consume each POD record synchronously.
-        unsafe {
-            (sink.begin_line)(
-                sink.context,
-                FfiLineRecord {
-                    rect: line_rect(line, content_inline_size),
-                    committed_fragment_count,
-                },
-            );
-        }
-        for fragment in &line.fragments {
-            if fragment.is_fully_truncated {
-                continue;
-            }
-            let (x, y) = fragment.offset();
-            let (x, y) = (x + fragment.relpos_delta.x, y + fragment.relpos_delta.y);
-            let (width, height) = fragment.size();
-            let (glyph_pointer, glyph_count, glyph_font, glyph_text_type, glyph_run_width) =
-                if let Some(glyph_data) = fragment.glyphs.as_ref() {
-                    (
-                        glyph_data.glyphs.as_ptr(),
-                        glyph_data.glyphs.len(),
-                        glyph_data.font,
-                        glyph_data.text_type,
-                        glyph_data.width,
-                    )
-                } else {
-                    (std::ptr::null(), 0, std::ptr::null(), 0, 0.0)
-                };
-            // SAFETY: Glyph storage stays live through this callback.
-            unsafe {
-                (sink.emit_fragment)(
-                    sink.context,
-                    FfiCommittedFragment {
-                        layout_node: callbacks.shell(fragment.layout_node),
-                        offset: FfiCssPixelPoint { x, y },
-                        size: FfiCssPixelPoint { x: width, y: height },
-                        start: fragment.start,
-                        length_in_code_units: fragment.length_in_code_units,
-                        baseline: fragment.baseline,
-                        writing_mode: fragment.writing_mode,
-                        has_trailing_whitespace: fragment.has_trailing_whitespace,
-                        has_glyph_run: fragment.glyphs.is_some(),
-                        glyphs: glyph_pointer,
-                        glyph_count,
-                        glyph_font,
-                        glyph_text_type,
-                        glyph_run_width,
-                    },
-                );
-            }
-        }
-    }
-    for piece in &data.inline_box_pieces {
-        // SAFETY: The sink copies the POD piece synchronously.
-        unsafe {
-            (sink.emit_inline_box_piece)(
-                sink.context,
-                FfiInlineBoxPiece {
-                    node: callbacks.shell(piece.node),
-                    first_fragment_index: piece.first_fragment_index,
-                    fragment_count: piece.fragment_count,
-                    border_box_rect: FfiCssPixelRect {
-                        x: piece.border_box_rect.x + piece.relpos_delta.x,
-                        y: piece.border_box_rect.y + piece.relpos_delta.y,
-                        width: piece.border_box_rect.width,
-                        height: piece.border_box_rect.height,
-                    },
-                    present_edges: piece.present_edges,
-                    is_geometry_only_placeholder: piece.is_geometry_only_placeholder,
-                },
-            );
-        }
-    }
+    rect
 }

@@ -6,6 +6,7 @@
 
 #include <AK/AnyOf.h>
 #include <Compositor/BackingStoreManager.h>
+#include <LibGfx/Bitmap.h>
 #include <LibGfx/PaintingSurface.h>
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/SkiaBackendContext.h>
@@ -121,18 +122,32 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing
     m_rendering_store_index.clear();
     m_latest_rendered_store_index.clear();
 
-    auto buffer_count = should_publish ? allocation.bitmap_ids.size() : 2;
-    VERIFY(buffer_count <= allocation.bitmap_ids.size());
+    if (Gfx::Bitmap::size_would_overflow(Gfx::BitmapFormat::BGRA8888, allocation.size))
+        return {};
+
+    auto buffer_count = allocation.bitmap_ids.size();
     m_backing_stores.ensure_capacity(buffer_count);
+
+    if (!should_publish) {
+        for (size_t i = 0; i < buffer_count; ++i) {
+            m_backing_stores.append({
+                .surface = Gfx::PaintingSurface::create_with_size(allocation.size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, skia_backend_context),
+                .bitmap_id = allocation.bitmap_ids[i],
+                .state = BufferState::Available,
+                .accumulated_damage = { {}, allocation.size },
+            });
+        }
+        return {};
+    }
 
     // The UI installs the first published buffer as its initial front buffer.
     // Reserve it until the UI releases it after presenting another buffer.
-    auto initial_buffer_state = [should_publish](size_t index) {
-        return should_publish && index == 0 ? BufferState::Presented : BufferState::Available;
+    auto initial_buffer_state = [](size_t index) {
+        return index == 0 ? BufferState::Presented : BufferState::Available;
     };
 
 #if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_DIRECTX)
-    if (skia_backend_context && should_publish && gpu_sharing == GpuSharing::Allowed) {
+    if (skia_backend_context && gpu_sharing == GpuSharing::Allowed) {
         Vector<Gfx::SharedImage> shared_images;
         shared_images.ensure_capacity(buffer_count);
         bool allocation_succeeded = true;
@@ -166,12 +181,10 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing
 #endif
 
     Vector<Gfx::SharedImage> shared_images;
-    if (should_publish)
-        shared_images.ensure_capacity(buffer_count);
+    shared_images.ensure_capacity(buffer_count);
     for (size_t i = 0; i < buffer_count; ++i) {
         auto buffer = Gfx::SharedImageBuffer::create(allocation.size);
-        if (should_publish)
-            shared_images.append(buffer.export_shared_image());
+        shared_images.append(buffer.export_shared_image());
         m_backing_stores.append({
             .surface = create_shareable_bitmap_backing_store(allocation.size, buffer, skia_backend_context),
             .bitmap_id = allocation.bitmap_ids[i],
@@ -179,9 +192,6 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing
             .accumulated_damage = { {}, allocation.size },
         });
     }
-
-    if (!should_publish)
-        return {};
 
     return Publication {
         .bitmap_ids = allocation.bitmap_ids,

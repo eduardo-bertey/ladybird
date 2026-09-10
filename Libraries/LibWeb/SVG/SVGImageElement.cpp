@@ -7,7 +7,9 @@
 #include "SVGImageElement.h"
 #include <LibGC/Heap.h>
 #include <LibGfx/DecodedImageFrame.h>
+#include <LibWeb/Bindings/SVGImageElement.h>
 #include <LibWeb/CSS/Sizing.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentObserver.h>
 #include <LibWeb/DOM/Event.h>
@@ -15,14 +17,18 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Layout/SVGImageBox.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Namespace.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 
 namespace Web::SVG {
 
 GC_DEFINE_ALLOCATOR(SVGImageElement);
+
+Layout::Node const* SVGImageElement::image_provider_layout_node() const
+{
+    return unsafe_layout_node();
+}
 
 SVGImageElement::SVGImageElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGGraphicsElement(document, move(qualified_name))
@@ -75,7 +81,8 @@ void SVGImageElement::attribute_changed(Utf16FlyString const& name, Optional<Utf
 
 Gfx::FloatRect SVGImageElement::bounding_box(CSSPixelSize viewport_size) const
 {
-    auto computed_values = this->computed_values();
+    auto computed_values = this->computed_style();
+    VERIFY(computed_values);
 
     // https://w3c.github.io/svgwg/svg2-draft/embedded.html#Placement
     // Computation of automatically-sized values follows the Default Sizing Algorithm defined for replaced elements in
@@ -126,7 +133,8 @@ void SVGImageElement::fetch_the_document(URL::URL const& url)
         [this, resource_request = GC::Root { m_resource_request }] {
             m_load_event_delayer.clear();
             register_with_decoded_image_data_if_needed();
-            set_needs_style_update(true);
+            image_provider_contents_changed();
+            document().style_computer().style_engine().record_element_style_input_change(style_node_id());
             set_needs_layout_update(DOM::SetNeedsLayoutReason::SVGImageElementFetchTheDocument);
 
             dispatch_event(DOM::Event::create(HTML::EventNames::load,
@@ -146,9 +154,9 @@ void SVGImageElement::fetch_the_document(URL::URL const& url)
     }
 }
 
-RefPtr<Layout::Node> SVGImageElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+Layout::Node* SVGImageElement::create_layout_node(CSS::LayoutStyle style)
 {
-    return make_ref_counted<Layout::SVGImageBox>(document(), *this, style);
+    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGImageBox);
 }
 
 GC::Ptr<HTML::DecodedImageData> SVGImageElement::decoded_image_data() const

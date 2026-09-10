@@ -14,12 +14,13 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <AK/Variant.h>
+#include <LibCore/Forward.h>
 #include <LibJS/Runtime/Value.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/Fetch/FetchMethod.h>
-#include <LibWeb/Fetch/Request.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/ImageBitmap.h>
+#include <LibWeb/HTML/Scripting/ImportMap.h>
+#include <LibWeb/HTML/Timer.h>
 #include <LibWeb/PerformanceTimeline/PerformanceEntry.h>
 #include <LibWeb/PerformanceTimeline/PerformanceEntryTuple.h>
 #include <LibWeb/WebSockets/WebSocket.h>
@@ -41,14 +42,22 @@ public:
     Utf16String origin() const;
     bool is_secure_context() const;
     bool cross_origin_isolated() const;
-    void create_image_bitmap(JS::Realm&, ImageBitmapSource image, ImageBitmapOptions options, GC::Ref<WebIDL::Promise>) const;
-    void create_image_bitmap(JS::Realm&, ImageBitmapSource image, WebIDL::Long sx, WebIDL::Long sy, WebIDL::Long sw, WebIDL::Long sh, ImageBitmapOptions options, GC::Ref<WebIDL::Promise>) const;
+
+    WebIDL::ExceptionOr<Utf16String> btoa(Utf16View data) const;
+    WebIDL::ExceptionOr<Utf16String> atob(Utf16View data) const;
 
     i32 set_timeout(TimerHandler, i32 timeout, GC::RootVector<JS::Value> arguments);
     i32 set_interval(TimerHandler, i32 timeout, GC::RootVector<JS::Value> arguments);
     void clear_timeout(i32);
     void clear_interval(i32);
     void clear_map_of_active_timers();
+
+    void queue_microtask(WebIDL::CallbackType&);
+
+    void create_image_bitmap(JS::Realm&, ImageBitmapSource image, ImageBitmapOptions options, GC::Ref<WebIDL::Promise>) const;
+    void create_image_bitmap(JS::Realm&, ImageBitmapSource image, WebIDL::Long sx, WebIDL::Long sy, WebIDL::Long sw, WebIDL::Long sh, ImageBitmapOptions options, GC::Ref<WebIDL::Promise>) const;
+
+    WebIDL::ExceptionOr<JS::Value> structured_clone(JS::Realm&, JS::Value, Bindings::StructuredSerializeOptions const&);
 
     enum class CheckIfPerformanceBufferIsFull {
         No,
@@ -87,11 +96,22 @@ public:
     };
     AffectedAnyWebSockets make_disappear_all_web_sockets();
 
-    void run_steps_after_a_timeout(i32 timeout, Function<void()> completion_step);
+    i32 run_steps_after_a_timeout(i32 timeout, Function<void()> completion_step);
 
-    [[nodiscard]] GC::Ref<HighResolutionTime::Performance> performance();
-
-    GC::Ref<IndexedDB::IDBFactory> indexed_db();
+    void document_visibility_state_changed(Badge<DOM::Document>);
+    void document_audio_play_state_changed(Badge<DOM::Document>);
+    void set_hidden_document_timer_wake_up_interval(Badge<Internals::Internals>, double milliseconds)
+    {
+        VERIFY(milliseconds > 0);
+        m_hidden_document_timer_wake_up_interval = milliseconds;
+    }
+    void set_hidden_document_intensive_timer_throttling(Badge<Internals::Internals>, double wake_up_interval, double grace_period_once_loaded, double grace_period_while_loading)
+    {
+        VERIFY(wake_up_interval > 0 && grace_period_once_loaded >= 0 && grace_period_while_loading >= 0);
+        m_intensive_timer_wake_up_interval = wake_up_interval;
+        m_intensive_timer_throttling_grace_period_once_loaded = grace_period_once_loaded;
+        m_intensive_timer_throttling_grace_period_while_loading = grace_period_while_loading;
+    }
 
     void report_error(JS::Value e);
 
@@ -101,18 +121,37 @@ public:
     };
     void report_an_exception(JS::Value exception, OmitError = OmitError::No);
 
+    GC::Ref<WebIDL::CallbackType> count_queuing_strategy_size_function();
+    GC::Ref<WebIDL::CallbackType> byte_length_queuing_strategy_size_function();
+
+    void push_onto_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise>);
+    bool remove_from_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise>);
+
+    void push_onto_about_to_be_notified_rejected_promises_list(GC::Ref<JS::Promise>);
+    bool remove_from_about_to_be_notified_rejected_promises_list(GC::Ref<JS::Promise>);
+
+    void notify_about_rejected_promises(Badge<EventLoop>);
+
+    ImportMap& import_map() { return m_import_map; }
+    ImportMap const& import_map() const { return m_import_map; }
+    void set_import_map(ImportMap const& import_map) { m_import_map = import_map; }
+
+    static void set_experimental_interfaces_exposed(bool);
+    static bool expose_experimental_interfaces();
+    static bool expose_experimental_interface(EnvironmentSettingsObject&, StringView name);
+
     [[nodiscard]] GC::Ref<Crypto::Crypto> crypto();
-
     [[nodiscard]] GC::Ref<ServiceWorker::CacheStorage> caches();
-
+    GC::Ref<IndexedDB::IDBFactory> indexed_db();
+    [[nodiscard]] GC::Ref<HighResolutionTime::Performance> performance();
     [[nodiscard]] GC::Ref<TrustedTypes::TrustedTypePolicyFactory> trusted_types();
-
-    Optional<URL::Origin> window_or_worker_global_scope_extract_an_origin() const;
 
 protected:
     void initialize();
     void visit_edges(JS::Cell::Visitor&);
     void finalize();
+
+    Optional<URL::Origin> window_or_worker_global_scope_extract_an_origin() const;
 
 private:
     enum class Repeat {
@@ -120,7 +159,11 @@ private:
         No,
     };
     i32 run_timer_initialization_steps(TimerHandler handler, i32 timeout, GC::RootVector<JS::Value> arguments, Repeat repeat, Optional<i32> previous_id = {});
-    void run_steps_after_a_timeout_impl(i32 timeout, Function<void()> completion_step, Optional<i32> timer_key, Repeat repeat = Repeat::No);
+    void run_steps_after_a_timeout_impl(i32 timeout, TimerThrottlingClass, Function<void()> completion_step, Optional<i32> timer_key, Repeat repeat = Repeat::No);
+    bool document_is_hidden() const;
+    bool timers_are_throttled() const;
+    Optional<i32> throttled_timer_delay(TimerThrottlingClass, double deadline) const;
+    void realign_timers();
 
     void create_image_bitmap_impl(JS::Realm&, GC::Ref<WebIDL::Promise>, ImageBitmapSource& image, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, ImageBitmapOptions options) const;
 
@@ -132,8 +175,18 @@ private:
     IDAllocator m_timer_id_allocator;
     HashMap<int, GC::Ref<Timer>> m_timers;
 
-    // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timer-nesting-level
-    HashMap<i32, u32> m_timer_nesting_levels;
+    // The interval between the wake-ups a hidden document holds its delayed timers back to; a test can shorten it.
+    double m_hidden_document_timer_wake_up_interval { 1000 };
+    // The rarer wake-ups a hidden document holds its chained timers back to once it has been hidden for the grace
+    // period — a minute for a document that had finished loading when it hid, five for one that was still loading,
+    // which are Chrome's values; a test can shorten all three.
+    double m_intensive_timer_wake_up_interval { 60'000 };
+    double m_intensive_timer_throttling_grace_period_once_loaded { 60'000 };
+    double m_intensive_timer_throttling_grace_period_while_loading { 300'000 };
+    RefPtr<Core::Timer> m_intensive_timer_throttling_grace_timer;
+    bool m_chained_timers_intensively_throttled { false };
+    // When a chained timer last ran while the document was hidden (see throttled_timer_delay()).
+    Optional<double> m_last_chained_timer_wake_up;
 
     // https://www.w3.org/TR/performance-timeline/#performance-timeline
     // Each global object has:
@@ -181,6 +234,23 @@ private:
     // https://w3c.github.io/resource-timing/#dfn-resource-timing-secondary-buffer
     // A resource timing secondary buffer to store PerformanceResourceTiming objects that is initially empty.
     Vector<GC::Ref<ResourceTiming::PerformanceResourceTiming>> m_resource_timing_secondary_buffer;
+
+    // https://streams.spec.whatwg.org/#count-queuing-strategy-size-function
+    GC::Ptr<WebIDL::CallbackType> m_count_queuing_strategy_size_function;
+
+    // https://streams.spec.whatwg.org/#byte-length-queuing-strategy-size-function
+    GC::Ptr<WebIDL::CallbackType> m_byte_length_queuing_strategy_size_function;
+
+    // https://html.spec.whatwg.org/multipage/webappapis.html#about-to-be-notified-rejected-promises-list
+    GC::Ptr<GC::HeapVector<GC::Ref<JS::Promise>>> m_about_to_be_notified_rejected_promises_list;
+
+    // https://html.spec.whatwg.org/multipage/webappapis.html#outstanding-rejected-promises-weak-set
+    // The outstanding rejected promises weak set must not create strong references to any of its members, and implementations are free to limit its size, e.g. by removing old entries from it when new ones are added.
+    Vector<GC::Ptr<JS::Promise>> m_outstanding_rejected_promises_weak_set;
+
+    // https://html.spec.whatwg.org/multipage/webappapis.html#concept-global-import-map
+    // A global object has an import map, initially an empty import map.
+    ImportMap m_import_map;
 };
 
 }

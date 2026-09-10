@@ -7,10 +7,11 @@
 
 #pragma once
 
+#include <LibGfx/Matrix4x4.h>
 #include <LibGfx/PaintStyle.h>
 #include <LibWeb/CSS/URL.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGAnimatedTransformList.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGFitToViewBox.h>
@@ -31,9 +32,6 @@ class WEB_API SVGGraphicsElement : public SVGElement {
     WEB_WRAPPABLE(SVGGraphicsElement, SVGElement);
 
 public:
-    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
-
-    Optional<Gfx::Color> fill_color() const;
     Optional<Gfx::Color> stroke_color() const;
     Vector<float> stroke_dasharray() const;
     Optional<float> stroke_dashoffset() const;
@@ -44,8 +42,6 @@ public:
     Optional<CSS::StrokeLinejoin> stroke_linejoin() const;
     Optional<double> stroke_miterlimit() const;
     Optional<float> stroke_opacity() const;
-    Optional<FillRule> fill_rule() const;
-    Optional<ClipRule> clip_rule() const;
 
     virtual Optional<ViewBox> active_view_box() const
     {
@@ -56,13 +52,13 @@ public:
 
     float visible_stroke_width() const
     {
+        // NB: CSS geometry-effect metadata relies on this reading only stroke color and width.
+        //     If SVG bounds begin accounting for caps, joins, miter limits, or stroke opacity,
+        //     mark those properties as affecting layout geometry as well.
         if (auto color = stroke_color(); color.has_value() && color->alpha() > 0)
             return stroke_width().value_or(0);
         return 0;
     }
-
-    Optional<Painting::PaintStyle> fill_paint_style(SVGPaintContext const&, DisplayListRecordingContext* = nullptr) const;
-    Optional<Painting::PaintStyle> stroke_paint_style(SVGPaintContext const&, DisplayListRecordingContext* = nullptr) const;
 
     GC::Ptr<SVG::SVGMaskElement const> mask() const;
     GC::Ptr<SVG::SVGClipPathElement const> clip_path() const;
@@ -76,17 +72,17 @@ public:
     GC::Ptr<Geometry::DOMMatrix> get_ctm();
     GC::Ptr<Geometry::DOMMatrix> get_screen_ctm();
 
-    virtual Gfx::AffineTransform element_transform() const
+    // The transform property carries the transform attribute through the cascade; this is the
+    // extra transformation some elements apply beyond it, such as the x/y translation of <use>.
+    virtual Gfx::AffineTransform additional_element_transform() const
     {
-        return m_transform;
+        return {};
     }
+
+    GC::Ptr<DOM::Element> paint_server_element(Optional<CSS::SVGPaint> const&) const;
 
 protected:
     SVGGraphicsElement(DOM::Document&, DOM::QualifiedName);
-
-    Optional<Painting::PaintStyle> svg_paint_computed_value_to_gfx_paint_style(SVGPaintContext const& paint_context, Optional<CSS::SVGPaint> const& paint_value, DisplayListRecordingContext* = nullptr) const;
-
-    Gfx::AffineTransform m_transform = {};
 
     GC::Ptr<DOM::Element> resolve_url_to_element(CSS::URL const& url) const;
     GC::Ptr<DOM::Element> resolve_url_to_element(Utf16String const& url) const;
@@ -107,6 +103,9 @@ private:
     virtual bool is_svg_graphics_element() const final { return true; }
     GC::Ptr<DOM::Element> resolve_fragment_identifier_to_element(Utf16String const& fragment) const;
     float resolve_relative_to_viewport_size(CSS::LengthPercentage const& length_percentage) const;
+
+public:
+    CSSPixels viewport_percentage_basis() const;
 };
 
 Gfx::AffineTransform transform_from_transform_list(ReadonlySpan<Transform> transform_list);

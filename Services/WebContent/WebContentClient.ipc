@@ -1,6 +1,7 @@
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/Color.h>
 #include <LibIPC/TransportHandle.h>
+#include <LibIPC/File.h>
 #include <LibGfx/Cursor.h>
 #include <LibGfx/ShareableBitmap.h>
 #include <LibHTTP/Cookie/Cookie.h>
@@ -10,6 +11,7 @@
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/CameFromCache.h>
 #include <LibRequests/RequestTimingInfo.h>
+#include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
@@ -23,14 +25,20 @@
 #include <LibWeb/HTML/BroadcastChannelMessage.h>
 #include <LibWeb/HTML/FileFilter.h>
 #include <LibWeb/HTML/ApplyHistoryStep.h>
+#include <LibWeb/HTML/HistoryOperation.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigationSourceSnapshot.h>
+#include <LibWeb/HTML/NavigationPopulationRequest.h>
 #include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/ReplicatedNavigableState.h>
 #include <LibWeb/HTML/SameDocumentNavigationEntry.h>
 #include <LibWeb/HTML/SelectedFile.h>
 #include <LibWeb/HTML/SelectItem.h>
+#include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
+#include <LibWeb/HTML/SandboxingFlagSet.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
+#include <LibWeb/HTML/VisibilityState.h>
+#include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
 #include <LibWeb/HTML/WebViewHints.h>
 #include <LibWeb/HTML/WorkerAgentTypes.h>
 #include <LibWeb/Page/EventResult.h>
@@ -40,7 +48,9 @@
 #include <LibWeb/WebDriver/Response.h>
 #include <LibWebView/Attribute.h>
 #include <LibWebView/ConsoleOutput.h>
+#include <LibWebView/DictionaryLookup.h>
 #include <LibWebView/DOMNodeProperties.h>
+#include <LibWebView/Debugger.h>
 #include <LibWeb/StorageAPI/StorageEndpoint.h>
 #include <LibWebView/StorageSetResult.h>
 #include <LibWebView/Mutation.h>
@@ -49,23 +59,26 @@
 
 endpoint WebContentClient
 {
+    open_system_font(u64 generation, u64 face_id) => (u64 matched_face_id, u32 ttc_index, u8 format, Optional<IPC::File> file)
+    match_system_font(String family, u16 weight, u16 width, u8 slope) => (u64 face_id, u32 ttc_index, u8 format, Optional<IPC::File> file)
+    match_system_font_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) => (u64 face_id, u32 ttc_index, u8 format, Optional<IPC::File> file)
+    resolve_generic_font(String family, u16 weight, u8 slope) => (Optional<String> resolved_family)
+
     allocate_compositor_context_id(u64 page_id, Web::Compositor::PagePresentationRegistration page_presentation_registration) => (Web::Compositor::CompositorContextId context_id)
     did_destroy_compositor_context(Web::Compositor::CompositorContextId context_id) =|
 
-    decide_navigation_process(u64 page_id, Optional<Web::HTML::CrossProcessId> frame_id, URL::URL current_url, URL::URL target_url, Web::NavigationTarget target) => (Web::NavigationProcessDecision decision)
-    did_request_new_process_for_navigation(u64 page_id, URL::URL url, Variant<Empty, Utf16String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot) =|
-    did_request_new_process_for_child_frame_navigation(u64 page_id, Web::HTML::CrossProcessId frame_id, URL::URL url, Variant<Empty, Utf16String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot) =|
+    did_request_navigation_start(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::NavigationTarget target, URL::URL url, Utf16String navigation_id, Optional<Web::HTML::NavigationStartRequest> start_request) =|
+    did_complete_navigation_unload_check(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) =|
+    did_request_navigation_population(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::NavigationTarget target, Web::HTML::NavigationPopulationRequest request) =|
+    did_finish_history_navigation_params_creation(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation population) =|
+    did_finish_navigation_params_creation(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, Optional<Web::HTML::NavigationPopulationResult> result) =|
+    did_fail_navigation_population(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) =|
     did_create_child_frame(u64 page_id, Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState replicated_state) =|
     did_update_child_frame_viewport(u64 page_id, Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, double device_pixel_ratio) =|
-    did_commit_child_frame_navigation(u64 page_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState replicated_state) =|
-    did_change_top_level_active_document(u64 page_id, Web::HTML::ReplicatedNavigableState replicated_state) =|
     did_destroy_child_frame(u64 page_id, Web::HTML::CrossProcessId frame_id) =|
-    did_start_webdriver_navigation(u64 page_id, URL::URL url) =|
-    did_start_loading(u64 page_id, Optional<Utf16String> navigation_id, URL::URL url, Variant<Empty, Utf16String, Web::HTML::POSTResource> document_resource, bool is_redirect, Web::Bindings::NavigationHistoryBehavior history_handling) =|
-    did_cancel_loading(u64 page_id, Optional<Utf16String> navigation_id, URL::URL url) =|
     did_finish_loading(u64 page_id, Optional<Utf16String> navigation_id, URL::URL url) =|
     did_start_download_without_request(u64 page_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size) => (Optional<u64> download_id)
-    did_start_download(u64 page_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data) => (Optional<u64> download_id)
+    did_start_download(u64 page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data) => (Optional<u64> download_id)
     did_receive_download_data(u64 page_id, u64 download_id, ByteBuffer data) =|
     did_finish_download(u64 page_id, u64 download_id) =|
     did_fail_download(u64 page_id, u64 download_id, String error) =|
@@ -73,7 +86,6 @@ endpoint WebContentClient
     did_request_cursor_change(u64 page_id, Gfx::Cursor cursor) =|
     did_change_title(u64 page_id, Utf16String title) =|
     did_update_editing_history_state(u64 page_id, bool can_undo, bool can_redo) =|
-    did_change_url(u64 page_id, URL::URL url) =|
     did_request_tooltip_override(u64 page_id, Gfx::IntPoint position, ByteString title) =|
     did_stop_tooltip_override(u64 page_id) =|
     did_enter_tooltip_area(u64 page_id, ByteString title) =|
@@ -82,6 +94,7 @@ endpoint WebContentClient
     did_unhover_link(u64 page_id) =|
     did_click_link(u64 page_id, URL::URL url, ByteString target, unsigned modifiers) =|
     did_middle_click_link(u64 page_id, URL::URL url, ByteString target, unsigned modifiers) =|
+    did_request_external_url(u64 page_id, URL::URL url, URL::Origin initiator_origin, bool has_transient_activation) =|
     did_request_context_menu(u64 page_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target) =|
     did_request_link_context_menu(u64 page_id, Gfx::IntPoint content_position, URL::URL url, ByteString target, unsigned modifiers) =|
     did_request_image_context_menu(u64 page_id, Gfx::IntPoint content_position, URL::URL url, ByteString target, unsigned modifiers, Optional<Gfx::ShareableBitmap> bitmap) =|
@@ -113,11 +126,23 @@ endpoint WebContentClient
     did_list_devtools_sources(u64 page_id, u64 request_id, Vector<Web::HTML::ScriptRegistry::Description> sources) =|
     did_get_devtools_source(u64 page_id, Web::HTML::ScriptRegistry::Identifier source_id, Optional<Web::HTML::ScriptRegistry::Content> source) =|
     did_add_devtools_source(u64 page_id, Web::HTML::ScriptRegistry::Description source) =|
+    did_pause_debugger(u64 page_id, WebView::DebuggerPause pause) =|
+    did_resume_debugger(u64 page_id) =|
+    did_complete_debugger_breakpoint_operation(u64 page_id, u64 request_id, Optional<String> error) =|
+    did_get_debugger_environments(u64 page_id, u64 request_id, Optional<String> error, Vector<WebView::DebuggerEnvironment> environments) =|
+    did_evaluate_javascript_in_debugger_frame(u64 page_id, u64 request_id, Optional<String> error, WebView::DebuggerEvaluationResult result) =|
+    did_get_debugger_object_properties(u64 page_id, u64 request_id, Optional<String> error, WebView::DebuggerObjectProperties properties) =|
+    did_get_debugger_source_positions(u64 page_id, u64 request_id, Vector<WebView::DebuggerSourcePosition> positions) =|
     did_resolve_dom_node_url(u64 page_id, u64 request_id, String resolved_url) =|
 
     did_take_screenshot(u64 page_id, Gfx::ShareableBitmap screenshot) =|
 
     did_get_internal_page_info(u64 page_id, WebView::PageInfoType type, Optional<Core::AnonymousBuffer> info) =|
+
+    did_get_selected_text(u64 page_id, u64 request_id, ByteString selection) =|
+    did_get_selected_text_for_lookup(u64 page_id, u64 request_id, Optional<WebView::DictionaryLookup> lookup) =|
+    did_select_word_for_dictionary_lookup(u64 page_id, u64 request_id, bool selected) =|
+    did_cut_selected_text(u64 page_id, u64 request_id, ByteString selection) =|
 
     did_change_favicon(u64 page_id, Gfx::ShareableBitmap favicon) =|
 
@@ -135,33 +160,29 @@ endpoint WebContentClient
     did_is_known_hsts_host(String domain) => (bool result)
 
     did_lose_request_server_connection() => (Optional<IPC::TransportHandle> handle)
+    did_simulate_worker_request_server_connection_loss(u64 page_id) => ()
 
-    did_request_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key) => (Optional<Utf16String> value)
-    did_set_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key, Utf16String value) => (WebView::StorageSetResult result)
-    did_remove_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key) => ()
-    did_request_storage_keys(Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key) => (Vector<Utf16String> keys)
-    did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key) => ()
-    did_request_storage_usage(String storage_key) => (u64 usage)
+    did_request_storage_item(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key) => (Optional<Utf16String> value)
+    did_set_storage_item(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key, Utf16String value) => (WebView::StorageSetResult result)
+    did_remove_storage_item(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key, Utf16String bottle_key) => ()
+    did_request_storage_keys(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key) => (Vector<Utf16String> keys)
+    did_clear_storage(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key) => ()
+    did_request_storage_usage(u64 page_id, String storage_key) => (u64 usage)
     did_change_storage_item(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String url, Optional<Utf16String> key, Optional<Utf16String> old_value, Optional<Utf16String> new_value) =|
     did_update_indexed_database(u64 page_id, String update) =|
     did_post_broadcast_channel_message(u64 page_id, Web::HTML::BroadcastChannelMessage message) =|
 
     did_update_resource_count(u64 page_id, i32 count_waiting) =|
-    did_request_new_web_view(u64 page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints) => (Optional<u64> new_page_id, Optional<Web::HTML::CrossProcessId> root_navigable_id, String handle)
+    did_request_new_web_view(u64 page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Optional<Web::HTML::CrossProcessId> opener_navigable_id, Optional<URL::URL> opener_base_url, Utf16String target_name) => (Optional<u64> new_page_id, Optional<Web::HTML::CrossProcessId> root_navigable_id, Optional<Web::HTML::SessionHistoryEntryDescriptor> initial_history_entry, Web::HTML::VisibilityState system_visibility_state, String handle)
     did_request_activate_tab(u64 page_id) =|
     did_close_browsing_context(u64 page_id) =|
     did_change_needs_beforeunload_check(u64 page_id, bool needs_beforeunload_check) =|
-    did_request_traverse_the_history_by_delta(u64 page_id, i32 delta, Web::HistoryTraversalPrecheck history_traversal_precheck) =|
-    did_request_webdriver_history_traversal(u64 page_id, u64 request_id, i32 delta) =|
-    did_request_webdriver_load_url_from_ui(u64 page_id, URL::URL url) => (Web::WebDriver::Response response)
-    did_request_webdriver_traverse_history_from_ui(u64 page_id, i32 delta) => (Web::WebDriver::Response response)
-    did_request_webdriver_mark_web_content_session_history_stale(u64 page_id) => (Web::WebDriver::Response response)
-    did_request_webdriver_session_history(u64 page_id) => (Web::WebDriver::Response response)
-    did_request_webdriver_navigation_completion(u64 page_id, u64 request_id, Optional<u64> page_load_timeout) =|
+    webdriver_user_prompt_handling_complete(u64 page_id, u64 request_id, Web::WebDriver::Response response) =|
+    webdriver_command_complete(u64 page_id, u64 command_id, Web::WebDriver::Response response) =|
     did_request_restore_window(u64 page_id) =|
-    did_request_reposition_window(u64 page_id, Gfx::IntPoint position) =|
-    did_request_resize_window(u64 page_id, Gfx::IntSize size) =|
-    did_request_maximize_window(u64 page_id) =|
+    did_request_reposition_window(u64 page_id, Gfx::IntPoint position, u64 completion_id) =|
+    did_request_resize_window(u64 page_id, Gfx::IntSize size, u64 completion_id) =|
+    did_request_maximize_window(u64 page_id, u64 completion_id) =|
     did_request_minimize_window(u64 page_id) =|
     did_request_fullscreen_window(u64 page_id) =|
     did_request_exit_fullscreen(u64 page_id) =|
@@ -183,28 +204,29 @@ endpoint WebContentClient
     did_request_primary_paste(u64 page_id) =|
     did_update_primary_selection(u64 page_id, String text) =|
 
-    did_create_top_level_traversable(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry) =|
-    did_update_session_history_entry_navigation_api_state(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, Web::HTML::StorageSerializationRecord navigation_api_state) =|
-    did_update_session_history_entry_scroll_restoration_mode(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, Web::HTML::ScrollRestorationMode scroll_restoration_mode) =|
-    did_update_session_history_entry_scroll_position_data(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, Web::HTML::SessionHistoryEntryScrollPositionData scroll_position_data) =|
-    did_update_session_history_entry_document_state_navigable_target_name(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, Utf16String navigable_target_name) =|
+    did_update_session_history_entry_navigation_api_state(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Web::HTML::StorageSerializationRecord navigation_api_state) =|
+    did_update_session_history_entry_scroll_restoration_mode(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Web::HTML::ScrollRestorationMode scroll_restoration_mode) =|
+    did_update_session_history_entry_document_state_navigable_target_name(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Utf16String navigable_target_name) =|
     did_set_session_history_entry_document_state_reload_pending(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, bool reload_pending) =|
-    did_append_nested_history(u64 page_id, Web::HTML::CrossProcessId parent_navigable_id, Web::HTML::SessionHistoryNestedHistoryDescriptor nested_history) =|
-    did_remove_nested_history(u64 page_id, Web::HTML::CrossProcessId parent_navigable_id, Web::HTML::CrossProcessId child_navigable_id) =|
-    did_request_finalize_same_document_navigation(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SameDocumentNavigationEntry target_entry, bool replaces_current_entry, Web::HTML::HistoryHandlingBehavior history_handling, Web::HTML::UserNavigationInvolvement user_involvement, bool applies_history_step_in_coordinator) =|
-    did_finalize_cross_document_navigation(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor history_entry, Optional<Utf16String> entry_to_replace_navigation_api_key) =|
+    did_request_set_system_visibility_state(u64 page_id, Web::HTML::VisibilityState visibility_state) =|
     did_request_ui_process_session_history_for_testing(u64 page_id) => (String session_history)
     did_request_site_isolation_process_tree_for_testing(u64 page_id) => (String process_tree)
-    did_update_session_history_and_request_ui_process_session_history_for_testing(u64 page_id, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries, Vector<i32> used_steps, size_t current_used_step_index) => (String session_history)
-    did_set_top_level_session_history(u64 page_id, bool accepted, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries, Vector<i32> used_steps, size_t current_used_step_index) =|
-    request_history_operation(u64 page_id, u64 initiation_id, Web::HistoryOperationParameters parameters) =|
-    history_operation_ready(u64 page_id, u64 operation_id, bool proceed, Optional<i32> step_override, Web::HTML::HistoryStepResult abandon_result) =|
-    initiator_sandboxing_check_result(u64 page_id, u64 operation_id, bool allowed) =|
-    history_step_unload_cancelation_result(u64 page_id, u64 operation_id, Web::HTML::HistoryStepResult result) =|
-    changing_navigable_history_job_ready(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition) =|
-    changing_navigable_continuation_applied(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id) =|
-    nonchanging_navigable_history_state_updated(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id) =|
-    did_reset_session_history_for_testing(u64 page_id) =|
+    did_request_crash_of_remote_frame_processes_for_testing(u64 page_id) =|
+    request_history_operation(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters parameters) =|
+    history_operation_ready(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationReadyResult result) =|
+    history_step_unload_cancelation_result(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) =|
+    history_step_beforeunload_check_result(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) =|
+    changing_navigable_history_job_ready(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, Web::HTML::UnloadDisplayedDocument unload_displayed_document) =|
+    changing_navigable_unload_preparation_complete(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) =|
+    descendant_unload_task_complete(u64 page_id, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id) =|
+    request_child_navigable_unload(u64 page_id, Web::HTML::CrossProcessId navigable_id) =|
+    changing_navigable_continuation_applied(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::ReplicatedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) =|
+    nonchanging_navigable_history_state_updated(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) =|
+    did_reset_session_history_for_testing(u64 page_id, Web::HTML::SessionHistoryEntryDescriptor active_entry) =|
+    did_request_capture_session_history_snapshot_for_testing(u64 page_id) => (bool captured)
+    did_request_restore_session_history_snapshot_for_testing(u64 page_id) => (bool restored)
+    did_request_register_session_store_tab_for_testing(u64 page_id) => (bool registered)
+    did_request_session_store_tab_state_for_testing(u64 page_id) => (String state)
 
     did_change_audio_play_state(u64 page_id, Web::HTML::AudioPlayState play_state) =|
     did_change_screen_wake_lock_state(u64 page_id, Web::ScreenWakeLockState wake_lock_state) =|

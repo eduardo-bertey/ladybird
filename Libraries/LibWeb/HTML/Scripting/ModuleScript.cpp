@@ -6,7 +6,7 @@
 
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/ModuleRequest.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/Fetching.h>
 #include <LibWeb/HTML/Scripting/ModuleScript.h>
@@ -30,7 +30,7 @@ static void register_source(ModuleScript& script, ScriptRegistry::IsInlineSource
         return;
 
     auto const& source_code = (*module_record)->cached_executable()->source_code;
-    register_javascript_source(script, source_code, is_inline_source, source_line_number);
+    register_javascript_source(script, source_code, ScriptRegistry::JavaScriptSource::Type::Module, is_inline_source, source_line_number);
 }
 
 ModuleScript::~ModuleScript() = default;
@@ -42,9 +42,7 @@ ModuleScript::ModuleScript(Optional<URL::URL> base_url, ByteString filename, Env
 
 GC::Ref<ModuleScript> ModuleScript::create_internal(Optional<URL::URL> base_url, ByteString const& filename, EnvironmentSettingsObject& settings)
 {
-    auto script = GC::Heap::the().allocate<ModuleScript>(move(base_url), filename, settings);
-    script->initialize(settings.realm());
-    return script;
+    return settings.realm().create<ModuleScript>(move(base_url), filename, settings);
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#creating-a-javascript-module-script
@@ -68,7 +66,7 @@ WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> ModuleScript::create_a_javascript_mod
     script->set_error_to_rethrow(JS::js_null());
 
     // 7. Let result be ParseModule(source, realm, script).
-    auto result = JS::SourceTextModule::parse(source, realm, script->filename(), script->display_filename(), script.ptr());
+    auto result = JS::SourceTextModule::parse(source, realm, script->filename(), script->display_filename(), script.ptr(), source_line_number);
 
     // 8. If result is a list of errors, then:
     if (result.is_error()) {
@@ -172,7 +170,7 @@ WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> ModuleScript::create_a_css_module_scr
 
     // 5. Let sheet be the result of running the steps to create a constructed CSSStyleSheet with an empty dictionary as
     //    the argument.
-    auto sheet = TRY(CSS::CSSStyleSheet::create_constructed(*settings.responsible_document()));
+    auto sheet = TRY(CSS::StyleSheetState::create_constructed(*settings.responsible_document()));
 
     // 6. Run the steps to synchronously replace the rules of a CSSStyleSheet on sheet given source.
     //    If this throws an exception, catch it, and set script's parse error to that exception, and return script.
@@ -215,6 +213,30 @@ WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> ModuleScript::create_a_json_module_sc
 
     // 6. Set script's record to result.
     script->m_record = result.value();
+
+    // 7. Return script.
+    return script;
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#creating-a-text-module-script
+WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> ModuleScript::create_a_text_module_script(ByteString const& filename, Utf16View text, EnvironmentSettingsObject& settings)
+{
+    auto& realm = settings.realm();
+
+    // 1. Let script be a new module script that this algorithm will subsequently initialize.
+    // 2. Set script's settings object to settings.
+    // 3. Set script's base URL and fetch options to null.
+    auto script = create_internal(Optional<URL::URL> {}, filename, settings);
+
+    // 4. Set script's parse error and error to rethrow to null.
+    script->set_parse_error(JS::js_null());
+    script->set_error_to_rethrow(JS::js_null());
+
+    // 5. Let result be CreateTextModule(text).
+    auto result = JS::create_text_module(realm, text, filename);
+
+    // 6. Set script's record to result.
+    script->m_record = result;
 
     // 7. Return script.
     return script;

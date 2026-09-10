@@ -1,12 +1,12 @@
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 67 0+0+0] [BFC] children: not-inline
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 67.203125 0+0+0] [BFC] children: not-inline
     BlockContainer <(anonymous)> at [0,0] [0+0+0 800 0+0+0] [0+0+0 0 0+0+0] children: inline
       TextNode <#text> (not painted)
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 51 0+0+8] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 51.203125 0+0+8] children: not-inline
       BlockContainer <(anonymous)> at [8,8] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
         TextNode <#text> (not painted)
       BlockContainer <div> at [8,8] [0+0+0 784 0+0+0] [0+0+0 16 0+0+0] children: not-inline
-      BlockContainer <(anonymous)> at [8,24] [0+0+0 784 0+0+0] [0+0+0 35 0+0+0] children: inline
+      BlockContainer <(anonymous)> at [8,24] [0+0+0 784 0+0+0] [0+0+0 35.203125 0+0+0] children: inline
         frag 0 from TextInputBox start: 0, length: 0, rect: [11,40 200x16] baseline: 18
         frag 1 from TextNode start: 0, length: 1, rect: [214,43 8x16] baseline: 12.796875
             " "
@@ -51,27 +51,5 @@ Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children
               TextNode <#text> (not painted)
         TextNode <#text> (not painted)
 
-ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x67]
-    PaintableWithLines (BlockContainer(anonymous)) [0,0 800x0]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x51]
-      PaintableWithLines (BlockContainer(anonymous)) [8,8 784x0]
-      PaintableWithLines (BlockContainer<DIV>) [8,8 784x16]
-      PaintableWithLines (BlockContainer(anonymous)) [8,24 784x35]
-        PaintableWithLines (TextInputBox<INPUT>) [8,38 206x20]
-          Paintable (Box<DIV>) [11,40 200x16]
-            PaintableWithLines (BlockContainer<DIV>) [11,40 200x16]
-            PaintableWithLines (BlockContainer<DIV>) [11,40 200x16]
-        PaintableWithLines (TextAreaBox<TEXTAREA>) [222,24 166x32]
-          Paintable (Box<DIV>) [225,27 160x13]
-            PaintableWithLines (BlockContainer<DIV>) [225,27 160x13]
-            PaintableWithLines (BlockContainer<DIV>) [225,27 160x13]
-        PaintableWithLines (TextInputBox<INPUT>) [396,38 206x20]
-          Paintable (Box<DIV>) [399,40 200x16]
-            PaintableWithLines (BlockContainer<DIV>) [399,40 200x16]
-        PaintableWithLines (TextAreaBox<TEXTAREA>) [610,24 166x32]
-          Paintable (Box<DIV>) [613,27 160x13]
-            PaintableWithLines (BlockContainer<DIV>) [613,27 160x13]
-
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x67] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x67.203125] (z-index: auto)

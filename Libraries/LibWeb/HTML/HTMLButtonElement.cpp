@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
@@ -27,10 +26,8 @@ HTMLButtonElement::HTMLButtonElement(DOM::Document& document, DOM::QualifiedName
 
 HTMLButtonElement::~HTMLButtonElement() = default;
 
-HTMLButtonElement::TypeAttributeState HTMLButtonElement::type_state() const
+HTMLButtonElement::TypeAttributeState HTMLButtonElement::parse_type_attribute(Optional<Utf16String> const& value)
 {
-    auto value = get_attribute_value_view(HTML::AttributeNames::type);
-
     if (value.has_value() && value->equals_ignoring_ascii_case(u"submit"sv))
         return HTMLButtonElement::TypeAttributeState::Submit;
     if (value.has_value() && value->equals_ignoring_ascii_case(u"reset"sv))
@@ -84,6 +81,15 @@ void HTMLButtonElement::set_type_for_bindings(Utf16View type)
 void HTMLButtonElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const&, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     PopoverTargetAttributes::associated_attribute_changed(name, value, namespace_);
+
+    if (name == AttributeNames::type && !namespace_.has_value())
+        m_type_state = parse_type_attribute(value);
+
+    if (name.is_one_of(AttributeNames::type, AttributeNames::command, AttributeNames::commandfor)) {
+        submit_button_state_changed();
+        if (auto* form = this->form())
+            form->default_button_state_maybe_changed();
+    }
 }
 
 void HTMLButtonElement::visit_edges(Visitor& visitor)

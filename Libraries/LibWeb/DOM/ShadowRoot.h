@@ -65,7 +65,7 @@ public:
     virtual EventTarget* get_parent(Event const&) override;
 
     WebIDL::ExceptionOr<Utf16String> inner_html() const;
-    WebIDL::ExceptionOr<void> set_inner_html(StringView);
+    WebIDL::ExceptionOr<void> set_inner_html(Utf16View);
 
     WebIDL::ExceptionOr<void> set_html_unsafe(StringView);
 
@@ -76,8 +76,8 @@ public:
     CSS::StyleSheetList& style_sheets();
     CSS::StyleSheetList const& style_sheets() const;
 
-    void for_each_css_style_sheet(Function<void(CSS::CSSStyleSheet&)>&& callback) const;
-    void for_each_active_css_style_sheet(Function<void(CSS::CSSStyleSheet&)> const& callback) const;
+    void for_each_css_style_sheet(Function<void(CSS::StyleSheetState&)>&& callback) const;
+    void for_each_active_css_style_sheet(Function<void(CSS::StyleSheetState&)> const& callback) const;
 
     WebIDL::ExceptionOr<Vector<GC::Ref<Animations::Animation>>> get_animations();
 
@@ -110,9 +110,26 @@ public:
     bool keep_custom_element_registry_null() const { return m_keep_custom_element_registry_null; }
     void set_keep_custom_element_registry_null(bool value) { m_keep_custom_element_registry_null = value; }
 
+    HTML::RadioButtonGroupRegistry& ensure_radio_button_group_registry();
+
     virtual void finalize() override;
 
     GC::Ptr<Element> retargeted_fullscreen_element() const;
+
+    // A shadow root is not an element and has no style of its own, but it is a parent in the style
+    // tree: it is what a shadow-tree element's relations name, and it is what bounds the region a
+    // `:host()` rule reaches. Without an identity of its own, that region has no name and every
+    // route across the boundary widens to the document.
+    [[nodiscard]] CSS::StyleNodeID style_node_id() const { return m_style_node_id; }
+    void set_style_node_id(CSS::StyleNodeID style_node_id) { m_style_node_id = style_node_id; }
+
+    // A shadow root is also a style scope, and that is a longer-lived thing than its place in the
+    // style tree. The style node identity is minted when the root joins the tree and given up when
+    // it leaves; the scope identity has to survive that, because a sheet adopted into the scope is
+    // detached with the identity it was attached with. Only moving to another document retires it,
+    // since identities belong to one document's engine.
+    [[nodiscard]] CSS::TreeScopeID style_engine_tree_scope() const { return m_style_engine_tree_scope; }
+    void set_style_engine_tree_scope(CSS::TreeScopeID tree_scope) { m_style_engine_tree_scope = tree_scope; }
 
 protected:
     virtual void visit_edges(Cell::Visitor&) override;
@@ -130,6 +147,9 @@ private:
     virtual void adopted_from(Document&) override;
 
     void calculate_part_element_map();
+
+    CSS::StyleNodeID m_style_node_id;
+    CSS::TreeScopeID m_style_engine_tree_scope;
 
     // NOTE: The specification doesn't seem to specify a default value for mode. Assuming closed for now.
     ShadowRootMode m_mode { ShadowRootMode::Closed };
@@ -162,13 +182,15 @@ private:
     CSS::StyleScope m_style_scope;
 
     mutable PartElementMap m_part_element_map;
-    mutable u64 m_dom_tree_version_when_calculated_part_element_map { 0 };
+    mutable Optional<u64> m_dom_tree_version_when_calculated_part_element_map;
 
     // https://dom.spec.whatwg.org/#shadowroot-custom-element-registry
     GC::Ptr<HTML::CustomElementRegistry> m_custom_element_registry;
 
     // https://dom.spec.whatwg.org/#shadowroot-keep-custom-element-registry-null
     bool m_keep_custom_element_registry_null { false };
+
+    GC::Ptr<HTML::RadioButtonGroupRegistry> m_radio_button_group_registry;
 
 public:
     using DocumentShadowRootList = IntrusiveList<&ShadowRoot::m_list_node>;

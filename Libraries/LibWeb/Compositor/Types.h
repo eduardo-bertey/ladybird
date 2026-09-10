@@ -32,26 +32,33 @@ enum class WindowResizingInProgress : u8 {
     Yes,
 };
 
+enum class ContextVisibility : u8 {
+    Visible,
+    Hidden,
+};
+
 enum class PagePresentationRegistration {
     No,
     Yes,
 };
 
-// Facts about a video element that the compositor combines with its own paint knowledge to
-// decide when its sink is updated: a visible sink updates while painted, a captured one updates
-// regardless of paint, and a time-stopped one updates only until everything due at the settled
-// position has been presented. Every flag change wakes the sink's update scheduling.
-enum class VideoUpdateFlags : u8 {
-    None = 0,
-    Visible = 1 << 0,
-    Captured = 1 << 1,
-    TimeStopped = 1 << 2,
+// Where a reader of the compositor's async scroll updates takes them from: the ones the compositor pushed
+// (already here, in order with the input it forwarded), or the compositor's state as of now, asked for
+// synchronously, for a reader that routes input against the offsets the compositor holds this instant.
+enum class AsyncScrollUpdateFreshness : u8 {
+    Pushed,
+    FromCompositor,
 };
-AK_ENUM_BITWISE_OPERATORS(VideoUpdateFlags);
 
 struct PendingAsyncScrollUpdates {
+    // The publication these updates were handed out in, per context and increasing. A scroll state
+    // snapshot WebContent produces after adopting them carries it back.
+    u64 sequence { 0 };
     Vector<AsyncScrollOffset> scroll_offsets;
     Vector<AsyncScrollOperationID> completed_operation_ids;
+    Vector<AsyncScrollOperationID> operation_ids_taken_over_by_user_input;
+    bool user_scroll_gesture_in_progress { false };
+    bool user_scroll_gesture_ended { false };
 };
 
 struct AsyncScrollEnqueueResult {
@@ -62,6 +69,11 @@ struct AsyncScrollEnqueueResult {
 enum class AsyncScrollOperationTracking {
     No,
     Yes,
+};
+
+enum class ScrollAnimationKind : u8 {
+    SmoothScroll,
+    Momentum,
 };
 
 }

@@ -7,6 +7,7 @@
 #include <LibWebView/CompositorClient.h>
 
 #include <LibCore/EventLoop.h>
+#include <LibWebView/Application.h>
 #include <LibWebView/WebContentClient.h>
 
 namespace WebView {

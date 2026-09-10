@@ -9,12 +9,15 @@
 #include <AK/TypeCasts.h>
 #include <AK/Vector.h>
 #include <LibGC/Root.h>
-#include <LibWeb/Bindings/Element.h>
+#include <LibWeb/Bindings/CSS.h>
+#include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/Focus.h>
+#include <LibWeb/HTML/HTMLAreaElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
@@ -87,6 +90,54 @@ static void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector
     }
 
     auto new_focus_target_is_document_viewport = new_focus_target && new_focus_target->is_document();
+    GC::Ptr<DOM::Node> focus_transition_source;
+    Vector<GC::Root<DOM::Element>> old_focus_within_chain;
+
+    auto build_focus_within_chain = [](GC::Ptr<DOM::Node> source) {
+        Vector<GC::Root<DOM::Element>> chain;
+        for (auto* node = source.ptr(); node; node = node->flat_tree_parent()) {
+            if (auto* element = as_if<DOM::Element>(*node))
+                chain.append(*element);
+        }
+        return chain;
+    };
+
+    auto finish_focus_transition = [&](GC::Ptr<DOM::Node> destination) {
+        if (!focus_transition_source)
+            return;
+
+        CSS::Invalidation::invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass::Focus, focus_transition_source, destination);
+        CSS::Invalidation::invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass::FocusVisible, focus_transition_source, destination);
+
+        auto new_focus_within_chain = build_focus_within_chain(destination);
+        for (auto& element : old_focus_within_chain) {
+            if (!new_focus_within_chain.contains_slow(element))
+                CSS::record_element_state_changed(*element, CSS::PseudoClass::FocusWithin, false);
+        }
+        for (auto& element : new_focus_within_chain) {
+            if (!old_focus_within_chain.contains_slow(element))
+                CSS::record_element_state_changed(*element, CSS::PseudoClass::FocusWithin, true);
+        }
+
+        focus_transition_source = nullptr;
+        old_focus_within_chain.clear();
+    };
+
+    // AD-HOC: A blur or focus handler can move focus, re-entering these steps. The spec algorithm
+    //         has no answer for that: the old area stays designated while its blur fires, so a
+    //         handler that calls focus() derives its old chain from the same designated area and
+    //         blurs it again, without bound. Like other engines, clear each entry's designation
+    //         before its blur event fires, and stop this update when a handler moved focus: the
+    //         nested update has already designated and fired events for the new area.
+    auto currently_focused_area = [&]() -> GC::Ptr<DOM::Node> {
+        for (auto const* chain : { &old_chain, &new_chain }) {
+            for (auto const& entry : *chain) {
+                if (auto browsing_context = entry->document().browsing_context())
+                    return browsing_context->top_level_traversable()->currently_focused_area();
+            }
+        }
+        return nullptr;
+    };
 
     // 2. For each entry entry in old chain, in order, run these substeps:
     for (auto& entry : old_chain) {
@@ -130,15 +181,37 @@ static void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector
             related_blur_target = new_chain.last();
         }
 
+        // AD-HOC: Clear the entry's designation before its blur event fires; see above. Keep the CSS
+        //         focus-state transition pending until the new entry has passed its focusability
+        //         check. The specification leaves the old entry designated during this check, so
+        //         publishing a transition through null here could make the new entry stop rendering.
+        //         Snapshot the :focus-within chain because a blur handler can detach the old entry.
+        if (auto* element = as_if<DOM::Element>(*entry); element && element->document().focused_area().ptr() == element) {
+            auto preserve_focus_state = new_focus_target && !new_focus_target->is_document() && &new_focus_target->document() == &element->document();
+            if (preserve_focus_state) {
+                focus_transition_source = element;
+                old_focus_within_chain = build_focus_within_chain(element);
+            }
+            element->document().set_focused_area(nullptr, preserve_focus_state ? DOM::Document::InvalidateFocusPseudoClasses::No : DOM::Document::InvalidateFocusPseudoClasses::Yes);
+        }
+
         // 4. If blur event target is not null, fire a focus event named blur at blur event target, with related blur
         //    target as the related target.
         // FIXME: NOTE: In some cases, e.g., if entry is an area element's shape, a scrollable region, or a viewport, no event
         //       is fired.
         if (blur_event_target) {
+            auto focused_before_dispatch = currently_focused_area();
             fire_a_focus_event(blur_event_target, related_blur_target, HTML::EventNames::blur, false);
 
             // AD-HOC: dispatch focusout
             fire_a_focus_event(blur_event_target, related_blur_target, HTML::EventNames::focusout, true);
+
+            // AD-HOC: A handler moved focus; the nested update owns the designation. See above.
+            if (currently_focused_area() != focused_before_dispatch) {
+                auto destination = focus_transition_source ? focus_transition_source->document().focused_area() : nullptr;
+                finish_focus_transition(destination);
+                return;
+            }
         }
     }
 
@@ -156,11 +229,17 @@ static void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector
         // 1. If entry is a focusable area, and the focused area of the document is not entry:
         if (entry->is_document()) {
             designate_document_viewport_as_focused_area(entry->document());
-        } else if (entry->is_focusable() && entry->document().focused_area().ptr() != entry.ptr()) {
-            relevant_window(*entry).navigation()->set_focus_changed_during_ongoing_navigation(true);
+        } else if (entry->document().focused_area().ptr() != entry.ptr()) {
+            if (entry->is_focusable()) {
+                relevant_window(*entry).navigation()->set_focus_changed_during_ongoing_navigation(true);
 
-            // 2. Designate entry as the focused area of the document.
-            entry->document().set_focused_area(*entry);
+                // 2. Designate entry as the focused area of the document.
+                auto had_focus_transition = focus_transition_source != nullptr;
+                finish_focus_transition(new_focus_target);
+                entry->document().set_focused_area(*entry, had_focus_transition ? DOM::Document::InvalidateFocusPseudoClasses::No : DOM::Document::InvalidateFocusPseudoClasses::Yes);
+            } else {
+                finish_focus_transition(nullptr);
+            }
         }
 
         // 2. If entry is an element, let focus event target be entry.
@@ -192,12 +271,19 @@ static void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector
         // FIXME: NOTE: In some cases, e.g. if entry is an area element's shape, a scrollable region, or a viewport, no event
         //       is fired.
         if (focus_event_target) {
+            auto focused_before_dispatch = currently_focused_area();
             fire_a_focus_event(focus_event_target, related_focus_target, HTML::EventNames::focus, false);
 
             // AD-HOC: dispatch focusin
             fire_a_focus_event(focus_event_target, related_focus_target, HTML::EventNames::focusin, true);
+
+            // AD-HOC: A handler moved focus; the nested update owns the designation. See above.
+            if (currently_focused_area() != focused_before_dispatch)
+                return;
         }
     }
+
+    finish_focus_transition(new_focus_target);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#focus-chain
@@ -248,6 +334,12 @@ static bool document_has_focusable_viewport(DOM::Document& document)
 
 static bool is_inert_for_focus(DOM::Node const& node)
 {
+    // The shapes of area elements in an image map have their associated img element as their DOM anchor, so inertness
+    // applies to the image rather than the area element. HTMLAreaElement::is_focusable() accounts for the inertness of
+    // the associated image.
+    if (is<HTMLAreaElement>(node))
+        return false;
+
     return node.find_in_shadow_including_ancestry([](auto const& ancestor) {
         return ancestor.is_inert();
     });
@@ -516,7 +608,7 @@ void run_unfocusing_steps(GC::Ptr<DOM::Node> old_focus_target)
     auto& top_document = as<DOM::Document>(*old_chain.last());
 
     // 8. If topDocument's node navigable has system focus, then run the focusing steps for topDocument's viewport.
-    if (top_document.navigable()->traversable_navigable()->is_focused()) {
+    if (as<LocalTraversableNavigable>(*top_document.navigable()->traversable_navigable()).is_focused()) {
 
         // AD-HOC: Remove top_document from old_chain so step 1 in run_focus_update_steps doesn't cancel the blur.
         auto without_viewport_surrogate = old_chain;

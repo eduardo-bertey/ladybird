@@ -5,6 +5,7 @@
  */
 
 #include <AK/Debug.h>
+#include <AK/Math.h>
 #include <Compositor/ConnectionFromWebContent.h>
 #include <LibCore/System.h>
 #include <LibWeb/Page/InputEvent.h>
@@ -53,9 +54,9 @@ void ConnectionFromWebContent::remove_video_sink(Media::VideoSinkHandle video_si
     m_compositor_state->remove_video_sink(*this, video_sink_handle);
 }
 
-void ConnectionFromWebContent::set_video_update_flags(Media::VideoSinkHandle video_sink_handle, Web::Compositor::VideoUpdateFlags flags)
+void ConnectionFromWebContent::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
 {
-    m_compositor_state->set_video_update_flags(*this, video_sink_handle, flags);
+    m_compositor_state->set_video_sink_ticking(*this, video_sink_handle, should_tick);
 }
 
 void ConnectionFromWebContent::create_video_edge(Media::VideoSinkHandle video_sink_handle)
@@ -71,12 +72,6 @@ void ConnectionFromWebContent::release_video_edge(Media::VideoSinkHandle video_s
 {
     if (m_video_presentation_connection)
         m_video_presentation_connection->release_edge(video_sink_handle);
-}
-
-void ConnectionFromWebContent::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool ticking)
-{
-    if (m_video_presentation_connection)
-        m_video_presentation_connection->set_sink_ticking(video_sink_handle, ticking);
 }
 
 void ConnectionFromWebContent::notify_compositor_lost()
@@ -98,6 +93,16 @@ void ConnectionFromWebContent::request_rendering_update()
     async_request_rendering_update();
 }
 
+void ConnectionFromWebContent::rendering_opportunity(Web::Compositor::CompositorContextId context_id, i64 frame_time_nanoseconds, double frame_interval_milliseconds)
+{
+    async_rendering_opportunity(context_id, frame_time_nanoseconds, frame_interval_milliseconds);
+}
+
+void ConnectionFromWebContent::async_scroll_updates(Web::Compositor::CompositorContextId context_id, Web::Compositor::PendingAsyncScrollUpdates const& updates)
+{
+    async_async_scroll_updates(context_id, updates);
+}
+
 void ConnectionFromWebContent::dispatch_mouse_event_to_web_content(u64 page_id, Web::MouseEvent const& event)
 {
     async_mouse_event(page_id, event);
@@ -116,6 +121,24 @@ bool ConnectionFromWebContent::context_is_owned_by_this_connection(Web::Composit
     }
 
     VERIFY_NOT_REACHED();
+}
+
+void ConnectionFromWebContent::request_rendering_opportunity(Web::Compositor::CompositorContextId context_id, double maximum_frames_per_second)
+{
+    if (!context_is_owned_by_this_connection(context_id))
+        return;
+    if (!isfinite(maximum_frames_per_second) || maximum_frames_per_second <= 0) {
+        did_misbehave("WebContent sent an invalid maximum frame rate");
+        return;
+    }
+    m_compositor_state->request_rendering_opportunity(context_id, maximum_frames_per_second);
+}
+
+void ConnectionFromWebContent::hurry_rendering_opportunity(Web::Compositor::CompositorContextId context_id)
+{
+    if (!context_is_owned_by_this_connection(context_id))
+        return;
+    m_compositor_state->hurry_rendering_opportunity(context_id);
 }
 
 void ConnectionFromWebContent::set_parent_context(Web::Compositor::CompositorContextId context_id, Optional<Web::Compositor::CompositorContextId> parent_context_id)
@@ -153,11 +176,11 @@ void ConnectionFromWebContent::update_image_frame_resources(Web::Compositor::Com
     m_compositor_state->update_image_frame_resources(context_id, move(image_frames));
 }
 
-void ConnectionFromWebContent::update_visual_context_tree(Web::Compositor::CompositorContextId context_id, Web::Painting::AccumulatedVisualContextTree visual_context_tree)
+void ConnectionFromWebContent::update_visual_context_tree(Web::Compositor::CompositorContextId context_id, Web::Painting::AccumulatedVisualContextTree visual_context_tree, Web::Painting::DisplayListResourceTransaction resource_transaction)
 {
     if (!context_is_owned_by_this_connection(context_id))
         return;
-    m_compositor_state->update_visual_context_tree(context_id, move(visual_context_tree));
+    m_compositor_state->update_visual_context_tree(context_id, move(visual_context_tree), move(resource_transaction));
 }
 
 void ConnectionFromWebContent::update_scroll_state(Web::Compositor::CompositorContextId context_id, Web::Painting::ScrollStateSnapshot scroll_state_snapshot)
@@ -267,21 +290,21 @@ void ConnectionFromWebContent::invalidate_wheel_event_listener_state(Web::Compos
     m_compositor_state->invalidate_wheel_event_listener_state(context_id, generation);
 }
 
-Messages::CompositorWebContentServer::AsyncScrollByResponse ConnectionFromWebContent::async_scroll_by(Web::Compositor::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::AsyncScrollOperationTracking operation_tracking)
+Messages::CompositorWebContentServer::AsyncScrollByResponse ConnectionFromWebContent::async_scroll_by(Web::Compositor::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::SnapContainerHandling snap_container_handling, Web::Compositor::AsyncScrollOperationTracking operation_tracking)
 {
     if (!context_is_owned_by_this_connection(context_id))
         return Web::Compositor::AsyncScrollEnqueueResult {};
-    auto result = m_compositor_state->async_scroll_by(context_id, document_id, position, delta, viewport_rect, operation_tracking);
+    auto result = m_compositor_state->async_scroll_by(context_id, document_id, position, delta, viewport_rect, snap_container_handling, operation_tracking);
     if (result.accepted)
         async_request_rendering_update();
     return result;
 }
 
-Messages::CompositorWebContentServer::SmoothScrollToResponse ConnectionFromWebContent::smooth_scroll_to(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel)
+Messages::CompositorWebContentServer::SmoothScrollToResponse ConnectionFromWebContent::smooth_scroll_to(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel, Web::Compositor::ScrollAnimationKind animation_kind)
 {
     if (!context_is_owned_by_this_connection(context_id))
         return Web::Compositor::AsyncScrollEnqueueResult {};
-    auto result = m_compositor_state->smooth_scroll_to(context_id, stable_node_id, offset, viewport_rect, device_pixels_per_css_pixel);
+    auto result = m_compositor_state->smooth_scroll_to(context_id, stable_node_id, offset, main_thread_offset, viewport_rect, device_pixels_per_css_pixel, animation_kind);
     if (result.accepted)
         async_request_rendering_update();
     return result;
@@ -308,11 +331,11 @@ void ConnectionFromWebContent::viewport_size_updated(Web::Compositor::Compositor
     m_compositor_state->viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
 }
 
-void ConnectionFromWebContent::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
+void ConnectionFromWebContent::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect)
 {
     if (!context_is_owned_by_this_connection(context_id))
         return;
-    m_compositor_state->present_frame(context_id, viewport_rect, damage_rect);
+    m_compositor_state->present_frame(context_id, viewport_rect);
 }
 
 void ConnectionFromWebContent::request_screenshot(Web::Compositor::CompositorContextId context_id, Web::Compositor::ScreenshotRequestId request_id, Gfx::ShareableBitmap target_bitmap)

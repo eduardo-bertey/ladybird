@@ -15,6 +15,7 @@
 #include <LibWeb/HTML/ErrorEvent.h>
 #include <LibWeb/HTML/ErrorInformation.h>
 #include <LibWeb/HTML/History.h>
+#include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigateEvent.h>
 #include <LibWeb/HTML/Navigation.h>
@@ -26,6 +27,7 @@
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
+#include <LibWeb/HTML/SourceSnapshotParams.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
@@ -57,8 +59,7 @@ static void report_navigation_api_state_update(DOM::Document& document, SessionH
     if (!navigable)
         return;
 
-    auto traversable = navigable->traversable_navigable();
-    traversable->page().client().page_did_update_session_history_entry_navigation_api_state(navigable->id(), entry.navigation_api_key(), entry.navigation_api_state());
+    navigable->page().client().page_did_update_session_history_entry_navigation_api_state(navigable->id(), session_history_entry_identity(entry), entry.navigation_api_state());
 }
 
 NavigationAPIMethodTracker::NavigationAPIMethodTracker(GC::Ref<Navigation> navigation,
@@ -168,8 +169,8 @@ WebIDL::ExceptionOr<void> Navigation::update_current_entry(NavigationUpdateCurre
     // 4. Set current's session history entry's navigation API state to serializedState.
     current->session_history_entry().set_navigation_api_state(serialized_state);
 
-    // NB: The UI-process session history mirror needs to observe updateCurrentEntry() state changes so restored
-    //     WebContent processes can reconstruct Navigation API state from the authoritative UI-owned history.
+    // NB: Canonical session history needs to observe updateCurrentEntry() state changes so replacement WebContent processes
+    //     can reconstruct Navigation API state.
     auto& document = window().associated_document();
     report_navigation_api_state_update(document, current->session_history_entry());
 
@@ -697,10 +698,8 @@ WebIDL::ExceptionOr<NavigationResult> Navigation::perform_a_navigation_api_trave
     auto navigable = document.navigable();
 
     // 10. Let traversable be navigable's traversable navigable.
-    auto traversable = navigable->traversable_navigable();
-
     // 11. Let sourceSnapshotParams be the result of snapshotting source snapshot params given document.
-    auto source_snapshot_params = document.snapshot_source_snapshot_params();
+    auto source_snapshot_params = snapshot_source_snapshot_params(document);
 
     // 12. Append the following session history traversal steps to traversable:
     // NB: The UI process owns the session history traversal queue, resolves the key against the canonical session
@@ -755,24 +754,15 @@ WebIDL::ExceptionOr<NavigationResult> Navigation::perform_a_navigation_api_trave
 
     // 4. Let result be the result of applying the traverse history step given by targetSHE's step to traversable,
     //    given sourceSnapshotParams, navigable, and "none".
-    traversable->request_history_operation(
+    navigable->page().history_executor().request_history_operation(
         NavigationAPITraverseHistoryOperationParameters {
             .navigable_id = navigable->id(),
             .key = key,
+            .initiator_source_snapshot = Web::InitiatorSourceSnapshot { .sandboxing_flags = source_snapshot_params->sandboxing_flags, .has_transient_activation = source_snapshot_params->has_transient_activation },
             .user_involvement = UserNavigationInvolvement::None,
         },
         {
             .source_snapshot_params = source_snapshot_params,
-            .initiator_to_check = navigable,
-            .pre_steps = GC::create_function(heap(), [key, navigable](u64, GC::Ref<LocalTraversableNavigable::OnHistoryOperationReady> ready) {
-                // 3. If targetSHE is navigable's active session history entry:
-                // NOTE: This can occur if a previously queued traversal already took us to this session history entry.
-                if (auto active_entry = navigable->active_session_history_entry(); active_entry && active_entry->navigation_api_key() == key) {
-                    ready->function()(false, {}, HistoryStepResult::NoMatchingEntry);
-                    return;
-                }
-                ready->function()(true, {}, HistoryStepResult::Applied);
-            }),
             .on_complete = on_complete,
         });
 
@@ -1335,23 +1325,21 @@ bool Navigation::inner_navigate_event_firing_algorithm(
             auto destination_entry = event->destination()->navigation_history_entry();
             VERIFY(destination_entry);
             auto target_step = destination_entry->session_history_entry().step().get<int>();
-            auto traversable = navigable->traversable_navigable();
-            traversable->request_history_operation(
+            navigable->page().history_executor().request_history_operation(
                 ResumeTraverseHistoryOperationParameters {
                     .navigable_id = navigable->id(),
                     .target_step = target_step,
                     .user_involvement = user_involvement_for_resume,
                 },
                 {
-                    .navigation_api_abort_behavior = LocalNavigable::NavigationAPIAbortBehavior::Preserve,
-                    .pre_steps = GC::create_function(heap(), [this, event](u64, GC::Ref<LocalTraversableNavigable::OnHistoryOperationReady> ready) {
+                    .pre_steps = GC::create_function(heap(), [this, event](Optional<Web::ReconstructedChildNavigation>, GC::Ref<HistoryExecutor::OnHistoryOperationReady> ready) {
                         // NB: This operation can start after a later navigation has aborted the intercepted
                         //     traverse. In that case, the aborted traverse must not be resumed.
                         if (event->abort_controller()->signal()->aborted() || event != m_ongoing_navigate_event) {
-                            ready->function()(false, {}, HistoryStepResult::Applied);
+                            ready->function()(HistoryStepResult::Applied);
                             return;
                         }
-                        ready->function()(true, {}, HistoryStepResult::Applied);
+                        ready->function()(Empty {});
                     }),
                 });
         }

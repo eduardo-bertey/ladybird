@@ -44,6 +44,7 @@
 #include <LibURL/Parser.h>
 #include <LibURL/URL.h>
 #include <LibWeb/HTML/SelectedFile.h>
+#include <LibWeb/HTML/VisibilityState.h>
 #include <LibWebView/Process.h>
 #include <LibWebView/Utilities.h>
 
@@ -158,22 +159,48 @@ static ErrorOr<void> skip_async_scrolling_tests_unless_enabled(Application const
     return enumerate_test_files_recursively(path, s_skipped_tests);
 }
 
+static ErrorOr<void> skip_out_of_process_iframe_tests_unless_enabled(Application const& app)
+{
+    if (WebView::Application::web_content_options().site_isolation_mode == WebView::SiteIsolationMode::IFrame)
+        return {};
+
+    auto path = LexicalPath::join(app.test_root_path, "Text/input/SiteIsolation/iframe/"sv).string();
+    if (!FileSystem::exists(path))
+        return {};
+    return enumerate_test_files_recursively(path, s_skipped_tests);
+}
+
 static ErrorOr<void> skip_ui_process_session_history_tests_unless_enabled(Application const& app)
 {
     if (app.run_ui_process_session_history_tests)
         return {};
 
-    static constexpr Array ui_process_session_history_tests {
-        "Text/input/navigation/ui-process-session-history-dump.html"sv,
-        "Text/input/navigation/ui-process-session-history-same-document-back.html"sv,
-        "Text/input/navigation/ui-process-session-history-same-document.html"sv,
-    };
+    auto directory = LexicalPath::join(app.test_root_path, "Text/input/navigation/"sv).string();
+    if (!FileSystem::exists(directory))
+        return {};
 
-    for (auto const& test : ui_process_session_history_tests) {
-        auto path = LexicalPath::join(app.test_root_path, test).string();
+    Core::DirIterator it(directory, Core::DirIterator::Flags::SkipDots);
+    while (it.has_next()) {
+        auto path = it.next_full_path();
+        if (!LexicalPath::basename(path).starts_with("ui-process-session-history-"sv))
+            continue;
+        if (!is_valid_test_name(path))
+            continue;
         s_skipped_tests.append(TRY(real_path_for_test_input(path)));
     }
 
+    return {};
+}
+
+static ErrorOr<void> skip_aia_tests_on_apple(Application const& app)
+{
+#ifdef AK_OS_MACOS
+    auto path = LexicalPath::join(app.test_root_path, "Text/input/aia-cert-fetching.html"sv).string();
+    if (FileSystem::exists(path))
+        s_skipped_tests.append(TRY(real_path_for_test_input(path)));
+#else
+    (void)app;
+#endif
     return {};
 }
 
@@ -525,7 +552,7 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
             // NOTE: We take a screenshot here to force the lazy layout of SVG-as-image documents to happen.
             //       It also causes a lot more code to run, which is good for finding bugs. :^)
             view.take_screenshot()->when_resolved([&view, &context, test_index, on_test_complete = move(on_test_complete)](auto const&) {
-                auto promise = view.request_internal_page_info(WebView::PageInfoType::LayoutTree | WebView::PageInfoType::PaintTree | WebView::PageInfoType::StackingContextTree);
+                auto promise = view.request_internal_page_info(WebView::PageInfoType::LayoutTree | WebView::PageInfoType::StackingContextTree);
 
                 promise->when_resolved([&context, test_index, on_test_complete = move(on_test_complete)](auto const& text) {
                     context.tests[test_index].text = text;
@@ -1024,7 +1051,9 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
 
     TRY(load_test_config(app.test_root_path));
     TRY(skip_async_scrolling_tests_unless_enabled(app));
+    TRY(skip_out_of_process_iframe_tests_unless_enabled(app));
     TRY(skip_ui_process_session_history_tests_unless_enabled(app));
+    TRY(skip_aia_tests_on_apple(app));
 
     Vector<Test> tests;
 
@@ -1121,8 +1150,6 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     for (size_t i = 0; i < concurrency; ++i) {
         auto view = TestWebView::create(theme, window_size);
         view->on_load_finish = [&](auto const&) { ++loaded_web_views; };
-        // FIXME: Figure out a better way to ensure that tests use default browser settings.
-        view->reset_zoom();
 
         views.unchecked_append(move(view));
     }
@@ -1141,6 +1168,11 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
         s_view_index_by_view.set(view.ptr(), i);
     }
 
+    auto tests_remaining = tests.size();
+    TestRunContext context { tests, tests_remaining, total_tests };
+    s_run_context = &context;
+    ScopeGuard clear_run_context = [&] { s_run_context = nullptr; };
+
     display.begin_run();
     ScopeGuard clear_live_display = [&] { display.clear_live_display(); };
 
@@ -1148,12 +1180,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     s_view_run_next_test.resize_and_keep_capacity(concurrency);
 
     s_all_tests_complete = Core::Promise<Empty>::construct();
-    auto tests_remaining = tests.size();
     auto current_test = 0uz;
-
-    TestRunContext context { tests, tests_remaining, total_tests };
-    s_run_context = &context;
-    ScopeGuard clear_run_context = [&] { s_run_context = nullptr; };
 
     Vector<TestCompletion> non_passing_tests;
     bool fail_fast_triggered = false;
@@ -1183,13 +1210,21 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
 
             // Disconnect child crash handlers so old child crashes don't affect the next test
             view->disconnect_child_crash_handlers();
+            view->close_child_web_views();
 
             // Don't try to reset state if WebContent crashed - it's gone
             if (test_result != TestResult::Crashed) {
                 view->clear_content_blockers();
                 view->reset_zoom();
+                view->reset_force_dark();
+                view->reset_line_box_borders();
                 view->reset_viewport_size(window_size);
             }
+
+            // The system visibility state lives in this view's traversable, and a test that hid the page only puts it
+            // back from signalTestIsDone(). A test that times out or crashes while hidden would otherwise hand the
+            // hidden state to every test that follows in this view, a respawned WebContent included.
+            view->set_system_visibility_state(Web::HTML::VisibilityState::Visible);
 
             auto& test = tests[test_index];
             if (test.timeout_timer) {

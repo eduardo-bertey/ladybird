@@ -162,11 +162,40 @@ ThrowCompletionOr<Value> VM::run(SourceTextModule& module)
 
 VM::HandleExceptionResponse VM::handle_exception(u32 program_counter, Value exception)
 {
+    if (auto* debugger = vm().debugger()) {
+        bool exception_will_be_caught = false;
+        ExecutionContext const* previous_context = nullptr;
+        vm().for_each_execution_context_top_to_bottom([&](ExecutionContext const& context) {
+            if (!context.executable)
+                return true;
+
+            auto context_program_counter = context.program_counter;
+            if (!previous_context)
+                context_program_counter = program_counter;
+            else if (previous_context->caller_frame == &context)
+                context_program_counter = previous_context->caller_return_pc - 1;
+            previous_context = &context;
+
+            auto handler = context.executable->exception_handlers_for_offset(context_program_counter);
+            if (handler.has_value() && handler->catches_exception) {
+                exception_will_be_caught = true;
+                return false;
+            }
+            return true;
+        });
+
+        debugger->pause_on_exception_if_needed(current_executable(), program_counter, exception, exception_will_be_caught);
+    }
+
     for (;;) {
         auto handlers = current_executable().exception_handlers_for_offset(program_counter);
         if (handlers.has_value()) {
             reg(Register::exception()) = exception;
             m_running_execution_context->program_counter = handlers->handler_offset;
+            if (handlers->catches_exception) {
+                if (auto* debugger = vm().debugger())
+                    debugger->did_finish_exception_propagation(exception);
+            }
             return HandleExceptionResponse::ContinueInThisExecutable;
         }
 
@@ -190,6 +219,10 @@ VM::HandleExceptionResponse VM::handle_exception(u32 program_counter, Value exce
         }
 
         reg(Register::exception()) = exception;
+        if (m_run_executable_depth == 1) {
+            if (auto* debugger = vm().debugger())
+                debugger->did_finish_exception_propagation(exception);
+        }
         return HandleExceptionResponse::ExitFromExecutable;
     }
 }
@@ -197,7 +230,7 @@ VM::HandleExceptionResponse VM::handle_exception(u32 program_counter, Value exce
 ExecutionContext* VM::push_inline_frame(
     ECMAScriptFunctionObject& callee_function,
     Executable& callee_executable,
-    ReadonlySpan<Operand> arguments,
+    ReadonlySpan<Value> arguments,
     u32 return_pc,
     u32 dst_raw,
     Value this_value,
@@ -214,10 +247,10 @@ ExecutionContext* VM::push_inline_frame(
     if (!callee_context) [[unlikely]]
         return nullptr;
 
-    // Copy arguments from caller's registers into callee's argument slots.
+    // Copy the supplied arguments into the callee's argument slots.
     auto* callee_argument_values = callee_context->arguments_data();
     for (u32 i = 0; i < insn_argument_count; ++i)
-        callee_argument_values[i] = get(arguments[i]);
+        callee_argument_values[i] = arguments[i];
     for (size_t i = insn_argument_count; i < argument_count; ++i)
         callee_argument_values[i] = js_undefined();
     callee_context->passed_argument_count = insn_argument_count;
@@ -323,6 +356,11 @@ ThrowCompletionOr<Value> VM::run_executable(ExecutionContext& context, Executabl
         auto* values = context.registers_and_constants_and_locals_and_arguments_span().data();
 
         js_interpreter(bytecode, entry_point, values, this);
+    }
+
+    if (is_outermost_bytecode_execution) {
+        if (auto* debugger = vm().debugger())
+            debugger->did_finish_bytecode_execution();
     }
 
     if (is_outermost_bytecode_execution && !vm().is_executing_module())

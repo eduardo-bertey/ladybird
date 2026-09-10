@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Checked.h>
 #include <AK/IPv4Address.h>
 #include <AK/IPv6Address.h>
 #include <AK/JsonValue.h>
@@ -12,7 +13,6 @@
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
 #include <LibCore/AnonymousBuffer.h>
-#include <LibCore/Proxy.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/File.h>
 #include <LibURL/Parser.h>
@@ -150,7 +150,7 @@ ErrorOr<URL::Origin> decode(Decoder& decoder)
     auto scheme = TRY(decoder.decode<Optional<String>>());
     auto host = TRY(decoder.decode<URL::Host>());
     auto port = TRY(decoder.decode<Optional<u16>>());
-    auto domain = TRY(decoder.decode<Optional<String>>());
+    auto domain = TRY(decoder.decode<Optional<URL::Host>>());
 
     return URL::Origin { move(scheme), move(host), port, move(domain) };
 }
@@ -174,23 +174,16 @@ ErrorOr<Core::AnonymousBuffer> decode(Decoder& decoder)
     if (auto valid = TRY(decoder.decode<bool>()); !valid)
         return Core::AnonymousBuffer {};
 
-    // NOTE: We don't use decode_size() here since AnonymousBuffer is backed by
-    // shared memory, not heap allocation. The MAX_DECODED_SIZE limit doesn't
-    // apply because the memory is already allocated by the sender.
-    auto size = static_cast<size_t>(TRY(decoder.decode<u32>()));
+    // We don't use decode_size() here since AnonymousBuffer is backed by shared memory, not heap allocation. The
+    // MAX_DECODED_SIZE limit doesn't apply because the memory is already allocated by the sender.
+    auto encoded_size = TRY(decoder.decode<u64>());
+    if (!AK::is_within_range<size_t>(encoded_size))
+        return Error::from_string_literal("Anonymous buffer size does not fit on this platform");
+
+    auto size = static_cast<size_t>(encoded_size);
     auto anon_file = TRY(decoder.decode<IPC::File>());
 
     return Core::AnonymousBuffer::create_from_anon_fd(anon_file.take_fd(), size);
-}
-
-template<>
-ErrorOr<Core::ProxyData> decode(Decoder& decoder)
-{
-    auto type = TRY(decoder.decode<Core::ProxyData::Type>());
-    auto host_ipv4 = IPv4Address(TRY(decoder.decode<u32>()));
-    auto port = TRY(decoder.decode<u16>());
-
-    return Core::ProxyData { type, host_ipv4, port };
 }
 
 template<>

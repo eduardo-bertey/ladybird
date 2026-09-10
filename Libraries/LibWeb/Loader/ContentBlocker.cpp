@@ -151,6 +151,16 @@ ErrorOr<void> ContentBlocker::set_patterns(ReadonlySpan<String> patterns)
 
 ErrorOr<void> ContentBlocker::set_rules_from_bytes(ReadonlyBytes rules_bytes)
 {
+    // OPTIMIZATION: Building an engine costs the same tokenizing and flatbuffer work whether or not there are any
+    //               rules to put in it, and every caller already treats a missing engine as "nothing is blocked".
+    //               Drop the engine instead of rebuilding an empty one.
+    if (rules_bytes.is_empty()) {
+        ContentBlocking::FFI::rust_content_blocker_free(m_engine);
+        m_engine = nullptr;
+        m_has_cosmetic_rules = false;
+        return {};
+    }
+
     auto* engine = ContentBlocking::FFI::rust_content_blocker_create(
         rules_bytes.data(),
         rules_bytes.size());
@@ -291,6 +301,8 @@ ContentBlocker::ResourceType ContentBlocker::resource_type_from_fetch_metadata(O
             return ResourceType::Script;
         case Request::Destination::Style:
             return ResourceType::Stylesheet;
+        case Request::Destination::Text:
+            return ResourceType::Other;
         case Request::Destination::JSON:
         case Request::Destination::Manifest:
         case Request::Destination::Report:

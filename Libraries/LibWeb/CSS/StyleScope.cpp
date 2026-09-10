@@ -1,32 +1,27 @@
 /*
  * Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
  * Copyright (c) 2022-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ * Copyright (c) 2025, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #include <AK/StringBuilder.h>
 #include <AK/Utf16StringBuilder.h>
-#include <LibWeb/CSS/CSSConditionRule.h>
-#include <LibWeb/CSS/CSSContainerRule.h>
-#include <LibWeb/CSS/CSSFunctionRule.h>
-#include <LibWeb/CSS/CSSGroupingRule.h>
-#include <LibWeb/CSS/CSSImportRule.h>
-#include <LibWeb/CSS/CSSKeyframesRule.h>
-#include <LibWeb/CSS/CSSLayerBlockRule.h>
-#include <LibWeb/CSS/CSSLayerStatementRule.h>
-#include <LibWeb/CSS/CSSNestedDeclarations.h>
-#include <LibWeb/CSS/CSSScopeRule.h>
-#include <LibWeb/CSS/CSSStyleRule.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/CounterStyle.h>
 #include <LibWeb/CSS/CounterStyleDefinition.h>
 #include <LibWeb/CSS/Enums.h>
+#include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleScope.h>
-#include <LibWeb/CSS/StyleValues/StyleValueList.h>
+#include <LibWeb/CSS/StyleSheetImport.h>
+#include <LibWeb/CSS/StyleSheetInvalidation.h>
+#include <LibWeb/CSS/StyleSheetState.h>
+#include <LibWeb/ComputedValuesRustFFI.h>
+#include <LibWeb/DOM/AdoptedStyleSheets.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Namespace.h>
@@ -34,12 +29,175 @@
 
 namespace Web::CSS {
 
-void RuleCaches::visit_edges(GC::Cell::Visitor& visitor)
+// https://www.w3.org/TR/cssom/#remove-a-css-style-sheet
+void StyleScope::remove_a_css_style_sheet(CSS::StyleSheetState& sheet, StyleEngineUpdate style_engine_update)
 {
-    main.visit_edges(visitor);
-    for (auto& it : by_layer) {
-        it.value->visit_edges(visitor);
+    NonnullRefPtr keep_alive { sheet };
+    // 1. Remove the CSS style sheet from the list of document or shadow root CSS style sheets.
+    remove_sheet(sheet, style_engine_update);
+
+    // 2. Set the CSS style sheet’s parent CSS style sheet, owner node and owner CSS rule to null.
+    sheet.set_parent_css_style_sheet(nullptr);
+    sheet.set_owner_node(nullptr);
+    sheet.set_owner_import(nullptr);
+}
+
+// https://www.w3.org/TR/cssom/#add-a-css-style-sheet
+void StyleScope::add_a_css_style_sheet(CSS::StyleSheetState& sheet, StyleEngineUpdate style_engine_update)
+{
+    // 1. Add the CSS style sheet to the list of document or shadow root CSS style sheets at the appropriate location. The remainder of these steps deal with the disabled flag.
+    add_sheet(sheet, style_engine_update);
+
+    // 2. If the disabled flag is set, then return.
+    if (sheet.disabled())
+        return;
+
+    // 3. If the title is not the empty string, the alternate flag is unset, and preferred CSS style sheet set name is the empty string change the preferred CSS style sheet set name to the title.
+    if (!sheet.title().is_empty() && !sheet.is_alternate() && m_preferred_css_style_sheet_set_name.is_empty()) {
+        m_preferred_css_style_sheet_set_name = sheet.title();
     }
+
+    // 4. If any of the following is true, then unset the disabled flag and return:
+    //    - The title is the empty string.
+    //    - The last CSS style sheet set name is null and the title is a case-sensitive match for the preferred CSS style sheet set name.
+    //    - The title is a case-sensitive match for the last CSS style sheet set name.
+    // NOTE: We don't enable alternate sheets with an empty title.  This isn't directly mentioned in the algorithm steps, but the
+    // HTML specification says that the title element must be specified with a non-empty value for alternative style sheets.
+    // See: https://html.spec.whatwg.org/multipage/links.html#the-link-is-an-alternative-stylesheet
+    if ((sheet.title().is_empty() && !sheet.is_alternate())
+        || (!sheet.title().is_empty()
+            && ((!m_last_css_style_sheet_set_name.has_value() && sheet.title().equals_ignoring_ascii_case(m_preferred_css_style_sheet_set_name))
+                || (m_last_css_style_sheet_set_name.has_value() && sheet.title().equals_ignoring_ascii_case(m_last_css_style_sheet_set_name.value()))))) {
+        sheet.set_disabled(false);
+        return;
+    }
+
+    // 5. Set the disabled flag.
+    sheet.set_disabled(true);
+}
+
+// https://www.w3.org/TR/cssom/#create-a-css-style-sheet
+NonnullRefPtr<StyleSheetState> StyleScope::create_a_css_style_sheet(Utf16View css_text, DOM::Element* owner_node, Utf16View media, Utf16String title, Alternate alternate, OriginClean origin_clean, Optional<::URL::URL> location, StyleSheetState* parent_style_sheet, StyleSheetImport* owner_import, StyleEngineUpdate style_engine_update)
+{
+    // 1. Create a new CSS style sheet object and set its properties as specified.
+    // AD-HOC: The spec never tells us when to parse this style sheet, but the most logical place is here.
+    auto sheet = parse_css_stylesheet(Parser::ParsingParams { document() }, css_text, location);
+    initialize_a_css_style_sheet(*sheet, owner_node, media, move(title), alternate, origin_clean, parent_style_sheet, owner_import, style_engine_update);
+    return sheet;
+}
+
+void StyleScope::initialize_a_css_style_sheet(StyleSheetState& sheet, DOM::Element* owner_node, Utf16View media, Utf16String title, Alternate alternate, OriginClean origin_clean, StyleSheetState* parent_style_sheet, StyleSheetImport* owner_import, StyleEngineUpdate style_engine_update)
+{
+    sheet.set_parent_css_style_sheet(parent_style_sheet);
+    sheet.set_owner_import(owner_import);
+    sheet.set_owner_node(owner_node);
+    sheet.set_media(move(media));
+    sheet.set_title(move(title));
+    sheet.set_alternate(alternate == Alternate::Yes);
+    sheet.set_origin_clean(origin_clean == OriginClean::Yes);
+
+    // 2. Then run the add a CSS style sheet steps for the newly created CSS style sheet.
+    add_a_css_style_sheet(sheet, style_engine_update);
+}
+
+void StyleScope::add_sheet(StyleSheetState& sheet, StyleEngineUpdate style_engine_update)
+{
+    sheet.add_owning_document_or_shadow_root(node());
+
+    sheet.load_pending_image_resources(document());
+
+    insert_sheet_in_tree_order(sheet);
+    document().fonts()->synchronize_css_connected_font_order();
+
+    if (style_engine_update == StyleEngineUpdate::Record)
+        record_stylesheet_attached(sheet, node(), following_sheet(sheet));
+
+    // NOTE: We evaluate media queries immediately when adding a new sheet.
+    //       This coalesces the full document style invalidations.
+    //       If we don't do this, we invalidate now, and then again when Document updates media rules.
+    sheet.evaluate_media_queries(document());
+    // A sheet whose media does not match contributes nothing, so its rules can reach no element.
+    if (style_engine_update == StyleEngineUpdate::Record)
+        record_stylesheet_conditions(sheet, node(), !sheet.disabled() && sheet.native_media_list().matches());
+
+    invalidate_rule_cache_after_style_sheet_change(node(), sheet);
+}
+
+void StyleScope::insert_sheet_in_tree_order(StyleSheetState& sheet)
+{
+    if (m_style_sheets.is_empty()) {
+        // This is the first sheet, append it to the list.
+        m_style_sheets.append(sheet);
+    } else {
+        // We have sheets from before. Insert the new sheet in the correct position (DOM tree order).
+        bool did_insert = false;
+        for (ssize_t i = m_style_sheets.size() - 1; i >= 0; --i) {
+            auto& existing_sheet = *m_style_sheets[i];
+            auto position = existing_sheet.owner_node()->compare_document_position(sheet.owner_node());
+            if (position & DOM::Node::DocumentPosition::DOCUMENT_POSITION_FOLLOWING) {
+                m_style_sheets.insert(i + 1, sheet);
+                did_insert = true;
+                break;
+            }
+        }
+        if (!did_insert)
+            m_style_sheets.prepend(sheet);
+    }
+}
+
+StyleSheetState* StyleScope::following_sheet(StyleSheetState& sheet)
+{
+    // The list is kept in DOM tree order, so the sheet that now follows this one is its successor
+    // in cascade order too.
+    auto position = m_style_sheets.find_first_index(sheet);
+    StyleSheetState* following = nullptr;
+    if (position.has_value() && *position + 1 < m_style_sheets.size())
+        following = m_style_sheets[*position + 1].ptr();
+
+    // https://drafts.csswg.org/cssom/#documentorshadowroot-final-css-style-sheets
+    // Adopted sheets cascade after every sheet in the list, whenever either arrived, so the last
+    // sheet of the list is followed by the first adopted one rather than by nothing.
+    if (!following) {
+        auto& scope = node();
+        auto adopted = is<DOM::Document>(scope)
+            ? DOM::AdoptedStyleSheetsAccess::adopted_style_sheets(static_cast<DOM::Document&>(scope))
+            : DOM::AdoptedStyleSheetsAccess::adopted_style_sheets(static_cast<DOM::ShadowRoot&>(scope));
+        DOM::for_each_adopted_style_sheet(adopted, [&](StyleSheetState& adopted_sheet) {
+            if (!following)
+                following = &adopted_sheet;
+        });
+    }
+    return following;
+}
+
+void StyleScope::remove_sheet(StyleSheetState& sheet, StyleEngineUpdate style_engine_update)
+{
+    NonnullRefPtr keep_alive { sheet };
+    sheet.remove_owning_document_or_shadow_root(node());
+    bool did_remove = m_style_sheets.remove_first_matching([&](auto& entry) { return entry.ptr() == &sheet; });
+    VERIFY(did_remove);
+    if (style_engine_update == StyleEngineUpdate::Record)
+        record_stylesheet_detached(sheet, node());
+
+    invalidate_rule_cache_after_style_sheet_change(node(), sheet);
+}
+
+void StyleScope::move_sheet(StyleSheetState& sheet, StyleScope& destination)
+{
+    NonnullRefPtr keep_alive { sheet };
+    if (this != &destination) {
+        remove_sheet(sheet, StyleEngineUpdate::Record);
+        destination.add_sheet(sheet, StyleEngineUpdate::Record);
+        return;
+    }
+
+    auto position = m_style_sheets.find_first_index(sheet);
+    VERIFY(position.has_value());
+    m_style_sheets.remove(*position);
+    insert_sheet_in_tree_order(sheet);
+    document().fonts()->synchronize_css_connected_font_order();
+    record_stylesheet_attached(sheet, node(), following_sheet(sheet));
+    invalidate_rule_cache_after_style_sheet_change(node(), sheet);
 }
 
 NonnullRefPtr<StyleCache> StyleCache::create()
@@ -47,132 +205,19 @@ NonnullRefPtr<StyleCache> StyleCache::create()
     return adopt_ref(*new StyleCache);
 }
 
-StyleRuleCache::StyleRuleCache()
-{
-    qualified_layer_names_in_order.append({});
-}
-
-void StyleRuleCache::visit_edges(GC::Cell::Visitor& visitor)
-{
-    for (auto& cache : pseudo_class_rule_cache) {
-        if (cache)
-            cache->visit_edges(visitor);
-    }
-    author_rule_cache.visit_edges(visitor);
-    user_rule_cache.visit_edges(visitor);
-    user_agent_rule_cache.visit_edges(visitor);
-}
-
-void StyleCache::visit_edges(GC::Cell::Visitor& visitor)
-{
-    if (rule_cache)
-        rule_cache->visit_edges(visitor);
-}
-
 void StyleScope::visit_edges(GC::Cell::Visitor& visitor)
 {
     visitor.visit(m_node);
     visitor.visit(m_user_style_sheet);
-    if (m_style_cache)
-        m_style_cache->visit_edges(visitor);
-    visitor.visit(m_pending_has_invalidations);
-}
-
-void MatchingRule::visit_edges(GC::Cell::Visitor& visitor) const
-{
-    visitor.visit(rule);
-    visitor.visit(sheet);
-    visitor.visit(container_rule);
-    visitor.visit(scope_rule);
-}
-
-static Optional<Utf16FlyString> namespace_filter_for_qualified_name(Selector::SimpleSelector::QualifiedName const& qualified_name, CSSStyleSheet const& style_sheet)
-{
-    switch (qualified_name.namespace_type) {
-    case Selector::SimpleSelector::QualifiedName::NamespaceType::Default:
-        return style_sheet.default_namespace();
-    case Selector::SimpleSelector::QualifiedName::NamespaceType::None:
-        return Utf16FlyString {};
-    case Selector::SimpleSelector::QualifiedName::NamespaceType::Any:
-        return {};
-    case Selector::SimpleSelector::QualifiedName::NamespaceType::Named:
-        return style_sheet.namespace_uri(qualified_name.namespace_);
-    }
-    VERIFY_NOT_REACHED();
-}
-
-static Selector::CompoundSelector const& target_compound_selector_for_namespace_filter(Selector const& selector)
-{
-    auto const& compound_selectors = selector.compound_selectors();
-    VERIFY(!compound_selectors.is_empty());
-
-    if (auto compound_selector = compound_selectors.last_matching([](auto const& compound_selector) {
-            return compound_selector.combinator != Selector::Combinator::PseudoElement;
-        });
-        compound_selector.has_value())
-        return compound_selector.value();
-
-    return compound_selectors.first();
-}
-
-static Optional<Utf16FlyString> element_namespace_filter_for_rule(Selector const& selector, CSSStyleSheet const& style_sheet)
-{
-    if (selector.is_slotted() || selector.has_part_pseudo_element())
-        return {};
-
-    auto const& compound_selector = target_compound_selector_for_namespace_filter(selector);
-    for (auto const& simple_selector : compound_selector.simple_selectors) {
-        if (simple_selector.type == Selector::SimpleSelector::Type::TagName
-            || simple_selector.type == Selector::SimpleSelector::Type::Universal) {
-            return namespace_filter_for_qualified_name(simple_selector.qualified_name(), style_sheet);
-        }
-    }
-
-    return style_sheet.default_namespace();
-}
-
-void RuleCache::visit_edges(GC::Cell::Visitor& visitor)
-{
-    auto visit_vector = [&](auto& vector) {
-        for (auto& rule : vector)
-            rule.visit_edges(visitor);
-    };
-    auto visit_map = [&](auto& map) {
-        for (auto& [_, rules] : map) {
-            visit_vector(rules);
-        }
-    };
-    auto visit_pseudo_class_buckets = [&](auto& buckets) {
-        for (auto& rules : buckets)
-            visit_vector(rules);
-    };
-
-    visit_map(rules_by_id);
-    visit_map(rules_by_class);
-    visit_map(rules_by_tag_name);
-    visit_map(rules_by_attribute_name);
-    visit_pseudo_class_buckets(rules_by_subject_pseudo_class);
-    visit_map(rules_by_ancestor_hash);
-    for (auto& rules : rules_by_pseudo_element) {
-        visit_map(rules.rules_by_id);
-        visit_map(rules.rules_by_class);
-        visit_map(rules.rules_by_tag_name);
-        visit_map(rules.rules_by_attribute_name);
-        visit_pseudo_class_buckets(rules.rules_by_subject_pseudo_class);
-        visit_map(rules.rules_by_ancestor_hash);
-        visit_vector(rules.root_rules);
-        visit_vector(rules.other_rules);
-    }
-    visit_vector(root_rules);
-    visit_vector(slotted_rules);
-    visit_vector(part_rules);
-    visit_vector(other_rules);
+    visitor.visit(m_style_sheets);
 }
 
 StyleScope::StyleScope(GC::Ref<DOM::Node> node)
     : m_node(node)
 {
 }
+
+StyleScope::~StyleScope() = default;
 
 bool SheetSetStyleCacheRegistry::entry_is_current(Entry const& entry)
 {
@@ -183,7 +228,7 @@ bool SheetSetStyleCacheRegistry::entry_is_current(Entry const& entry)
     return true;
 }
 
-static u32 hash_sheet_set(Vector<GC::Ref<CSSStyleSheet>> const& sheets)
+static u32 hash_sheet_set(Vector<NonnullRefPtr<StyleSheetState>> const& sheets)
 {
     u32 hash = u64_hash(sheets.size());
     for (auto const& sheet : sheets)
@@ -191,7 +236,7 @@ static u32 hash_sheet_set(Vector<GC::Ref<CSSStyleSheet>> const& sheets)
     return hash;
 }
 
-NonnullRefPtr<StyleCache> SheetSetStyleCacheRegistry::ensure_style_cache_for_sheet_set(Vector<GC::Ref<CSSStyleSheet>> const& sheets)
+NonnullRefPtr<StyleCache> SheetSetStyleCacheRegistry::ensure_style_cache_for_sheet_set(Vector<NonnullRefPtr<StyleSheetState>> const& sheets)
 {
     auto hash = hash_sheet_set(sheets);
     if (auto entries = m_entries_by_hash.get(hash); entries.has_value()) {
@@ -231,7 +276,6 @@ void SheetSetStyleCacheRegistry::visit_edges(GC::Cell::Visitor& visitor)
     for (auto& [hash, entries] : m_entries_by_hash) {
         for (auto& entry : entries) {
             visitor.visit(entry.sheets);
-            entry.style_cache->visit_edges(visitor);
         }
     }
 }
@@ -241,10 +285,12 @@ StyleCache& StyleScope::ensure_style_cache()
     if (m_style_cache)
         return *m_style_cache;
 
-    if (auto* shadow_root = as_if<DOM::ShadowRoot>(*m_node); shadow_root && !document().page().user_style().has_value()) {
-        Vector<GC::Ref<CSSStyleSheet>> sheets;
+    // NB: A quirks-mode scope folds id and class name case into its bucket keys, and neither shared cache
+    //     below keys on that, so such a scope keeps its own cache.
+    if (auto* shadow_root = as_if<DOM::ShadowRoot>(*m_node); shadow_root && !document().page().user_style().has_value() && !document().in_quirks_mode()) {
+        Vector<NonnullRefPtr<StyleSheetState>> sheets;
         bool all_sheets_are_constructed = true;
-        shadow_root->for_each_active_css_style_sheet([&](CSSStyleSheet& style_sheet) {
+        shadow_root->for_each_active_css_style_sheet([&](StyleSheetState& style_sheet) {
             if (!style_sheet.constructed())
                 all_sheets_are_constructed = false;
             else
@@ -278,17 +324,21 @@ void StyleScope::build_rule_cache()
 {
     auto& style_cache = ensure_style_cache();
 
-    // OPTIMIZATION: If ensure_style_cache() returned the shared single-constructed-sheet cache and another
-    //               scope has already populated it, its contents are valid for this scope as well: the cache
-    //               only depends on the sheet and document-wide state, and any change to either invalidates
-    //               the shared cache itself (see CSSStyleSheet::invalidate_shared_style_cache()).
-    if (style_cache.rule_cache)
-        return;
+    if (!style_cache.rule_cache) {
+        ++document().style_invalidation_counters().scope_rule_cache_builds;
 
-    ++document().style_invalidation_counters().scope_rule_cache_builds;
+        style_cache.rule_cache = make<StyleRuleCache>();
+        ++style_cache.rule_cache_generation;
+        populate_rule_cache(*style_cache.rule_cache);
+    }
 
-    style_cache.rule_cache = make<StyleRuleCache>();
-    populate_rule_cache(*style_cache.rule_cache);
+    // A constructed-sheet cache can be shared by several shadow scopes. Its keyframes and other
+    // reference data are reusable, but each scope owns a distinct engine layer order and publishes
+    // this cache generation into that slot once.
+    if (m_published_layer_order_generation != style_cache.rule_cache_generation) {
+        publish_cascade_layer_order();
+        m_published_layer_order_generation = style_cache.rule_cache_generation;
+    }
 }
 
 void StyleScope::populate_rule_cache(StyleRuleCache& rule_cache)
@@ -301,53 +351,21 @@ void StyleScope::populate_rule_cache(StyleRuleCache& rule_cache)
     // them is built. Without this the cache is built against whatever state some other document
     // happened to leave behind, and `noscript` keeps the UA sheet's `display: none` only by accident.
     for (auto origin : { CascadeOrigin::UserAgent, CascadeOrigin::User }) {
-        for_each_stylesheet(origin, [&](CSSStyleSheet& sheet) {
+        for_each_stylesheet(origin, [&](StyleSheetState& sheet) {
             sheet.evaluate_media_queries(document());
         });
     }
-
-    build_qualified_layer_names_cache(rule_cache);
-
-    rule_cache.pseudo_class_rule_cache[to_underlying(PseudoClass::Hover)] = make<RuleCache>();
-    rule_cache.pseudo_class_rule_cache[to_underlying(PseudoClass::Active)] = make<RuleCache>();
-    rule_cache.pseudo_class_rule_cache[to_underlying(PseudoClass::Focus)] = make<RuleCache>();
-    rule_cache.pseudo_class_rule_cache[to_underlying(PseudoClass::FocusWithin)] = make<RuleCache>();
-    rule_cache.pseudo_class_rule_cache[to_underlying(PseudoClass::FocusVisible)] = make<RuleCache>();
-    rule_cache.pseudo_class_rule_cache[to_underlying(PseudoClass::Has)] = make<RuleCache>();
-    rule_cache.pseudo_class_rule_cache[to_underlying(PseudoClass::Target)] = make<RuleCache>();
 
     make_rule_cache_for_cascade_origin(CascadeOrigin::Author, rule_cache);
     make_rule_cache_for_cascade_origin(CascadeOrigin::User, rule_cache);
     make_rule_cache_for_cascade_origin(CascadeOrigin::UserAgent, rule_cache);
 }
 
-void StyleScope::build_style_invalidation_data()
-{
-    auto& style_cache = ensure_style_cache();
-
-    // OPTIMIZATION: Same as in build_rule_cache(): a shared cache populated by another scope using the
-    //               same single constructed sheet is valid for this scope as well.
-    if (style_cache.style_invalidation_data)
-        return;
-
-    style_cache.style_invalidation_data = make<StyleInvalidationData>();
-    populate_style_invalidation_data(*style_cache.style_invalidation_data);
-    style_cache.style_invalidation_data->did_finish_building();
-}
-
-void StyleScope::populate_style_invalidation_data(StyleInvalidationData& style_invalidation_data)
-{
-    build_user_style_sheet_if_needed();
-
-    build_style_invalidation_data_for_cascade_origin(CascadeOrigin::Author, style_invalidation_data);
-    build_style_invalidation_data_for_cascade_origin(CascadeOrigin::User, style_invalidation_data);
-    build_style_invalidation_data_for_cascade_origin(CascadeOrigin::UserAgent, style_invalidation_data);
-}
-
 void StyleScope::invalidate_style_cache()
 {
     invalidate_counter_style_cache();
     m_style_cache = nullptr;
+    m_published_layer_order_generation = 0;
     // The registered custom properties cache is built from the document's active stylesheets, so it only needs a
     // rebuild when the document scope's rule set changes.
     if (m_node->is_document())
@@ -382,21 +400,14 @@ void StyleScope::build_user_style_sheet_if_needed()
         source.append(content_blocker_style_source.utf16_view());
     }
 
-    m_user_style_sheet = GC::make_root(parse_css_stylesheet(CSS::Parser::ParsingParams(document()), source.view()));
+    m_user_style_sheet = parse_css_stylesheet(CSS::Parser::ParsingParams(document()), source.view());
 }
 
 void StyleScope::build_rule_cache_if_needed() const
 {
-    if (has_valid_rule_cache())
+    if (has_valid_rule_cache() && m_published_layer_order_generation == m_style_cache->rule_cache_generation)
         return;
     const_cast<StyleScope&>(*this).build_rule_cache();
-}
-
-void StyleScope::build_style_invalidation_data_if_needed() const
-{
-    if (has_valid_style_invalidation_data())
-        return;
-    const_cast<StyleScope&>(*this).build_style_invalidation_data();
 }
 
 StyleRuleCache const& StyleScope::rule_cache() const
@@ -405,55 +416,49 @@ StyleRuleCache const& StyleScope::rule_cache() const
     return *m_style_cache->rule_cache;
 }
 
-StyleInvalidationData const& StyleScope::style_invalidation_data() const
+static StyleSheetState& default_stylesheet()
 {
-    build_style_invalidation_data_if_needed();
-    return *m_style_cache->style_invalidation_data;
-}
-
-static CSSStyleSheet& default_stylesheet()
-{
-    static auto& sheet = *new GC::Root<CSSStyleSheet>;
-    if (!sheet.cell()) {
+    static auto& sheet = *new RefPtr<StyleSheetState>;
+    if (!sheet) {
         extern String const& default_stylesheet_source;
-        sheet = GC::make_root(parse_css_stylesheet(CSS::Parser::ParsingParams(Parser::IsUAStyleSheet::Yes), default_stylesheet_source));
+        sheet = parse_css_stylesheet(CSS::Parser::ParsingParams(Parser::IsUAStyleSheet::Yes), default_stylesheet_source);
     }
     return *sheet;
 }
 
-static CSSStyleSheet& quirks_mode_stylesheet()
+static StyleSheetState& quirks_mode_stylesheet()
 {
-    static auto& sheet = *new GC::Root<CSSStyleSheet>;
-    if (!sheet.cell()) {
+    static auto& sheet = *new RefPtr<StyleSheetState>;
+    if (!sheet) {
         extern String const& quirks_mode_stylesheet_source;
-        sheet = GC::make_root(parse_css_stylesheet(CSS::Parser::ParsingParams(Parser::IsUAStyleSheet::Yes), quirks_mode_stylesheet_source));
+        sheet = parse_css_stylesheet(CSS::Parser::ParsingParams(Parser::IsUAStyleSheet::Yes), quirks_mode_stylesheet_source);
     }
     return *sheet;
 }
 
-static CSSStyleSheet& mathml_stylesheet()
+static StyleSheetState& mathml_stylesheet()
 {
-    static auto& sheet = *new GC::Root<CSSStyleSheet>;
-    if (!sheet.cell()) {
+    static auto& sheet = *new RefPtr<StyleSheetState>;
+    if (!sheet) {
         extern String const& mathml_stylesheet_source;
-        sheet = GC::make_root(parse_css_stylesheet(CSS::Parser::ParsingParams(Parser::IsUAStyleSheet::Yes), mathml_stylesheet_source));
+        sheet = parse_css_stylesheet(CSS::Parser::ParsingParams(Parser::IsUAStyleSheet::Yes), mathml_stylesheet_source);
     }
     return *sheet;
 }
 
-static CSSStyleSheet& svg_stylesheet()
+static StyleSheetState& svg_stylesheet()
 {
-    static auto& sheet = *new GC::Root<CSSStyleSheet>;
-    if (!sheet.cell()) {
+    static auto& sheet = *new RefPtr<StyleSheetState>;
+    if (!sheet) {
         extern String const& svg_stylesheet_source;
-        sheet = GC::make_root(parse_css_stylesheet(CSS::Parser::ParsingParams(Parser::IsUAStyleSheet::Yes), svg_stylesheet_source));
+        sheet = parse_css_stylesheet(CSS::Parser::ParsingParams(Parser::IsUAStyleSheet::Yes), svg_stylesheet_source);
     }
     return *sheet;
 }
 
-void StyleScope::for_each_user_agent_stylesheet(bool include_quirks_mode_stylesheet, Function<void(CSS::CSSStyleSheet&, StyleSheetIdentifier const&)> const& callback)
+void StyleScope::for_each_user_agent_stylesheet(bool include_quirks_mode_stylesheet, bool include_mathml_and_svg_stylesheets, Function<void(CSS::StyleSheetState&, StyleSheetIdentifier const&)> const& callback)
 {
-    auto callback_with_identifier = [&](CSSStyleSheet& sheet, Utf16String url) {
+    auto callback_with_identifier = [&](StyleSheetState& sheet, Utf16String url) {
         StyleSheetIdentifier identifier {
             .type = StyleSheetIdentifier::Type::UserAgent,
             .url = move(url),
@@ -464,153 +469,29 @@ void StyleScope::for_each_user_agent_stylesheet(bool include_quirks_mode_stylesh
     callback_with_identifier(default_stylesheet(), "CSS/Default.css"_utf16);
     if (include_quirks_mode_stylesheet)
         callback_with_identifier(quirks_mode_stylesheet(), "CSS/QuirksMode.css"_utf16);
-    callback_with_identifier(mathml_stylesheet(), "MathML/Default.css"_utf16);
-    callback_with_identifier(svg_stylesheet(), "SVG/Default.css"_utf16);
+    // Both sheets declare a default namespace, so every selector in them - the universal one
+    // included - is restricted to the namespace it belongs to. Neither decides anything for a
+    // document with no element in it, and every element of every page was evaluating them.
+    if (include_mathml_and_svg_stylesheets) {
+        callback_with_identifier(mathml_stylesheet(), "MathML/Default.css"_utf16);
+        callback_with_identifier(svg_stylesheet(), "SVG/Default.css"_utf16);
+    }
 }
 
-Optional<StyleSheetIdentifier> StyleScope::user_agent_style_sheet_identifier(CSS::CSSStyleSheet const& style_sheet)
+Optional<StyleSheetIdentifier> StyleScope::user_agent_style_sheet_identifier(CSS::StyleSheetState const& style_sheet)
 {
     Optional<StyleSheetIdentifier> identifier;
-    for_each_user_agent_stylesheet(true, [&](auto& user_agent_style_sheet, auto const& user_agent_style_sheet_identifier) {
+    for_each_user_agent_stylesheet(true, true, [&](auto& user_agent_style_sheet, auto const& user_agent_style_sheet_identifier) {
         if (&style_sheet == &user_agent_style_sheet)
             identifier = user_agent_style_sheet_identifier;
     });
     return identifier;
 }
 
-static GC::Ptr<CSSContainerRule const> current_container_rule(Vector<GC::Ptr<CSSContainerRule const>> const& container_rule_stack)
-{
-    if (container_rule_stack.is_empty())
-        return nullptr;
-    return container_rule_stack.last();
-}
-
-template<typename Callback>
-static void for_each_scope_boundary_selector(CSSRule const& scope_rule, Callback callback)
-{
-    auto collect_selector_list = [&](Optional<SelectorList> const& selector_list) {
-        if (!selector_list.has_value())
-            return;
-        for (auto const& selector : *selector_list) {
-            callback(selector);
-        }
-    };
-
-    for (auto const* current_scope_rule = &scope_rule; current_scope_rule; current_scope_rule = nearest_ancestor_scope_rule_for_matching(*current_scope_rule).ptr()) {
-        collect_selector_list(scope_start_selectors_for_matching(*current_scope_rule));
-        collect_selector_list(scope_end_selectors_for_matching(*current_scope_rule));
-    }
-}
-
-static void collect_scope_boundary_selector_dependencies(CSSRule const& scope_rule, StyleInvalidationData& style_invalidation_data)
-{
-    for_each_scope_boundary_selector(scope_rule, [&](auto const& selector) {
-        style_invalidation_data.build_invalidation_sets_for_scope_boundary_selector(selector);
-    });
-}
-
-static void collect_scope_boundary_selector_insights(CSSRule const& scope_rule, SelectorInsights& selector_insights)
-{
-    for_each_scope_boundary_selector(scope_rule, [&](auto const& selector) {
-        StyleScope::collect_selector_insights(selector, selector_insights);
-    });
-}
-
-using StyleCacheStyleRuleCallback = Function<void(CSSRule const&, CSSStyleSheet const&, GC::Ptr<CSSContainerRule const>, GC::Ptr<CSSRule const>)>;
-
-static void for_each_style_producing_rule_for_style_cache(
-    CSSRuleList const& rule_list,
-    CSSStyleSheet const& current_style_sheet,
-    Vector<GC::Ptr<CSSContainerRule const>>& container_rule_stack,
-    GC::Ptr<CSSRule const> scope_rule,
-    StyleCacheStyleRuleCallback const& callback);
-
-static void for_each_style_producing_rule_for_style_cache(
-    CSSStyleSheet const& sheet,
-    Vector<GC::Ptr<CSSContainerRule const>>& container_rule_stack,
-    GC::Ptr<CSSRule const> scope_rule,
-    StyleCacheStyleRuleCallback const& callback)
-{
-    if (!sheet.media()->matches())
-        return;
-    for_each_style_producing_rule_for_style_cache(sheet.rules(), sheet, container_rule_stack, scope_rule, callback);
-}
-
-static void for_each_style_producing_rule_for_style_cache(
-    CSSRuleList const& rule_list,
-    CSSStyleSheet const& current_style_sheet,
-    Vector<GC::Ptr<CSSContainerRule const>>& container_rule_stack,
-    GC::Ptr<CSSRule const> scope_rule,
-    StyleCacheStyleRuleCallback const& callback)
-{
-    for (auto const& rule : rule_list) {
-        switch (rule->type()) {
-        case CSSRule::Type::Import: {
-            auto const& import_rule = as<CSSImportRule>(*rule);
-            if (import_rule.loaded_style_sheet()) {
-                GC::Ptr<CSSRule const> import_scope_rule = scope_rule;
-                if (import_rule.has_scope())
-                    import_scope_rule = &import_rule;
-                for_each_style_producing_rule_for_style_cache(*import_rule.loaded_style_sheet(), container_rule_stack, import_scope_rule, callback);
-            }
-            break;
-        }
-
-        case CSSRule::Type::Container: {
-            auto const& container_rule = as<CSSContainerRule>(*rule);
-            // @container conditions are element-dependent, so keep their style rules and evaluate the container later.
-            container_rule_stack.append(&container_rule);
-            for_each_style_producing_rule_for_style_cache(container_rule.css_rules(), current_style_sheet, container_rule_stack, scope_rule, callback);
-            container_rule_stack.take_last();
-            break;
-        }
-
-        case CSSRule::Type::Scope: {
-            auto const& nested_scope_rule = as<CSSScopeRule>(*rule);
-            for_each_style_producing_rule_for_style_cache(nested_scope_rule.css_rules(), current_style_sheet, container_rule_stack, &nested_scope_rule, callback);
-            break;
-        }
-
-        case CSSRule::Type::Media:
-        case CSSRule::Type::Supports:
-            if (as<CSSConditionRule>(*rule).condition_matches())
-                for_each_style_producing_rule_for_style_cache(as<CSSGroupingRule>(*rule).css_rules(), current_style_sheet, container_rule_stack, scope_rule, callback);
-            break;
-
-        case CSSRule::Type::LayerBlock:
-        case CSSRule::Type::Page:
-            for_each_style_producing_rule_for_style_cache(as<CSSGroupingRule>(*rule).css_rules(), current_style_sheet, container_rule_stack, scope_rule, callback);
-            break;
-
-        case CSSRule::Type::Style:
-            callback(*rule, current_style_sheet, current_container_rule(container_rule_stack), scope_rule);
-            for_each_style_producing_rule_for_style_cache(as<CSSGroupingRule>(*rule).css_rules(), current_style_sheet, container_rule_stack, scope_rule, callback);
-            break;
-
-        case CSSRule::Type::NestedDeclarations:
-            callback(*rule, current_style_sheet, current_container_rule(container_rule_stack), scope_rule);
-            break;
-
-        case CSSRule::Type::CounterStyle:
-        case CSSRule::Type::FontFace:
-        case CSSRule::Type::FontFeatureValues:
-        case CSSRule::Type::Function:
-        case CSSRule::Type::FunctionDeclarations:
-        case CSSRule::Type::Keyframe:
-        case CSSRule::Type::Keyframes:
-        case CSSRule::Type::LayerStatement:
-        case CSSRule::Type::Margin:
-        case CSSRule::Type::Namespace:
-        case CSSRule::Type::Property:
-            break;
-        }
-    }
-}
-
-void StyleScope::for_each_stylesheet(CascadeOrigin cascade_origin, Function<void(CSS::CSSStyleSheet&)> const& callback) const
+void StyleScope::for_each_stylesheet(CascadeOrigin cascade_origin, Function<void(CSS::StyleSheetState&)> const& callback) const
 {
     if (cascade_origin == CascadeOrigin::UserAgent) {
-        for_each_user_agent_stylesheet(document().in_quirks_mode(), [&](auto& sheet, auto const&) {
+        for_each_user_agent_stylesheet(document().in_quirks_mode(), document().needs_mathml_and_svg_user_agent_style_sheets(), [&](auto& sheet, auto const&) {
             callback(sheet);
         });
     }
@@ -627,144 +508,99 @@ void StyleScope::for_each_stylesheet(CascadeOrigin cascade_origin, Function<void
 
 void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin, StyleRuleCache& rule_cache)
 {
-    GC::ConservativeVector<MatchingRule> matching_rules;
-    size_t style_sheet_index = 0;
     for_each_stylesheet(cascade_origin, [&](auto& sheet) {
-        auto& rule_caches = [&] -> RuleCaches& {
-            switch (cascade_origin) {
-            case CascadeOrigin::Author:
-                return rule_cache.author_rule_cache;
-            case CascadeOrigin::User:
-                return rule_cache.user_rule_cache;
-            case CascadeOrigin::UserAgent:
-                return rule_cache.user_agent_rule_cache;
-            default:
-                VERIFY_NOT_REACHED();
-            }
-        }();
-
-        size_t rule_index = 0;
-        Vector<GC::Ptr<CSSContainerRule const>> container_rule_stack;
-        for_each_style_producing_rule_for_style_cache(sheet, container_rule_stack, nullptr, [&](auto const& rule, auto const& current_style_sheet, auto container_rule, auto scope_rule) {
-            if (container_rule && container_rule->contains_size_feature())
+        sheet.for_each_effective_rule_data(TraversalOrder::Preorder, [&](RustRuleView const& rule, Utf16View layer_prefix) {
+            if (rule.type() == RustRule::Type::Container && Parser::ValueParserFFI::rust_container_conditions_contains_size_feature(rule.container()))
                 rule_cache.has_size_container_queries = true;
-
-            SelectorList const& absolutized_selectors = [&]() -> SelectorList const& {
-                if (rule.type() == CSSRule::Type::Style)
-                    return static_cast<CSSStyleRule const&>(rule).absolutized_selectors();
-                if (rule.type() == CSSRule::Type::NestedDeclarations)
-                    return static_cast<CSSNestedDeclarations const&>(rule).absolutized_selectors();
-                VERIFY_NOT_REACHED();
-            }();
-
-            if (scope_rule)
-                collect_scope_boundary_selector_insights(*scope_rule, rule_cache.selector_insights);
-
-            for (size_t selector_index = 0; selector_index < absolutized_selectors.size(); ++selector_index) {
-                auto const& selector = *absolutized_selectors[selector_index];
-                MatchingRule matching_rule {
-                    .rule = &rule,
-                    .sheet = current_style_sheet,
-                    .container_rule = container_rule,
-                    .scope_rule = scope_rule,
-                    .element_namespace_filter = element_namespace_filter_for_rule(selector, current_style_sheet),
-                    .selector = selector,
-                    .selector_index = selector_index,
-                    .style_sheet_index = style_sheet_index,
-                    .rule_index = rule_index,
-                    .specificity = selector.specificity(),
-                    .cascade_origin = cascade_origin,
-                    .contains_pseudo_element = selector.target_pseudo_element().has_value(),
-                    .slotted = selector.is_slotted(),
-                    .contains_part_pseudo_element = selector.has_part_pseudo_element(),
-                };
-
-                auto const& qualified_layer_name = matching_rule.qualified_layer_name();
-                auto& matching_rule_cache = qualified_layer_name.is_empty() ? rule_caches.main : *rule_caches.by_layer.ensure(qualified_layer_name, [] { return make<RuleCache>(); });
-
-                collect_selector_insights(selector, rule_cache.selector_insights);
-
-                bool contains_root_pseudo_class = false;
-                for (auto const& simple_selector : selector.compound_selectors().last().simple_selectors) {
-                    if (!contains_root_pseudo_class) {
-                        if (simple_selector.type == CSS::Selector::SimpleSelector::Type::PseudoClass
-                            && simple_selector.pseudo_class().type == CSS::PseudoClass::Root) {
-                            contains_root_pseudo_class = true;
-                        }
-                    }
-                }
-
-                for (size_t i = 0; i < to_underlying(PseudoClass::__Count); ++i) {
-                    auto pseudo_class = static_cast<PseudoClass>(i);
-                    // If we're not building a rule cache for this pseudo class, just ignore it.
-                    if (!rule_cache.pseudo_class_rule_cache[i])
-                        continue;
-                    if (selector.contains_pseudo_class(pseudo_class)) {
-                        // For pseudo class rule caches we intentionally pass no pseudo-element, because we don't want to bucket pseudo class rules by pseudo-element type.
-                        rule_cache.pseudo_class_rule_cache[i]->add_rule(matching_rule, {}, contains_root_pseudo_class, SubjectPseudoClassBuckets::No, AncestorHashBuckets::No);
-                    }
-                }
-
-                matching_rule_cache.add_rule(matching_rule, selector.target_pseudo_element(), contains_root_pseudo_class, SubjectPseudoClassBuckets::Yes, AncestorHashBuckets::Yes);
+            if (rule.type() == RustRule::Type::Function) {
+                auto function = rule.compile_function();
+                auto name = Parser::ValueParserFFI::rust_function_signature_view(function.signature()).name;
+                rule_cache.function_rules_by_name.ensure(Utf16FlyString::from_utf16({ reinterpret_cast<char16_t const*>(name.utf16), name.length })).append({ move(function), Utf16FlyString::from_utf16(layer_prefix), cascade_origin });
             }
-            ++rule_index;
-        });
+            if (rule.type() != RustRule::Type::Keyframes)
+                return;
 
-        // Loosely based on https://drafts.csswg.org/css-animations-2/#keyframe-processing
-        sheet.for_each_effective_keyframes_at_rule([&](CSSKeyframesRule const& rule) {
+            // Loosely based on https://drafts.csswg.org/css-animations-2/#keyframe-processing
+            auto name = rule.name();
             auto keyframe_set = adopt_ref(*new Animations::KeyframeEffect::KeyFrameSet);
-            HashTable<PropertyID> animated_properties;
+            auto base_url = sheet.style_resource_base_url();
+            keyframe_set->style_sheet_resource_context = {
+                .base_url = base_url.has_value() ? base_url->to_string() : String {},
+                .origin_clean = sheet.is_origin_clean(),
+            };
+            HashTable<PropertyNameAndID> animated_properties;
 
             // Forwards pass, resolve all the user-specified keyframe properties.
-            for (auto const& keyframe_rule : *rule.css_rules()) {
-                auto const& keyframe = as<CSSKeyframeRule>(*keyframe_rule);
+            Function<void(ReadonlySpan<double>, RustDeclarationBlockSnapshot const&)> append_keyframe = [&](ReadonlySpan<double> keys, RustDeclarationBlockSnapshot const& keyframe_style) {
                 Animations::KeyframeEffect::KeyFrameSet::ResolvedKeyFrame resolved_keyframe;
 
-                auto const& keyframe_style = *keyframe.style();
-                for (auto const& it : keyframe_style.properties()) {
-                    if (it.property_id == PropertyID::AnimationTimingFunction) {
+                auto append_property = [&](Parser::ValueParserFFI::FfiDeclaredProperty const& declaration) {
+                    auto* value = static_cast<StyleValueFFI::StyleValueData const*>(declaration.value);
+                    if (declaration.name.length != 0) {
+                        auto name = Utf16FlyString::from_utf16({ reinterpret_cast<char16_t const*>(declaration.name.utf16), declaration.name.length });
+                        auto property = PropertyNameAndID::from_name(name);
+                        if (!property.has_value())
+                            return;
+                        animated_properties.set(*property);
+                        resolved_keyframe.properties.set(*property, RustStyleValueHandle::retained(value));
+                        return;
+                    }
+                    auto property_id = static_cast<PropertyID>(declaration.property_id);
+                    if (property_id == PropertyID::AnimationTimingFunction) {
                         // animation-timing-function is a list property, but inside @keyframes only
                         // a single value is meaningful.
-                        NonnullRefPtr<StyleValue const> easing_value = it.value;
-                        if (easing_value->is_value_list()) {
-                            auto const& list = easing_value->as_value_list();
-                            if (list.size() > 0)
-                                easing_value = list.value_at(0, false);
-                            else
-                                continue;
+                        if (value->tag == StyleValueFFI::StyleValueData::Tag::ValueList) {
+                            auto const& list = value->value_list.values;
+                            if (list.length == 0)
+                                return;
+                            value = static_cast<StyleValueFFI::StyleValueData const*>(list.pointer[0].pointer);
                         }
-                        if (easing_value->is_easing() || easing_value->is_keyword())
+                        if (value->tag == StyleValueFFI::StyleValueData::Tag::Easing || value->tag == StyleValueFFI::StyleValueData::Tag::Keyword) {
+                            auto easing_value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(value));
                             resolved_keyframe.easing = EasingFunction::from_style_value(*easing_value);
-                        else
-                            resolved_keyframe.easing = easing_value;
-                        continue;
+                        } else {
+                            resolved_keyframe.easing = RustStyleValueHandle::retained(value);
+                        }
+                        return;
                     }
-                    if (it.property_id == PropertyID::AnimationComposition) {
-                        auto composition_str = it.value->to_string(SerializationMode::Normal);
+                    if (property_id == PropertyID::AnimationComposition) {
                         AnimationComposition composition = AnimationComposition::Replace;
-                        if (composition_str == "add"sv)
-                            composition = AnimationComposition::Add;
-                        else if (composition_str == "accumulate"sv)
-                            composition = AnimationComposition::Accumulate;
+                        if (value->tag == StyleValueFFI::StyleValueData::Tag::ValueList && value->value_list.values.length == 1)
+                            value = static_cast<StyleValueFFI::StyleValueData const*>(value->value_list.values.pointer[0].pointer);
+                        if (value->tag == StyleValueFFI::StyleValueData::Tag::Keyword) {
+                            if (static_cast<Keyword>(value->keyword.keyword) == Keyword::Add)
+                                composition = AnimationComposition::Add;
+                            else if (static_cast<Keyword>(value->keyword.keyword) == Keyword::Accumulate)
+                                composition = AnimationComposition::Accumulate;
+                        }
                         resolved_keyframe.composite = Animations::css_animation_composition_to_composite_operation_or_auto(composition);
-                        continue;
+                        return;
                     }
-                    if (!is_animatable_property(it.property_id))
-                        continue;
+                    if (!is_animatable_property(property_id))
+                        return;
 
                     // Unresolved properties will be resolved in collect_animation_into()
-                    StyleComputer::for_each_property_expanding_shorthands(it.property_id, it.value, [&](PropertyID shorthand_id, StyleValue const& shorthand_value) {
-                        animated_properties.set(shorthand_id);
-                        resolved_keyframe.properties.set(shorthand_id, NonnullRefPtr<StyleValue const> { shorthand_value });
-                    });
-                }
+                    auto expansion = ComputedValuesFFI::rust_expand_property_shorthands(
+                        to_underlying(property_id), value);
+                    for (size_t i = 0; i < expansion.count; ++i) {
+                        auto const& property = expansion.properties[i];
+                        auto longhand_property = PropertyNameAndID::from_id(static_cast<PropertyID>(property.property_id));
+                        animated_properties.set(longhand_property);
+                        resolved_keyframe.properties.set(longhand_property,
+                            RustStyleValueHandle::retained(static_cast<StyleValueFFI::StyleValueData const*>(property.data)));
+                    }
+                    ComputedValuesFFI::rust_shorthand_expansion_destroy(expansion.storage);
+                };
+                Parser::ValueParserFFI::rust_declaration_data_visit(keyframe_style.data(), &append_property, [](void* context, Parser::ValueParserFFI::FfiDeclaredProperty const* property) {
+                    (*static_cast<decltype(append_property)*>(context))(*property);
+                });
 
-                for (auto const& key : keyframe.keys()) {
-                    auto resolved_key = static_cast<u64>(key.value() * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor);
+                for (auto key : keys) {
+                    auto resolved_key = static_cast<u64>(key * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor);
 
                     if (auto* existing_keyframe = keyframe_set->keyframes_by_key.find(resolved_key)) {
-                        for (auto& [property_id, value] : resolved_keyframe.properties)
-                            existing_keyframe->properties.set(property_id, value);
+                        for (auto& [property, value] : resolved_keyframe.properties)
+                            existing_keyframe->properties.set(property, value);
                         if (resolved_keyframe.composite != Bindings::CompositeOperationOrAuto::Auto)
                             existing_keyframe->composite = resolved_keyframe.composite;
                         if (!resolved_keyframe.easing.has<Empty>())
@@ -773,175 +609,44 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
                         keyframe_set->keyframes_by_key.insert(resolved_key, resolved_keyframe);
                     }
                 }
-            }
+            };
+            rule.for_each_keyframe(append_keyframe);
 
             Animations::KeyframeEffect::generate_initial_and_final_frames(keyframe_set, animated_properties);
 
             if constexpr (LIBWEB_CSS_DEBUG) {
-                dbgln("Resolved keyframe set '{}' into {} keyframes:", rule.name(), keyframe_set->keyframes_by_key.size());
+                dbgln("Resolved keyframe set '{}' into {} keyframes:", name, keyframe_set->keyframes_by_key.size());
                 for (auto it = keyframe_set->keyframes_by_key.begin(); it != keyframe_set->keyframes_by_key.end(); ++it)
                     dbgln("    - keyframe {}: {} properties", it.key(), it->properties.size());
             }
 
-            rule_caches.main.rules_by_animation_keyframes.set(rule.name(), move(keyframe_set));
-        });
-        ++style_sheet_index;
-    });
-}
-
-void StyleScope::build_style_invalidation_data_for_cascade_origin(CascadeOrigin cascade_origin, StyleInvalidationData& style_invalidation_data)
-{
-    for_each_stylesheet(cascade_origin, [&](auto& sheet) {
-        Vector<GC::Ptr<CSSContainerRule const>> container_rule_stack;
-        for_each_style_producing_rule_for_style_cache(sheet, container_rule_stack, nullptr, [&](auto const& rule, auto const&, auto, auto scope_rule) {
-            SelectorList const& absolutized_selectors = [&]() -> SelectorList const& {
-                if (rule.type() == CSSRule::Type::Style)
-                    return static_cast<CSSStyleRule const&>(rule).absolutized_selectors();
-                if (rule.type() == CSSRule::Type::NestedDeclarations)
-                    return static_cast<CSSNestedDeclarations const&>(rule).absolutized_selectors();
-                VERIFY_NOT_REACHED();
-            }();
-
-            for (auto const& selector : absolutized_selectors)
-                style_invalidation_data.build_invalidation_sets_for_selector(selector);
-
-            if (scope_rule)
-                collect_scope_boundary_selector_dependencies(*scope_rule, style_invalidation_data);
+            rule_cache.rules_by_animation_keyframes.set(Utf16FlyString { name }, move(keyframe_set));
         });
     });
 }
 
-void StyleScope::collect_selector_insights(Selector const& selector, SelectorInsights& insights)
+void StyleScope::publish_cascade_layer_order(StyleSheetState* pending_attachment)
 {
-    for (auto const& compound_selector : selector.compound_selectors()) {
-        for (auto const& simple_selector : compound_selector.simple_selectors) {
-            if (simple_selector.type == Selector::SimpleSelector::Type::PseudoClass) {
-                insights.pseudo_classes.set(simple_selector.pseudo_class().type, true);
-                if (simple_selector.pseudo_class().type == PseudoClass::LocalLink)
-                    insights.has_local_link_selectors = true;
-                if (simple_selector.pseudo_class().type == PseudoClass::Has) {
-                    insights.has_has_selectors = true;
-                    for (auto const& argument_selector : simple_selector.pseudo_class().argument_selector_list) {
-                        for (auto const& relative_compound_selector : argument_selector->compound_selectors()) {
-                            if (relative_compound_selector.combinator == Selector::Combinator::NextSibling
-                                || relative_compound_selector.combinator == Selector::Combinator::SubsequentSibling) {
-                                insights.has_has_selectors_with_relative_selector_that_has_sibling_combinator = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                for (auto const& argument_selector : simple_selector.pseudo_class().argument_selector_list) {
-                    collect_selector_insights(*argument_selector, insights);
-                }
-            } else if (simple_selector.type == Selector::SimpleSelector::Type::PseudoElement) {
-                // Pseudo-elements like ::slotted(...) carry a compound selector argument whose contents need the
-                // same insight collection pass.
-                auto const& pseudo_element = simple_selector.pseudo_element();
-                if (pseudo_element.type() == PseudoElement::Slotted)
-                    collect_selector_insights(pseudo_element.compound_selector(), insights);
-            }
-        }
-    }
-}
-
-struct LayerNode {
-    OrderedHashMap<Utf16FlyString, LayerNode> children {};
-};
-
-static Utf16FlyString make_qualified_layer_name(Utf16FlyString const& parent_qualified_name, Utf16FlyString const& name)
-{
-    if (parent_qualified_name.is_empty())
-        return name;
-
-    Utf16StringBuilder builder;
-    builder.append(parent_qualified_name);
-    builder.append_ascii('.');
-    builder.append(name);
-    auto qualified_name = builder.to_string();
-    return Utf16FlyString::from_utf16(qualified_name.utf16_view());
-}
-
-static void flatten_layer_names_tree(Vector<Utf16FlyString>& layer_names, Utf16FlyString const& parent_qualified_name, Utf16FlyString const& name, LayerNode const& node)
-{
-    auto qualified_name = make_qualified_layer_name(parent_qualified_name, name);
-
-    for (auto const& item : node.children)
-        flatten_layer_names_tree(layer_names, qualified_name, item.key, item.value);
-
-    layer_names.append(qualified_name);
-}
-
-void StyleScope::build_qualified_layer_names_cache(StyleRuleCache& rule_cache)
-{
-    LayerNode root;
-
-    auto insert_layer_name = [&](Utf16FlyString const& internal_qualified_name) {
-        auto* node = &root;
-        internal_qualified_name.view()
-            .for_each_split_view(u'.', SplitBehavior::Nothing, [&](Utf16View const& part) {
-                auto local_name = Utf16FlyString::from_utf16(part);
-                node = &node->children.ensure(local_name);
-                return IterationDecision::Continue;
-            });
-    };
-
-    // Walk all style sheets, identifying when we first see a @layer name, and add its qualified name to the list.
-    // TODO: Separate the light and shadow-dom layers.
+    Vector<Parser::ValueParserFFI::NativeStyleSheet const*> sheets;
+    // An adopted sheet is announced before ObservableArray stores it. Include that pending
+    // attachment so its layer order crosses the same transaction boundary as its rules.
     for_each_stylesheet(CascadeOrigin::Author, [&](auto& sheet) {
-        // NOTE: Postorder so that a @layer block is iterated after its children,
-        // because we want those children to occur before it in the list.
-        sheet.for_each_effective_rule(TraversalOrder::Postorder, [&](auto& rule) {
-            switch (rule.type()) {
-            case CSSRule::Type::Import: {
-                auto& import = as<CSSImportRule>(rule);
-                // https://drafts.csswg.org/css-cascade-5/#at-import
-                // The layer is added to the layer order even if the import fails to load the stylesheet, but is
-                // subject to any import conditions (just as if declared by an @layer rule wrapped in the appropriate
-                // conditional group rules).
-                if (auto layer_name = import.internal_qualified_layer_name({}); layer_name.has_value() && import.matches())
-                    insert_layer_name(layer_name.release_value());
-                break;
-            }
-            case CSSRule::Type::LayerBlock: {
-                auto& layer_block = as<CSSLayerBlockRule>(rule);
-                insert_layer_name(layer_block.internal_qualified_name({}));
-                break;
-            }
-            case CSSRule::Type::LayerStatement: {
-                auto& layer_statement = as<CSSLayerStatementRule>(rule);
-                auto qualified_names = layer_statement.internal_qualified_name_list({});
-                for (auto& name : qualified_names)
-                    insert_layer_name(name);
-                break;
-            }
-
-                // Ignore everything else
-            case CSSRule::Type::Style:
-            case CSSRule::Type::Media:
-            case CSSRule::Type::Container:
-            case CSSRule::Type::CounterStyle:
-            case CSSRule::Type::FontFace:
-            case CSSRule::Type::FontFeatureValues:
-            case CSSRule::Type::Function:
-            case CSSRule::Type::FunctionDeclarations:
-            case CSSRule::Type::Keyframes:
-            case CSSRule::Type::Keyframe:
-            case CSSRule::Type::Margin:
-            case CSSRule::Type::Namespace:
-            case CSSRule::Type::NestedDeclarations:
-            case CSSRule::Type::Page:
-            case CSSRule::Type::Property:
-            case CSSRule::Type::Scope:
-            case CSSRule::Type::Supports:
-                break;
-            }
-        });
+        if (&sheet == pending_attachment)
+            pending_attachment = nullptr;
+        sheets.append(sheet.native_sheet().handle());
     });
+    if (pending_attachment && !pending_attachment->disabled() && pending_attachment->native_media_list().matches())
+        sheets.append(pending_attachment->native_sheet().handle());
 
-    // Now, produce a flat list of qualified names to use later
-    rule_cache.qualified_layer_names_in_order.clear();
-    flatten_layer_names_tree(rule_cache.qualified_layer_names_in_order, {}, {}, root);
+    m_has_published_named_layer_order = Parser::ValueParserFFI::rust_style_sheet_publish_layer_order(
+        sheets.data(), sheets.size(), document().style_computer().style_engine().rust_handle(),
+        style_engine_tree_scope().value(), m_has_published_named_layer_order, &document(),
+        [](void* document) { static_cast<DOM::Document*>(document)->flush_deferred_style_change_event(); });
+}
+
+TreeScopeID StyleScope::style_engine_tree_scope() const
+{
+    return style_engine_tree_scope_for(*m_node);
 }
 
 void StyleScope::invalidate_counter_style_cache()
@@ -960,9 +665,31 @@ void StyleScope::build_counter_style_cache()
 {
     m_is_doing_counter_style_cache_update = true;
 
+    // Counter styles can be resolved before any keyframe or function lookup builds the rule cache.
+    // Publish this scope's layer order before comparing definitions from different layers.
+    build_rule_cache_if_needed();
+
+    // A rebuild is triggered by any sheet arriving, and almost every rebuild produces the same
+    // counter styles it produced last time. A style names the one it resolved to by identity, so
+    // minting a fresh object for an unchanged style makes every element's inherited list group new,
+    // which is what a child reads of its parent.
+    auto previously_registered_counter_styles = move(m_registered_counter_styles);
     m_registered_counter_styles.clear_with_capacity();
 
+    auto register_counter_style = [&](Utf16FlyString const& name, NonnullRefPtr<CSS::CounterStyle const> counter_style) {
+        if (auto previous = previously_registered_counter_styles.get(name); previous.has_value() && previous.value()->equals(*counter_style)) {
+            m_registered_counter_styles.set(name, *previous.value());
+            return;
+        }
+        m_registered_counter_styles.set(name, move(counter_style));
+    };
+
     HashMap<Utf16FlyString, CSS::CounterStyleDefinition> counter_style_definitions;
+    struct CounterStylePriority {
+        u8 origin;
+        u32 layer;
+    };
+    HashMap<Utf16FlyString, CounterStylePriority> counter_style_priorities;
 
     auto const define_complex_predefined_counter_styles = [&]() {
         // https://drafts.csswg.org/css-counter-styles-3/#complex-predefined-counters
@@ -1146,23 +873,51 @@ void StyleScope::build_counter_style_cache()
         .length_resolution_context = CSS::Length::ResolutionContext::for_document(document())
     };
 
-    Function<void(CSS::CSSStyleSheet&)> const collect_counter_style_definitions = [&](CSS::CSSStyleSheet const& style_sheet) {
-        style_sheet.for_each_effective_counter_style_at_rule([&](CSS::CSSCounterStyleRule const& counter_style_rule) {
-            // FIXME: Respect CSS layers here
-            if (auto const& definition = CSS::CounterStyleDefinition::from_counter_style_rule(counter_style_rule, computation_context); definition.has_value())
+    auto collect_counter_style_definitions = [&](CSS::CascadeOrigin cascade_origin, CSS::StyleSheetState const& style_sheet) {
+        auto& style_engine = document().style_computer().style_engine();
+        auto const tree_scope = style_engine_tree_scope();
+        auto const origin_priority = [&]() -> u8 {
+            switch (cascade_origin) {
+            case CSS::CascadeOrigin::UserAgent:
+                return 0;
+            case CSS::CascadeOrigin::User:
+                return 1;
+            case CSS::CascadeOrigin::Author:
+                return 2;
+            default:
+                VERIFY_NOT_REACHED();
+            }
+        }();
+        style_sheet.for_each_effective_rule_data(TraversalOrder::Preorder, [&](RustRuleView const& rule, Utf16View layer_prefix) {
+            if (rule.type() != RustRule::Type::CounterStyle)
+                return;
+            auto name = Utf16FlyString { rule.name() };
+            auto qualified_layer_name = Utf16FlyString::from_utf16(layer_prefix);
+            auto const layer = qualified_layer_name.is_empty() ? 0 : style_engine.intern_atom(qualified_layer_name).value();
+            CounterStylePriority priority {
+                .origin = origin_priority,
+                .layer = style_engine.layer_index(tree_scope, layer),
+            };
+            if (auto existing = counter_style_priorities.get(name); existing.has_value()) {
+                if (existing->origin > priority.origin || (existing->origin == priority.origin && existing->layer > priority.layer))
+                    return;
+            }
+            if (auto const& definition = CSS::CounterStyleDefinition::from_descriptors(name.view(), rule.descriptors(), computation_context); definition.has_value()) {
                 counter_style_definitions.set(definition->name(), *definition);
+                counter_style_priorities.set(definition->name(), priority);
+            }
         });
     };
 
     // NB: We should only register predefined counter styles in the document's style scope, this ensures overrides are
     //     correctly inherited by shadow roots.
     if (m_node->is_document()) {
-        for_each_stylesheet(CSS::CascadeOrigin::UserAgent, collect_counter_style_definitions);
+        for_each_stylesheet(CSS::CascadeOrigin::UserAgent, [&](auto& sheet) { collect_counter_style_definitions(CSS::CascadeOrigin::UserAgent, sheet); });
         define_complex_predefined_counter_styles();
-        for_each_stylesheet(CSS::CascadeOrigin::User, collect_counter_style_definitions);
+        for_each_stylesheet(CSS::CascadeOrigin::User, [&](auto& sheet) { collect_counter_style_definitions(CSS::CascadeOrigin::User, sheet); });
     }
 
-    for_each_stylesheet(CSS::CascadeOrigin::Author, collect_counter_style_definitions);
+    for_each_stylesheet(CSS::CascadeOrigin::Author, [&](auto& sheet) { collect_counter_style_definitions(CSS::CascadeOrigin::Author, sheet); });
 
     VERIFY(!m_node->is_document() || counter_style_definitions.contains("decimal"_utf16_fly_string));
 
@@ -1202,7 +957,7 @@ void StyleScope::build_counter_style_cache()
         // NB: We don't need to wait for this counter style's extended counter style to be registered since it doesn't
         //     have one - register it immediately.
         if (definition.algorithm().has<CSS::CounterStyleAlgorithm>()) {
-            m_registered_counter_styles.set(name, CSS::CounterStyle::from_counter_style_definition(definition, *this));
+            register_counter_style(name, CSS::CounterStyle::from_counter_style_definition(definition, *this));
             continue;
         }
 
@@ -1227,66 +982,34 @@ void StyleScope::build_counter_style_cache()
             if (!m_registered_counter_styles.contains(extends_name) && counter_style_definitions.contains(extends_name))
                 continue;
 
-            m_registered_counter_styles.set(definition.name(), CSS::CounterStyle::from_counter_style_definition(definition, *this));
+            register_counter_style(definition.name(), CSS::CounterStyle::from_counter_style_definition(definition, *this));
             extending_counter_styles.remove(i);
             --i;
         }
     }
 
+    bool counter_style_environment_changed = previously_registered_counter_styles.size() != m_registered_counter_styles.size();
+    if (!counter_style_environment_changed) {
+        for (auto const& [name, counter_style] : m_registered_counter_styles) {
+            auto previous = previously_registered_counter_styles.get(name);
+            if (!previous.has_value() || previous.value() != counter_style.ptr()) {
+                counter_style_environment_changed = true;
+                break;
+            }
+        }
+    }
+    if (counter_style_environment_changed)
+        m_counter_style_environment_identity = document().next_counter_style_environment_identity();
+
     m_is_doing_counter_style_cache_update = false;
     m_needs_counter_style_cache_update = false;
 }
 
-bool StyleScope::may_have_has_selectors() const
+u64 StyleScope::counter_style_environment_identity() const
 {
-    if (!has_valid_rule_cache()) {
-        bool may_have_has_selectors = false;
-        for (auto cascade_origin : { CascadeOrigin::Author, CascadeOrigin::User, CascadeOrigin::UserAgent }) {
-            for_each_stylesheet(cascade_origin, [&](auto& style_sheet) {
-                if (style_sheet.selector_insights().has_has_selectors)
-                    may_have_has_selectors = true;
-            });
-        }
-        return may_have_has_selectors;
-    }
-
-    return rule_cache().selector_insights.has_has_selectors;
-}
-
-bool StyleScope::may_have_user_has_selectors() const
-{
-    bool may_have_user_has_selectors = false;
-    for_each_stylesheet(CascadeOrigin::User, [&](auto& style_sheet) {
-        if (style_sheet.selector_insights().has_has_selectors)
-            may_have_user_has_selectors = true;
-    });
-    return may_have_user_has_selectors;
-}
-
-bool StyleScope::may_have_user_pseudo_class_selectors(PseudoClass pseudo_class) const
-{
-    bool may_have_user_pseudo_class_selectors = false;
-    for_each_stylesheet(CascadeOrigin::User, [&](auto& style_sheet) {
-        if (style_sheet.selector_insights().pseudo_classes.get(pseudo_class))
-            may_have_user_pseudo_class_selectors = true;
-    });
-    return may_have_user_pseudo_class_selectors;
-}
-
-bool StyleScope::may_have_has_selectors_with_relative_selector_that_has_sibling_combinator() const
-{
-    if (!has_valid_rule_cache()) {
-        bool may_have_has_selectors_with_relative_selector_that_has_sibling_combinator = false;
-        for (auto cascade_origin : { CascadeOrigin::Author, CascadeOrigin::User, CascadeOrigin::UserAgent }) {
-            for_each_stylesheet(cascade_origin, [&](auto& style_sheet) {
-                if (style_sheet.selector_insights().has_has_selectors_with_relative_selector_that_has_sibling_combinator)
-                    may_have_has_selectors_with_relative_selector_that_has_sibling_combinator = true;
-            });
-        }
-        return may_have_has_selectors_with_relative_selector_that_has_sibling_combinator;
-    }
-
-    return rule_cache().selector_insights.has_has_selectors_with_relative_selector_that_has_sibling_combinator;
+    if (m_needs_counter_style_cache_update && !m_is_doing_counter_style_cache_update)
+        const_cast<StyleScope*>(this)->build_counter_style_cache();
+    return m_counter_style_environment_identity;
 }
 
 DOM::Document& StyleScope::document() const
@@ -1294,166 +1017,13 @@ DOM::Document& StyleScope::document() const
     return m_node->document();
 }
 
-RuleCache const& StyleScope::get_pseudo_class_rule_cache(PseudoClass pseudo_class) const
-{
-    return *rule_cache().pseudo_class_rule_cache[to_underlying(pseudo_class)];
-}
-
-void StyleScope::for_each_active_css_style_sheet(Function<void(CSS::CSSStyleSheet&)> const& callback) const
+void StyleScope::for_each_active_css_style_sheet(Function<void(CSS::StyleSheetState&)> const& callback) const
 {
     if (auto* shadow_root = as_if<DOM::ShadowRoot>(*m_node)) {
         shadow_root->for_each_active_css_style_sheet(callback);
     } else {
         m_node->document().for_each_active_css_style_sheet(callback);
     }
-}
-
-// The document keeps a list of the scopes with pending :has() invalidations so flushes only examine those. The
-// scope must appear in that list exactly once, so only the transition from an empty pending map registers it.
-void StyleScope::did_schedule_pending_has_invalidation(size_t previous_size)
-{
-    if (previous_size == 0)
-        document().register_style_scope_with_pending_has_invalidations(m_node);
-    document().set_needs_invalidation_of_elements_affected_by_has();
-}
-
-void StyleScope::node_was_adopted_from(DOM::Document& old_document)
-{
-    // Pending :has() invalidations registered this scope with its old document. Move the registration to the new
-    // document so the next flush there picks the scope up; the scheduling paths only register a scope when its
-    // pending map goes from empty to non-empty, so they would never re-register it themselves.
-    if (m_pending_has_invalidations.is_empty())
-        return;
-    old_document.unregister_style_scope_with_pending_has_invalidations(m_node);
-    document().register_style_scope_with_pending_has_invalidations(m_node);
-    document().set_needs_invalidation_of_elements_affected_by_has();
-}
-
-void StyleScope::schedule_ancestors_style_invalidation_due_to_presence_of_has(GC::Ref<DOM::Node> node)
-{
-    auto previous_size = m_pending_has_invalidations.size();
-    auto& mutation_features = m_pending_has_invalidations.ensure(node);
-    if (m_pending_has_invalidations.size() == previous_size)
-        return;
-    mutation_features.is_conservative = true;
-    did_schedule_pending_has_invalidation(previous_size);
-}
-
-static void merge_pending_has_invalidation_mutation_features(PendingHasInvalidationMutationFeatures& target, PendingHasInvalidationMutationFeatures const& source)
-{
-    target.is_conservative |= source.is_conservative;
-    target.may_affect_sibling_relationships |= source.may_affect_sibling_relationships;
-    target.may_affect_pseudo_classes |= source.may_affect_pseudo_classes;
-    target.may_affect_interaction_pseudo_classes |= source.may_affect_interaction_pseudo_classes;
-    for (auto const& tag_name : source.tag_names)
-        target.tag_names.set(tag_name);
-    for (auto const& id : source.ids)
-        target.ids.set(id);
-    for (auto const& class_name : source.class_names)
-        target.class_names.set(class_name);
-    for (auto const& attribute_name : source.attribute_names)
-        target.attribute_names.set(attribute_name);
-    for (auto const& pseudo_class : source.pseudo_classes)
-        target.pseudo_classes.set(pseudo_class);
-}
-
-static void collect_pending_has_invalidation_features_from_element(PendingHasInvalidationMutationFeatures& features, DOM::Element const& element)
-{
-    features.tag_names.set(element.local_name());
-    if (element.namespace_uri() != Namespace::HTML)
-        features.tag_names.set(element.lowercased_local_name());
-
-    if (auto id = element.id(); id.has_value())
-        features.ids.set(*id);
-
-    for (auto const& class_name : element.class_names())
-        features.class_names.set(class_name);
-
-    element.for_each_attribute([&](Utf16FlyString const& name, auto const&) {
-        features.attribute_names.set(name);
-        if (element.namespace_uri() != Namespace::HTML)
-            features.attribute_names.set(name.to_ascii_lowercase());
-    });
-}
-
-static PendingHasInvalidationMutationFeatures collect_pending_has_invalidation_mutation_features(DOM::Node& mutation_root, bool includes_descendants, HasMutationKind kind)
-{
-    PendingHasInvalidationMutationFeatures features;
-    features.may_affect_sibling_relationships = includes_descendants;
-    features.may_affect_pseudo_classes = true;
-    features.may_affect_interaction_pseudo_classes = kind != HasMutationKind::Insertion;
-    auto collect_node = [&](DOM::Node& node) {
-        if (node.is_character_data())
-            return;
-        if (auto* element = as_if<DOM::Element>(node))
-            collect_pending_has_invalidation_features_from_element(features, *element);
-    };
-
-    if (!includes_descendants) {
-        collect_node(mutation_root);
-        return features;
-    }
-
-    mutation_root.for_each_in_inclusive_subtree([&](DOM::Node& node) {
-        collect_node(node);
-        return TraversalDecision::Continue;
-    });
-    return features;
-}
-
-static PendingHasInvalidationMutationFeatures collect_pending_has_invalidation_mutation_features(Vector<CSS::InvalidationSet::Property> const& properties)
-{
-    PendingHasInvalidationMutationFeatures features;
-    for (auto const& property : properties) {
-        switch (property.type) {
-        case InvalidationSet::Property::Type::Class:
-            features.class_names.set(property.class_name());
-            break;
-        case InvalidationSet::Property::Type::Id:
-            features.ids.set(property.id());
-            break;
-        case InvalidationSet::Property::Type::TagName:
-            features.tag_names.set(property.name());
-            break;
-        case InvalidationSet::Property::Type::Attribute:
-            features.attribute_names.set(property.name());
-            break;
-        case InvalidationSet::Property::Type::InvalidateSelf:
-        case InvalidationSet::Property::Type::InvalidateWholeSubtree:
-            features.is_conservative = true;
-            break;
-        case InvalidationSet::Property::Type::PseudoClass:
-            features.pseudo_classes.set(property.value.get<PseudoClass>());
-            break;
-        }
-    }
-    return features;
-}
-
-void StyleScope::record_pending_has_invalidation_mutation_features(GC::Ref<DOM::Node> scheduled_node, GC::Ref<DOM::Node> mutation_root, bool includes_descendants, HasMutationKind kind)
-{
-    auto features = collect_pending_has_invalidation_mutation_features(*mutation_root, includes_descendants, kind);
-    auto previous_size = m_pending_has_invalidations.size();
-    auto& existing_features = m_pending_has_invalidations.ensure(scheduled_node);
-    if (m_pending_has_invalidations.size() == previous_size) {
-        merge_pending_has_invalidation_mutation_features(existing_features, features);
-        return;
-    }
-    existing_features = move(features);
-    did_schedule_pending_has_invalidation(previous_size);
-}
-
-void StyleScope::record_pending_has_invalidation_mutation_features(GC::Ref<DOM::Node> scheduled_node, Vector<CSS::InvalidationSet::Property> const& properties)
-{
-    auto features = collect_pending_has_invalidation_mutation_features(properties);
-    auto previous_size = m_pending_has_invalidations.size();
-    auto& existing_features = m_pending_has_invalidations.ensure(scheduled_node);
-    if (m_pending_has_invalidations.size() == previous_size) {
-        merge_pending_has_invalidation_mutation_features(existing_features, features);
-        return;
-    }
-    existing_features = move(features);
-    did_schedule_pending_has_invalidation(previous_size);
 }
 
 RefPtr<CSS::CounterStyle const> StyleScope::get_registered_counter_style(Utf16FlyString const& name) const
@@ -1469,37 +1039,34 @@ Optional<StyleScope::FunctionDefinitionAndScope> StyleScope::get_function_defini
 {
     return dereference_global_tree_scoped_reference<FunctionDefinitionAndScope>([&](StyleScope const& scope) -> Optional<FunctionDefinitionAndScope> {
         auto const get_function_definition_for_cascade_origin = [&](CSS::CascadeOrigin cascade_origin) {
-            CSSFunctionRule const* cascade_origin_result = nullptr;
-
-            Function<void(CSS::CSSStyleSheet&)> const get_function_definition_from_style_sheet = [&](CSS::CSSStyleSheet& style_sheet) {
-                style_sheet.for_each_effective_function_at_rule([&](CSS::CSSFunctionRule const& function_rule) {
-                    if (function_rule.name() != name)
-                        return;
-
-                    auto layer_index = scope.rule_cache().qualified_layer_names_in_order.find_first_index(function_rule.qualified_layer_name());
-
-                    if (!layer_index.has_value())
-                        return;
-
-                    if (!cascade_origin_result) {
-                        cascade_origin_result = &function_rule;
-                        return;
-                    }
-
-                    // NB: We should have a layer index if we have a result since we needed to match it in the first place
-                    auto existing_layer_index = scope.rule_cache().qualified_layer_names_in_order.find_first_index(cascade_origin_result->qualified_layer_name()).value();
-
-                    if (layer_index.value() >= existing_layer_index)
-                        cascade_origin_result = &function_rule;
-                });
+            RustCompiledFunction const* cascade_origin_result = nullptr;
+            u32 existing_layer_index = 0;
+            auto& style_engine = scope.document().style_computer().style_engine();
+            auto const tree_scope = scope.style_engine_tree_scope();
+            auto layer_index_of = [&](Utf16FlyString const& qualified_layer_name) {
+                auto const layer = qualified_layer_name.is_empty() ? 0 : style_engine.intern_atom(qualified_layer_name);
+                return style_engine.layer_index(tree_scope, layer.value());
             };
 
-            scope.for_each_stylesheet(cascade_origin, get_function_definition_from_style_sheet);
+            auto cached_rules = scope.rule_cache().function_rules_by_name.get(name);
+            if (!cached_rules.has_value())
+                return cascade_origin_result;
+
+            for (auto const& cached_rule : *cached_rules) {
+                if (cached_rule.cascade_origin != cascade_origin)
+                    continue;
+
+                auto layer_index = layer_index_of(cached_rule.qualified_layer_name);
+                if (!cascade_origin_result || layer_index >= existing_layer_index) {
+                    cascade_origin_result = &cached_rule.rule;
+                    existing_layer_index = layer_index;
+                }
+            }
 
             return cascade_origin_result;
         };
 
-        CSSFunctionRule const* result = nullptr;
+        RustCompiledFunction const* result = nullptr;
 
         if (scope.m_node->is_document()) {
             if (auto const* user_agent_result = get_function_definition_for_cascade_origin(CSS::CascadeOrigin::UserAgent))
@@ -1517,6 +1084,38 @@ Optional<StyleScope::FunctionDefinitionAndScope> StyleScope::get_function_defini
 
         return FunctionDefinitionAndScope { .function = *result, .scope = scope };
     });
+}
+
+void StyleScope::for_each_visible_function_definition(Function<void(FunctionDefinitionAndScope const&)> const& callback) const
+{
+    HashTable<Utf16FlyString> names;
+    Function<void(StyleScope const&)> collect_names = [&](StyleScope const& scope) {
+        for (auto const& [name, rules] : scope.rule_cache().function_rules_by_name) {
+            (void)rules;
+            names.set(name);
+        }
+
+        if (auto* shadow_root = as_if<DOM::ShadowRoot>(*scope.m_node)) {
+            if (auto* host = shadow_root->host()) {
+                auto const& root = host->root();
+                if (root.is_shadow_root()) {
+                    auto const& parent_shadow_root = as<DOM::ShadowRoot>(root);
+                    if (parent_shadow_root.uses_document_style_sheets())
+                        collect_names(root.document().style_scope());
+                    else
+                        collect_names(parent_shadow_root.style_scope());
+                } else if (auto const* document = as_if<DOM::Document>(root)) {
+                    collect_names(document->style_scope());
+                }
+            }
+        }
+    };
+    collect_names(*this);
+
+    for (auto const& name : names) {
+        if (auto definition = get_function_definition(name); definition.has_value())
+            callback(*definition);
+    }
 }
 
 template<typename T>
@@ -1543,7 +1142,12 @@ Optional<T> StyleScope::dereference_global_tree_scoped_reference(Function<Option
                 return shadow_root.style_scope().dereference_global_tree_scoped_reference(callback);
             }
 
-            return as<DOM::Document>(root).style_scope().dereference_global_tree_scoped_reference(callback);
+            if (auto const* document = as_if<DOM::Document>(root))
+                return document->style_scope().dereference_global_tree_scoped_reference(callback);
+
+            // A detached host's node tree is rooted at an ordinary element. Such a tree carries no
+            // tree-scoped names of its own, so the inheritance chain ends here.
+            return OptionalNone {};
         }
     }
 

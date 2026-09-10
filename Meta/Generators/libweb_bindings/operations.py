@@ -178,22 +178,28 @@ def define_the_regular_operations(
                 f"""    object.define_native_function(realm, "{name}"_utf16_fly_string, {idl_identifier_cpp_name(operation)}, {overload_resolution.operation_overload_set_length(operations)}, default_attributes);
 
 """,
+                f"{interface.name}.{name}",
             )
         )
 
-    if unforgeable:
-        return
-
     implemented_operation_names = overload_resolution.operation_overload_sets(interface).keys()
+    defined_unimplemented_operation_names = set()
     for operation in interface.regular_operations:
         if "FIXME" not in operation.extended_attributes:
             continue
+        if ("LegacyUnforgeable" in operation.extended_attributes) != unforgeable:
+            continue
         if operation.name in implemented_operation_names:
             continue
+        if operation.name in defined_unimplemented_operation_names:
+            continue
+        defined_unimplemented_operation_names.add(operation.name)
         out.write(
-            f"""    object.define_direct_property("{operation.name}"_utf16_fly_string, JS::js_undefined(), default_attributes | JS::Attribute::Unimplemented);
-
-"""
+            wrap_with_extended_attribute_exposure_checks(
+                includes,
+                operation.extended_attributes,
+                f'    object.define_unimplemented_property("{operation.name}"_utf16_fly_string);\n',
+            )
         )
 
 
@@ -207,6 +213,25 @@ def define_the_static_operations(out: TextIO, includes: GeneratedIncludes, inter
                 f"""    object.define_native_function(realm, "{name}"_utf16_fly_string, {idl_identifier_cpp_name(operation)}, {overload_resolution.operation_overload_set_length(operations)}, JS::Attribute::Enumerable | JS::Attribute::Configurable | JS::Attribute::Writable);
 
 """,
+                f"{interface.name}.{name}",
+            )
+        )
+
+    implemented_operation_names = overload_resolution.operation_overload_sets(interface, static=True).keys()
+    defined_unimplemented_operation_names = set()
+    for operation in interface.static_operations:
+        if "FIXME" not in operation.extended_attributes:
+            continue
+        if operation.name in implemented_operation_names:
+            continue
+        if operation.name in defined_unimplemented_operation_names:
+            continue
+        defined_unimplemented_operation_names.add(operation.name)
+        out.write(
+            wrap_with_extended_attribute_exposure_checks(
+                includes,
+                operation.extended_attributes,
+                f'    object.define_unimplemented_property("{operation.name}"_utf16_fly_string);\n',
             )
         )
 
@@ -258,6 +283,7 @@ def define_the_stringifier(
             extended_attributes,
             """    object.define_native_function(realm, "toString"_utf16_fly_string, to_string, 0, default_attributes);
 """,
+            f"{interface.name}.toString",
         )
     )
     out.write(
@@ -355,7 +381,6 @@ def write_stringifier(
     out.write(
         f"""JS_DEFINE_NATIVE_FUNCTION({receiver_class}::to_string)
 {{
-    WebIDL::log_trace(vm, "{receiver_class}::to_string");
     auto& realm = *vm.current_realm();
     auto this_value = vm.this_value();
     auto* idl_object = TRY(impl_from(vm, this_value));
@@ -404,7 +429,6 @@ def write_operation(
     out.write(
         f"""JS_DEFINE_NATIVE_FUNCTION({receiver_class}::{callback_name})
 {{
-    WebIDL::log_trace(vm, "{receiver_class}::{callback_name}");
     [[maybe_unused]] auto& realm = *vm.current_realm();
 """
     )
@@ -679,6 +703,7 @@ def collect_attribute_values(
     // 3. Perform ! CreateDataPropertyOrThrow(result, k, v).
     MUST(result->create_data_property({key_name}, {js_value_name}));
 """,
+                f"{interface.name}.{attribute.name}",
             )
         )
 
@@ -710,7 +735,6 @@ def write_default_to_json_operation(
     operation: Operation,
 ) -> None:
     includes.add("LibJS/Runtime/Object.h")
-    includes.add("LibWeb/WebIDL/Tracing.h")
 
     # 1. Let map be a new ordered map.
 
@@ -724,7 +748,6 @@ def write_default_to_json_operation(
     out.write(
         f"""JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::{idl_identifier_cpp_name(operation)})
 {{
-    WebIDL::log_trace(vm, "{interface.prototype_class}::{idl_identifier_cpp_name(operation)}");
     auto& realm = *vm.current_realm();
 
     auto this_value = vm.this_value();

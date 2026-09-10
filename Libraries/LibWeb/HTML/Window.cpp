@@ -37,6 +37,7 @@
 #include <LibWeb/CSS/StyleValues/IntegerStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
+#include <LibWeb/CSS/StyleValues/RatioStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ResolutionStyleValue.h>
 #include <LibWeb/CookieStore/CookieStore.h>
 #include <LibWeb/DOM/Document.h>
@@ -73,6 +74,7 @@
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
 #include <LibWeb/HTML/ScrollOptions.h>
+#include <LibWeb/HTML/SourceSnapshotParams.h>
 #include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/TokenizedFeatures.h>
@@ -83,7 +85,8 @@
 #include <LibWeb/Internals/Internals.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/RequestIdleCallback/IdleDeadline.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/Speech/SpeechSynthesis.h>
@@ -130,9 +133,13 @@ WebIDL::ExceptionOr<void> initialize_window_web_interfaces(HTML::Window& window,
 {
     auto& global_object = realm.global_object();
 
-    Bindings::add_window_exposed_interfaces(global_object);
-
     WEB_SET_PROTOTYPE_FOR_INTERFACE_ON(global_object, Window);
+
+    // OPTIMIZATION: The Window wrapper becomes the internal prototype of its WindowProxy. Mark it
+    // as a prototype before adding its many own properties so that attaching it does not copy them.
+    global_object.convert_to_prototype_if_needed();
+
+    Bindings::add_window_exposed_interfaces(global_object);
 
     Bindings::WindowGlobalMixin window_global_mixin;
     window_global_mixin.initialize(realm, global_object);
@@ -258,10 +265,14 @@ public:
 
     JS::Completion invoke(GC::Ref<RequestIdleCallback::IdleDeadline> deadline) { return m_handler(deadline); }
     u32 handle() const { return m_handle; }
+    Optional<i32> timeout_timer_id() const { return m_timeout_timer_id; }
+    void set_timeout_timer_id(i32 timeout_timer_id) { m_timeout_timer_id = timeout_timer_id; }
+    void clear_timeout_timer_id() { m_timeout_timer_id.clear(); }
 
 private:
     IdleCallbackHandler m_handler;
     u32 m_handle { 0 };
+    Optional<i32> m_timeout_timer_id;
 };
 
 GC::Ref<Window> Window::create()
@@ -297,7 +308,6 @@ void Window::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     WindowOrWorkerGlobalScopeMixin::visit_edges(visitor);
-    UniversalGlobalScopeMixin::visit_edges(visitor);
 
     visitor.visit(m_associated_document);
     visitor.visit(m_environment_settings_object);
@@ -441,8 +451,10 @@ WebIDL::ExceptionOr<Window::OpenedWindow> Window::window_open_steps_internal(Utf
 
     // 15. If windowType is either "new and unrestricted" or "new with no opener", then:
     if (window_type == WindowType::NewAndUnrestricted || window_type == WindowType::NewWithNoOpener) {
+        auto& local_target_navigable = as<LocalNavigable>(*target_navigable);
+
         // 1. Set targetNavigable's active browsing context's is popup to the result of checking if a popup window is requested, given tokenizedFeatures.
-        target_navigable->active_browsing_context()->set_is_popup(check_if_a_popup_window_is_requested(tokenized_features));
+        local_target_navigable.active_browsing_context()->set_is_popup(check_if_a_popup_window_is_requested(tokenized_features));
 
         // 2. Set up browsing context features for target browsing context given tokenizedFeatures. [CSSOMVIEW]
         // NOTE: This is implemented in choose_a_navigable when creating the top level traversable.
@@ -455,10 +467,10 @@ WebIDL::ExceptionOr<Window::OpenedWindow> Window::window_open_steps_internal(Utf
         if (url_matches_about_blank(url_record.value())) {
             // AD-HOC: Mark the initial about:blank for the new window as load complete
             // FIXME: We do this other places too when creating a new about:blank document. Perhaps it's worth a spec issue?
-            auto document = GC::Ref(*target_navigable->active_document());
+            auto document = GC::Ref(*local_target_navigable.active_document());
             HTML::HTMLParser::the_end(document, HTML::HTMLParser::parserless_completion_token(document));
 
-            perform_url_and_history_update_steps(*target_navigable->active_document(), url_record.release_value());
+            perform_url_and_history_update_steps(*local_target_navigable.active_document(), url_record.release_value());
         }
 
         // 5. Otherwise, navigate targetNavigable to urlRecord using sourceDocument, with referrerPolicy set to referrerPolicy and exceptionsEnabled set to true.
@@ -474,7 +486,7 @@ WebIDL::ExceptionOr<Window::OpenedWindow> Window::window_open_steps_internal(Utf
 
         // 2. If noopener is false, then set targetNavigable's active browsing context's opener browsing context to sourceDocument's browsing context.
         if (no_opener == TokenizedFeature::NoOpener::No)
-            target_navigable->active_browsing_context()->set_opener_browsing_context(source_document.browsing_context());
+            as<LocalNavigable>(*target_navigable).active_browsing_context()->set_opener_browsing_context(source_document.browsing_context());
     }
 
     // NOTE: Steps 17 and 18 are implemented in window_open_steps().
@@ -496,63 +508,88 @@ Page const& Window::page() const
     return associated_document().page();
 }
 
-Optional<CSS::FeatureValue> Window::query_media_feature(CSS::MediaFeatureID media_feature) const
+static CSS::Parser::ValueParserFFI::FfiMediaFeatureValue ident_media_feature_value(CSS::Keyword keyword)
+{
+    return { .kind = CSS::Parser::ValueParserFFI::FfiMediaFeatureValueKind::Ident, .keyword = to_underlying(keyword), .value = 0, .second_value = 0 };
+}
+
+static CSS::Parser::ValueParserFFI::FfiMediaFeatureValue integer_media_feature_value(double value)
+{
+    return { .kind = CSS::Parser::ValueParserFFI::FfiMediaFeatureValueKind::Integer, .keyword = 0, .value = value, .second_value = 0 };
+}
+
+static CSS::Parser::ValueParserFFI::FfiMediaFeatureValue length_media_feature_value(CSSPixels px)
+{
+    return { .kind = CSS::Parser::ValueParserFFI::FfiMediaFeatureValueKind::Length, .keyword = 0, .value = px.to_double(), .second_value = 0 };
+}
+
+static CSS::Parser::ValueParserFFI::FfiMediaFeatureValue ratio_media_feature_value(double numerator, double denominator)
+{
+    return { .kind = CSS::Parser::ValueParserFFI::FfiMediaFeatureValueKind::Ratio, .keyword = 0, .value = numerator, .second_value = denominator };
+}
+
+static CSS::Parser::ValueParserFFI::FfiMediaFeatureValue resolution_media_feature_value(double dots_per_pixel)
+{
+    return { .kind = CSS::Parser::ValueParserFFI::FfiMediaFeatureValueKind::Resolution, .keyword = 0, .value = dots_per_pixel, .second_value = 0 };
+}
+
+CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CSS::MediaFeatureID media_feature) const
 {
     // FIXME: Many of these should be dependent on the hardware
 
     // https://www.w3.org/TR/mediaqueries-5/#media-descriptor-table
     switch (media_feature) {
     case CSS::MediaFeatureID::AnyHover:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Hover));
+        return ident_media_feature_value(CSS::Keyword::Hover);
     case CSS::MediaFeatureID::AnyPointer:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Fine));
+        return ident_media_feature_value(CSS::Keyword::Fine);
     case CSS::MediaFeatureID::AspectRatio:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ratio, CSS::RatioStyleValue::create(CSS::NumberStyleValue::create(inner_width()), CSS::NumberStyleValue::create(inner_height())));
+        return ratio_media_feature_value(inner_width(), inner_height());
     case CSS::MediaFeatureID::Color:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Integer, CSS::IntegerStyleValue::create(8));
+        return integer_media_feature_value(8);
     case CSS::MediaFeatureID::ColorGamut:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Srgb));
+        return ident_media_feature_value(CSS::Keyword::Srgb);
     case CSS::MediaFeatureID::ColorIndex:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Integer, CSS::IntegerStyleValue::create(0));
+        return integer_media_feature_value(0);
     case CSS::MediaFeatureID::DeviceAspectRatio: {
         auto screen_area = page().client().screen_rect();
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ratio, CSS::RatioStyleValue::create(CSS::NumberStyleValue::create(screen_area.width().value()), CSS::NumberStyleValue::create(screen_area.height().value())));
+        return ratio_media_feature_value(screen_area.width().value(), screen_area.height().value());
     }
     case CSS::MediaFeatureID::DeviceHeight:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Length, CSS::LengthStyleValue::create(CSS::Length::make_px(page().web_exposed_screen_area().height())));
+        return length_media_feature_value(page().web_exposed_screen_area().height());
     case CSS::MediaFeatureID::DeviceWidth:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Length, CSS::LengthStyleValue::create(CSS::Length::make_px(page().web_exposed_screen_area().width())));
+        return length_media_feature_value(page().web_exposed_screen_area().width());
     case CSS::MediaFeatureID::DisplayMode:
         // FIXME: Detect if window is fullscreen
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Browser));
+        return ident_media_feature_value(CSS::Keyword::Browser);
     case CSS::MediaFeatureID::DynamicRange:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Standard));
+        return ident_media_feature_value(CSS::Keyword::Standard);
     case CSS::MediaFeatureID::EnvironmentBlending:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Opaque));
+        return ident_media_feature_value(CSS::Keyword::Opaque);
     case CSS::MediaFeatureID::ForcedColors:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::None));
+        return ident_media_feature_value(CSS::Keyword::None);
     case CSS::MediaFeatureID::Grid:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Integer, CSS::IntegerStyleValue::create(0));
+        return integer_media_feature_value(0);
     case CSS::MediaFeatureID::Height:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Length, CSS::LengthStyleValue::create(CSS::Length::make_px(inner_height())));
+        return length_media_feature_value(inner_height());
     case CSS::MediaFeatureID::HorizontalViewportSegments:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Integer, CSS::IntegerStyleValue::create(1));
+        return integer_media_feature_value(1);
     case CSS::MediaFeatureID::Hover:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Hover));
+        return ident_media_feature_value(CSS::Keyword::Hover);
     case CSS::MediaFeatureID::InvertedColors:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::None));
+        return ident_media_feature_value(CSS::Keyword::None);
     case CSS::MediaFeatureID::Monochrome:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Integer, CSS::IntegerStyleValue::create(0));
+        return integer_media_feature_value(0);
     case CSS::MediaFeatureID::NavControls:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Back));
+        return ident_media_feature_value(CSS::Keyword::Back);
     case CSS::MediaFeatureID::Orientation:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(inner_height() >= inner_width() ? CSS::Keyword::Portrait : CSS::Keyword::Landscape));
+        return ident_media_feature_value(inner_height() >= inner_width() ? CSS::Keyword::Portrait : CSS::Keyword::Landscape);
     case CSS::MediaFeatureID::OverflowBlock:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Scroll));
+        return ident_media_feature_value(CSS::Keyword::Scroll);
     case CSS::MediaFeatureID::OverflowInline:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Scroll));
+        return ident_media_feature_value(CSS::Keyword::Scroll);
     case CSS::MediaFeatureID::Pointer:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Fine));
+        return ident_media_feature_value(CSS::Keyword::Fine);
     case CSS::MediaFeatureID::PrefersColorScheme: {
         // https://github.com/w3c/csswg-drafts/issues/7213
         // An SVG used as an image answers with the used `color-scheme` of the element referencing
@@ -561,9 +598,9 @@ Optional<CSS::FeatureValue> Window::query_media_feature(CSS::MediaFeatureID medi
         auto preference = associated_document().svg_image_color_scheme().value_or(page().preferred_color_scheme());
         switch (preference) {
         case CSS::PreferredColorScheme::Light:
-            return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Light));
+            return ident_media_feature_value(CSS::Keyword::Light);
         case CSS::PreferredColorScheme::Dark:
-            return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Dark));
+            return ident_media_feature_value(CSS::Keyword::Dark);
         default:
             VERIFY_NOT_REACHED();
         }
@@ -571,62 +608,67 @@ Optional<CSS::FeatureValue> Window::query_media_feature(CSS::MediaFeatureID medi
     case CSS::MediaFeatureID::PrefersContrast:
         switch (page().preferred_contrast()) {
         case CSS::PreferredContrast::Less:
-            return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Less));
+            return ident_media_feature_value(CSS::Keyword::Less);
         case CSS::PreferredContrast::More:
-            return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::More));
+            return ident_media_feature_value(CSS::Keyword::More);
         case CSS::PreferredContrast::NoPreference:
-            return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::NoPreference));
+            return ident_media_feature_value(CSS::Keyword::NoPreference);
         case CSS::PreferredContrast::Auto:
         default:
             // FIXME: Fallback to system settings
-            return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::NoPreference));
+            return ident_media_feature_value(CSS::Keyword::NoPreference);
         }
     case CSS::MediaFeatureID::PrefersReducedData:
         // FIXME: Make this a preference
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::NoPreference));
+        return ident_media_feature_value(CSS::Keyword::NoPreference);
     case CSS::MediaFeatureID::PrefersReducedMotion:
         switch (page().preferred_motion()) {
         case CSS::PreferredMotion::NoPreference:
-            return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::NoPreference));
+            return ident_media_feature_value(CSS::Keyword::NoPreference);
         case CSS::PreferredMotion::Reduce:
-            return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Reduce));
+            return ident_media_feature_value(CSS::Keyword::Reduce);
         case CSS::PreferredMotion::Auto:
         default:
             // FIXME: Fallback to system settings
-            return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::NoPreference));
+            return ident_media_feature_value(CSS::Keyword::NoPreference);
         }
     case CSS::MediaFeatureID::PrefersReducedTransparency:
         // FIXME: Make this a preference
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::NoPreference));
+        return ident_media_feature_value(CSS::Keyword::NoPreference);
     case CSS::MediaFeatureID::Resolution:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Resolution, CSS::ResolutionStyleValue::create(CSS::Resolution::make_dots_per_pixel(device_pixel_ratio())));
+        return resolution_media_feature_value(device_pixel_ratio());
     case CSS::MediaFeatureID::Scan:
         // FIXME: Detect this from the display, if we can. Most displays aren't scanning and should return None.
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::None));
+        return ident_media_feature_value(CSS::Keyword::None);
     case CSS::MediaFeatureID::Scripting:
         if (associated_document().is_scripting_enabled())
-            return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Enabled));
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::None));
+            return ident_media_feature_value(CSS::Keyword::Enabled);
+        return ident_media_feature_value(CSS::Keyword::None);
     case CSS::MediaFeatureID::Update:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Fast));
+        return ident_media_feature_value(CSS::Keyword::Fast);
     case CSS::MediaFeatureID::VerticalViewportSegments:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Integer, CSS::IntegerStyleValue::create(1));
+        return integer_media_feature_value(1);
     case CSS::MediaFeatureID::VideoColorGamut:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Srgb));
+        return ident_media_feature_value(CSS::Keyword::Srgb);
     case CSS::MediaFeatureID::VideoDynamicRange:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Ident, CSS::KeywordStyleValue::create(CSS::Keyword::Standard));
+        return ident_media_feature_value(CSS::Keyword::Standard);
     case CSS::MediaFeatureID::WebkitTransform3d:
         // https://compat.spec.whatwg.org/#css-media-queries-webkit-transform-3d
         // If the user agent supports 3D transforms, the value will be 1. Otherwise the value is 0.
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Integer, CSS::IntegerStyleValue::create(1));
+        return integer_media_feature_value(1);
     case CSS::MediaFeatureID::Width:
-        return CSS::FeatureValue(CSS::FeatureValue::Type::Length, CSS::LengthStyleValue::create(CSS::Length::make_px(inner_width())));
+        return length_media_feature_value(inner_width());
 
     default:
         break;
     }
 
-    return {};
+    return {
+        .kind = CSS::Parser::ValueParserFFI::FfiMediaFeatureValueKind::Absent,
+        .keyword = 0,
+        .value = 0,
+        .second_value = 0,
+    };
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#fire-a-page-transition-event
@@ -661,11 +703,7 @@ WebIDL::ExceptionOr<GC::Ref<Storage>> Window::local_storage()
         return GC::Ref { *storage };
 
     // 2. Let map be the result of running obtain a local storage bottle map with this's relevant settings object and "localStorage".
-    GC::Ptr<StorageAPI::LocalStorageBottle> map;
-    auto storage_key = StorageAPI::obtain_a_storage_key(this->relevant_settings_object());
-    if (storage_key.has_value()) {
-        map = StorageAPI::LocalStorageBottle::create(page(), storage_key.value(), StorageAPI::StorageEndpoint::LOCAL_STORAGE_QUOTA);
-    }
+    auto map = StorageAPI::obtain_a_local_storage_bottle_map(this->relevant_settings_object(), StorageAPI::StorageEndpointType::LocalStorage);
 
     // 3. If map is failure, then throw a "SecurityError" DOMException.
     if (!map)
@@ -816,7 +854,8 @@ void Window::start_an_idle_period()
     auto& pending_list = m_idle_request_callbacks;
     // 3. Let run_list be window's list of runnable idle callbacks.
     auto& run_list = m_runnable_idle_callbacks;
-    run_list.extend(pending_list);
+    for (auto& [handle, callback] : pending_list)
+        run_list.set(handle, move(callback));
     // 4. Clear pending_list.
     pending_list.clear();
 
@@ -828,7 +867,8 @@ void Window::start_an_idle_period()
     //    which performs the steps defined in the invoke idle callbacks algorithm with window and getDeadline as parameters.
     queue_global_task(Task::Source::IdleTask, relevant_global_object(*this), GC::create_function(GC::Heap::the(), [this] {
         invoke_idle_callbacks();
-    }));
+    }),
+        Task::Priority::Idle);
 }
 
 // https://w3c.github.io/requestidlecallback/#invoke-idle-callbacks-algorithm
@@ -842,6 +882,10 @@ void Window::invoke_idle_callbacks()
     if (now < event_loop.compute_deadline() && !m_runnable_idle_callbacks.is_empty()) {
         // 1. Pop the top callback from window's list of runnable idle callbacks.
         auto callback = m_runnable_idle_callbacks.take_first();
+        if (callback->timeout_timer_id().has_value()) {
+            clear_timeout(*callback->timeout_timer_id());
+            callback->clear_timeout_timer_id();
+        }
         // 2. Let deadlineArg be a new IdleDeadline whose [get deadline time algorithm] is getDeadline.
         auto deadline_arg = RequestIdleCallback::IdleDeadline::create();
         // 3. Call callback with deadlineArg as its argument. If an uncaught runtime script error occurs, then report the exception.
@@ -853,13 +897,52 @@ void Window::invoke_idle_callbacks()
         if (!m_runnable_idle_callbacks.is_empty()) {
             queue_global_task(Task::Source::IdleTask, relevant_global_object(*this), GC::create_function(GC::Heap::the(), [this] {
                 invoke_idle_callbacks();
-            }));
+            }),
+                Task::Priority::Idle);
         }
     }
 }
 
+// https://w3c.github.io/requestidlecallback/#invoke-idle-callback-timeout-algorithm
+void Window::invoke_idle_callback_timeout(u32 handle)
+{
+    // 1. Let callback be the result of finding the entry in window's list of idle request callbacks or the list of
+    //    runnable idle callbacks that is associated with the value given by the handle argument passed to the algorithm.
+    auto taken = m_idle_request_callbacks.take(handle);
+    if (!taken.has_value())
+        taken = m_runnable_idle_callbacks.take(handle);
+
+    // 2. If callback is not undefined:
+    if (!taken.has_value())
+        return;
+    auto callback = taken.release_value();
+
+    callback->clear_timeout_timer_id();
+
+    // 2.1. Remove callback from both window's list of idle request callbacks and the list of runnable idle callbacks.
+    // NB: Taking the callback from whichever list contained it above implements this step, since it can only be in one.
+
+    // 2.2. Let now be the current time.
+
+    // 2.3. Let deadlineArg be a new IdleDeadline. Set the get deadline time algorithm associated with deadlineArg to an
+    //      algorithm returning now and set the timeout associated with deadlineArg to true.
+    auto deadline_arg = RequestIdleCallback::IdleDeadline::create(true);
+
+    // 2.4. Invoke callback with « deadlineArg » and "report".
+    auto result = callback->invoke(deadline_arg);
+    if (result.is_error())
+        report_exception(result, principal_realm());
+}
+
 void Window::set_associated_document(DOM::Document& document)
 {
+    if (m_associated_document.ptr() != &document) {
+        // The main-world Window wrapper caches the document attribute's JS
+        // value. Clear it before changing the native association so the next
+        // access wraps the new Document.
+        if (auto wrapper = cached_main_world_wrapper())
+            wrapper->clear_cached_accessor_value("document"_utf16_fly_string);
+    }
     m_associated_document = &document;
 }
 
@@ -999,15 +1082,18 @@ Utf16String Window::name() const
 void Window::set_name(Utf16View name)
 {
     // 1. If this's navigable is null, then return.
-    if (!navigable())
+    auto navigable = this->navigable();
+    if (!navigable)
         return;
 
     // 2. Set this's navigable's active session history entry's document state's navigable target name to the given value.
+    if (navigable->target_name() == name)
+        return;
     auto navigable_target_name = Utf16String::from_utf16(name);
-    auto active_session_history_entry = navigable()->active_session_history_entry();
+    auto active_session_history_entry = navigable->active_session_history_entry();
     active_session_history_entry->document_state()->set_navigable_target_name(navigable_target_name);
-    navigable()->page().client().page_did_update_session_history_entry_document_state_navigable_target_name(
-        navigable()->id(), active_session_history_entry->navigation_api_key(), navigable_target_name);
+    navigable->page().client().page_did_update_session_history_entry_document_state_navigable_target_name(
+        navigable->id(), session_history_entry_identity(*active_session_history_entry), navigable_target_name);
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-status
@@ -1035,7 +1121,7 @@ void Window::close()
     auto browsing_context = traversable->active_browsing_context();
 
     // 5. Let sourceSnapshotParams be the result of snapshotting source snapshot params given thisTraversable's active document.
-    auto source_snapshot_params = traversable->active_document()->snapshot_source_snapshot_params();
+    auto source_snapshot_params = snapshot_source_snapshot_params(traversable->active_document());
 
     auto& incumbent_global_object = HTML::incumbent_window();
 
@@ -1368,12 +1454,8 @@ Optional<Utf16String> Window::prompt(Optional<Utf16String> const& message, Optio
     return result;
 }
 
-// https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps
-WebIDL::ExceptionOr<void> Window::window_post_message_steps(JS::Realm& realm, JS::Value message, PostMessageOptions const& options)
+WebIDL::ExceptionOr<Window::PreparedPostMessage> Window::prepare_post_message(JS::Realm& realm, JS::Value message, PostMessageOptions const& options)
 {
-    // 1. Let targetRealm be targetWindow's realm.
-    auto& target_realm = this->principal_realm();
-
     // 2. Let incumbentSettings be the incumbent settings object.
     auto& incumbent_settings = incumbent_settings_object();
 
@@ -1405,58 +1487,89 @@ WebIDL::ExceptionOr<void> Window::window_post_message_steps(JS::Realm& realm, JS
     // 7. Let serializeWithTransferResult be StructuredSerializeWithTransfer(message, transfer). Rethrow any exceptions.
     auto serialize_with_transfer_result = TRY(structured_serialize_with_transfer(realm, message, transfer));
 
+    // NB: The task queued by step 8 reads incumbentSettings in its steps 2 and 3. Snapshot those values here.
+    // 8.2. Let origin be the incumbentSettings's origin.
+    auto source_origin = incumbent_settings.origin();
+
+    // 8.3. Let source be the WindowProxy object corresponding to incumbentSettings's global object (a Window object).
+    auto source = GC::Ref { as<WindowProxy>(incumbent_settings.realm().global_environment().global_this_value()) };
+
+    return PreparedPostMessage {
+        .serialize_with_transfer_result = move(serialize_with_transfer_result),
+        .target_origin = move(target_origin),
+        .source_origin = move(source_origin),
+        .source = source,
+    };
+}
+
+// https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps
+WebIDL::ExceptionOr<void> Window::window_post_message_steps(JS::Realm& realm, JS::Value message, PostMessageOptions const& options)
+{
+    // 1. Let targetRealm be targetWindow's realm.
+    // NB: Taken from targetWindow when the queued task delivers the message.
+
+    // 2-7.
+    auto prepared = TRY(prepare_post_message(realm, message, options));
+
     // 8. Queue a global task on the posted message task source given targetWindow to run the following steps:
-    queue_global_task(Task::Source::PostedMessage, relevant_global_object(*this), GC::create_function(GC::Heap::the(), [this, serialize_with_transfer_result = move(serialize_with_transfer_result), target_origin = move(target_origin), &incumbent_settings, &target_realm]() mutable {
-        // 1. If the targetOrigin argument is not a single literal U+002A ASTERISK character (*) and targetWindow's
-        //    associated Document's origin is not same origin with targetOrigin, then return.
-        // NOTE: Due to step 4 and 5 above, the only time it's not '*' is if target_origin contains an Origin.
-        if (!target_origin.has<Utf16String>()) {
-            auto const& actual_target_origin = target_origin.get<URL::Origin>();
-            if (!document()->origin().is_same_origin(actual_target_origin))
-                return;
-        }
-
-        // 2. Let origin be the incumbentSettings's origin.
-        auto const& origin = incumbent_settings.origin();
-
-        // 3. Let source be the WindowProxy object corresponding to incumbentSettings's global object (a Window object).
-        auto& source = as<WindowProxy>(incumbent_settings.realm().global_environment().global_this_value());
-
-        TemporaryExecutionContext temporary_execution_context { target_realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
-
-        // 4. Let deserializeRecord be StructuredDeserializeWithTransfer(serializeWithTransferResult, targetRealm).
-        auto deserialize_record_or_error = structured_deserialize_with_transfer(serialize_with_transfer_result, target_realm);
-
-        // If this throws an exception, catch it, fire an event named messageerror at targetWindow, using MessageEvent,
-        // with its origin initialized to origin and the source attribute initialized to source, and then return.
-        if (deserialize_record_or_error.is_exception()) {
-            MessageEventInit message_event_init { {}, JS::js_null(), Utf16String {}, Utf16String {}, {}, GC::Ref { source } };
-
-            auto message_error_event = MessageEvent::create(target_realm.global_object(), EventNames::messageerror, message_event_init, origin);
-            dispatch_event(message_error_event);
-            return;
-        }
-
-        // 5. Let messageClone be deserializeRecord.[[Deserialized]].
-        auto deserialize_record = deserialize_record_or_error.release_value();
-        auto message_clone = deserialize_record.deserialized;
-
-        // 6. Let newPorts be a new frozen array consisting of all MessagePort objects in deserializeRecord.[[TransferredValues]],
-        //    if any, maintaining their relative order.
-        // FIXME: Use a FrozenArray
-        auto new_ports = Bindings::message_ports_from_transferred_values(deserialize_record.transferred_values);
-
-        // 7. Fire an event named message at targetWindow, using MessageEvent, with its origin initialized to origin,
-        //    the source attribute initialized to source, the data attribute initialized to messageClone, and the ports
-        //    attribute initialized to newPorts.
-        MessageEventInit message_event_init { {}, message_clone, Utf16String {}, Utf16String {}, move(new_ports), GC::Ref { source } };
-
-        auto message_event = MessageEvent::create(target_realm.global_object(), EventNames::message, message_event_init, origin);
-        message_event->set_is_trusted(true);
-        dispatch_event(message_event);
+    queue_global_task(Task::Source::PostedMessage, relevant_global_object(*this), GC::create_function(GC::Heap::the(), [this, prepared = move(prepared)]() mutable {
+        deliver_posted_message(move(prepared.serialize_with_transfer_result), prepared.target_origin, prepared.source_origin, prepared.source);
     }));
 
     return {};
+}
+
+void Window::deliver_posted_message(SerializedTransferRecord serialize_with_transfer_result, Variant<Utf16String, URL::Origin> const& target_origin, URL::Origin const& origin, GC::Ref<WindowProxy> source)
+{
+    // 1. Let targetRealm be targetWindow's realm.
+    auto& target_realm = principal_realm();
+
+    // 1. If the targetOrigin argument is not a single literal U+002A ASTERISK character (*) and targetWindow's
+    //    associated Document's origin is not same origin with targetOrigin, then return.
+    // NOTE: Due to step 4 and 5 above, the only time it's not '*' is if target_origin contains an Origin.
+    if (!target_origin.has<Utf16String>()) {
+        auto const& actual_target_origin = target_origin.get<URL::Origin>();
+        if (!document()->origin().is_same_origin(actual_target_origin))
+            return;
+    }
+
+    // 2. Let origin be the incumbentSettings's origin.
+    // 3. Let source be the WindowProxy object corresponding to incumbentSettings's global object (a Window object).
+    // NB: Both were snapshotted by prepare_post_message().
+    NullableMessageEventSource source_for_event { source };
+
+    TemporaryExecutionContext temporary_execution_context { target_realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
+
+    // 4. Let deserializeRecord be StructuredDeserializeWithTransfer(serializeWithTransferResult, targetRealm).
+    auto deserialize_record_or_error = structured_deserialize_with_transfer(serialize_with_transfer_result, target_realm);
+
+    // If this throws an exception, catch it, fire an event named messageerror at targetWindow, using MessageEvent,
+    // with its origin initialized to origin and the source attribute initialized to source, and then return.
+    if (deserialize_record_or_error.is_exception()) {
+        MessageEventInit message_event_init { {}, JS::js_null(), Utf16String {}, Utf16String {}, {}, source_for_event };
+
+        auto message_error_event = MessageEvent::create(target_realm.global_object(), EventNames::messageerror, message_event_init, origin);
+        dispatch_event(message_error_event);
+        return;
+    }
+
+    // 5. Let messageClone be deserializeRecord.[[Deserialized]].
+    auto deserialize_record = deserialize_record_or_error.release_value();
+    auto message_clone = deserialize_record.deserialized;
+
+    // 6. Let newPorts be a new frozen array consisting of all MessagePort objects in deserializeRecord.[[TransferredValues]],
+    //    if any, maintaining their relative order.
+    // FIXME: Use a FrozenArray
+    auto new_ports = Bindings::message_ports_from_transferred_values(deserialize_record.transferred_values);
+
+    // 7. Fire an event named message at targetWindow, using MessageEvent, with its origin initialized to origin,
+    //    the source attribute initialized to source, the data attribute initialized to messageClone, and the ports
+    //    attribute initialized to newPorts.
+    MessageEventInit message_event_init { {}, message_clone, Utf16String {}, Utf16String {}, move(new_ports), source_for_event };
+
+    auto message_event = MessageEvent::create(target_realm.global_object(), EventNames::message, message_event_init, origin);
+    message_event->set_is_trusted(true);
+    dispatch_event(message_event);
 }
 
 // https://html.spec.whatwg.org/multipage/web-messaging.html#dom-window-postmessage-options
@@ -1545,7 +1658,7 @@ GC::Ref<CSS::CSSStyleProperties> Window::get_computed_style(DOM::Element& elemen
 WebIDL::ExceptionOr<GC::Ref<CSS::MediaQueryList>> Window::match_media(Utf16View query)
 {
     // 1. Let parsed media query list be the result of parsing query.
-    auto parsed_media_query_list = parse_media_query_list(CSS::Parser::ParsingParams(associated_document()), query);
+    auto parsed_media_query_list = parse_media_query_list(query);
 
     // 2. Return a new MediaQueryList object, with this's associated Document as the document, with parsed media query list as its associated media query list.
     auto media_query_list = CSS::MediaQueryList::create(associated_document(), move(parsed_media_query_list));
@@ -1672,7 +1785,7 @@ double Window::scroll_y() const
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-window-scroll
-void Window::scroll(ScrollToOptions const& options, GC::Ptr<WebIDL::Promise> promise)
+void Window::scroll(ScrollToOptions const& options, GC::Ptr<WebIDL::Promise> promise, Optional<CSSPixelPoint> relative_displacement)
 {
     // 4. If there is no viewport, return a resolved Promise and abort the remaining steps.
     // AD-HOC: Done here as step 1 requires the viewport.
@@ -1721,22 +1834,30 @@ void Window::scroll(ScrollToOptions const& options, GC::Ptr<WebIDL::Promise> pro
         // NB: Make sure layout is up-to-date before looking at scrollable overflow metrics.
         document->update_layout(DOM::UpdateLayoutReason::WindowScroll);
 
-        VERIFY(document->paintable_box());
-        auto scrolling_area = document->paintable_box()->scrollable_overflow_rect()->to_type<float>();
+        auto const* layout_node = document->layout_node();
+        VERIFY(layout_node && Painting::has_committed_box(*layout_node));
+        auto scrolling_area = Painting::scrollable_overflow_rect(*layout_node).value().to_type<float>();
+        auto overflow_directions = Painting::rust_physical_overflow_directions(*layout_node);
 
-        // 7. FIXME: For now we always assume overflow direction is rightward
-        // -> If the viewport has rightward overflow direction
-        //    Let x be max(0, min(x, viewport scrolling area width - viewport width)).
-        x = max(0.0f, min(x, scrolling_area.width() - viewport_width));
-        // -> If the viewport has leftward overflow direction
-        //    Let x be min(0, max(x, viewport width - viewport scrolling area width)).
+        // 7. -> If the viewport has rightward overflow direction
+        //       Let x be max(0, min(x, viewport scrolling area width - viewport width)).
+        //    -> If the viewport has leftward overflow direction
+        //       Let x be min(0, max(x, viewport width - viewport scrolling area width)).
+        if (overflow_directions.horizontal_axis_is_positive) {
+            x = max(0.0f, min(x, scrolling_area.width() - viewport_width));
+        } else {
+            x = min(0.0f, max(x, viewport_width - scrolling_area.width()));
+        }
 
-        // 8. FIXME: For now we always assume overflow direction is downward
-        // -> If the viewport has downward overflow direction
-        //    Let y be max(0, min(y, viewport scrolling area height - viewport height)).
-        y = max(0.0f, min(y, scrolling_area.height() - viewport_height));
-        // -> If the viewport has upward overflow direction
-        //    Let y be min(0, max(y, viewport height - viewport scrolling area height)).
+        // 8. -> If the viewport has downward overflow direction
+        //       Let y be max(0, min(y, viewport scrolling area height - viewport height)).
+        //    -> If the viewport has upward overflow direction
+        //       Let y be min(0, max(y, viewport height - viewport scrolling area height)).
+        if (overflow_directions.vertical_axis_is_positive) {
+            y = max(0.0f, min(y, scrolling_area.height() - viewport_height));
+        } else {
+            y = min(0.0f, max(y, viewport_height - scrolling_area.height()));
+        }
     }
 
     // FIXME: 9. Let position be the scroll position the viewport would have by aligning the x-coordinate x of the viewport
@@ -1759,13 +1880,13 @@ void Window::scroll(ScrollToOptions const& options, GC::Ptr<WebIDL::Promise> pro
     // 12. Perform a scroll of the viewport to position, document’s root element as the associated element, if there is
     //     one, or null otherwise, and the scroll behavior being the value of the behavior dictionary member of options.
     //     Let scrollPromise be the Promise returned from this step.
-    auto scroll_promise = navigable->perform_a_scroll_of_the_viewport({ x, y }, options.behavior);
+    auto scroll_promise = navigable->perform_a_scroll_of_the_viewport({ x, y }, options.behavior, LocalNavigable::ScrollTrigger::Programmatic, relative_displacement);
     if (promise)
         WebIDL::resolve_promise(*promise, scroll_promise->promise());
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-window-scroll
-void Window::scroll(double x, double y, GC::Ptr<WebIDL::Promise> promise)
+void Window::scroll(double x, double y, GC::Ptr<WebIDL::Promise> promise, Optional<CSSPixelPoint> relative_displacement)
 {
     // NB: This just implements step 2, and then forwards to the other Window::scroll() overload.
 
@@ -1778,7 +1899,7 @@ void Window::scroll(double x, double y, GC::Ptr<WebIDL::Promise> promise)
     options.left = x;
     options.top = y;
 
-    scroll(options, promise);
+    scroll(options, promise, relative_displacement);
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-window-scrollby
@@ -1798,7 +1919,8 @@ void Window::scroll_by(ScrollToOptions options, GC::Ptr<WebIDL::Promise> promise
     options.top = top + scroll_y();
 
     // 5. Return the Promise returned from scroll() after the method is invoked with options as the only argument.
-    scroll(options, promise);
+    CSSPixelPoint relative_displacement { CSSPixels::nearest_value_for(left), CSSPixels::nearest_value_for(top) };
+    scroll(options, promise, relative_displacement);
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-window-scrollby
@@ -1910,17 +2032,30 @@ u32 Window::request_idle_callback(IdleCallbackHandler callback, IdleRequestOptio
     auto handle = m_idle_callback_identifier;
 
     // 4. Push callback to the end of window's list of idle request callbacks, associated with handle.
-    m_idle_request_callbacks.append(adopt_ref(*new IdleCallback(move(callback), handle)));
+    auto idle_callback = adopt_ref(*new IdleCallback(move(callback), handle));
+    m_idle_request_callbacks.set(handle, idle_callback);
 
     // 5. Return handle and then continue running this algorithm asynchronously.
-    return handle;
 
-    // FIXME: 6. If the timeout property is present in options and has a positive value:
-    // FIXME:    1. Wait for timeout milliseconds.
-    // FIXME:    2. Wait until all invocations of this algorithm, whose timeout added to their posted time occurred before this one's, have completed.
-    // FIXME:    3. Optionally, wait a further user-agent defined length of time.
-    // FIXME:    4. Queue a task on the queue associated with the idle-task task source, which performs the invoke idle callback timeout algorithm, passing handle and window as arguments.
-    (void)options;
+    // 6. If the timeout property is present in options and has a positive value:
+    if (options.timeout.has_value() && *options.timeout > 0) {
+        // 1. Wait for timeout milliseconds.
+        auto timeout = min(*options.timeout, static_cast<u32>(NumericLimits<i32>::max()));
+        auto timeout_timer_id = run_steps_after_a_timeout(static_cast<i32>(timeout), [this, handle] {
+            // FIXME: 2. Wait until all invocations of this algorithm, whose timeout added to their posted time occurred before this one's, have completed.
+            // FIXME: 3. Optionally, wait a further user-agent defined length of time.
+
+            // 4. Queue a task on the queue associated with the idle-task task source, which performs the invoke idle callback timeout algorithm, passing handle and window as arguments.
+            // NB: A timed-out idle task has normal scheduling priority so that higher-priority work cannot keep it from
+            //     running indefinitely. Its task source remains the idle-task task source as required by the specification.
+            queue_global_task(Task::Source::IdleTask, relevant_global_object(*this), GC::create_function(GC::Heap::the(), [this, handle] {
+                invoke_idle_callback_timeout(handle);
+            }));
+        });
+        idle_callback->set_timeout_timer_id(timeout_timer_id);
+    }
+
+    return handle;
 }
 
 // https://w3c.github.io/requestidlecallback/#dom-window-cancelidlecallback
@@ -1931,12 +2066,15 @@ void Window::cancel_idle_callback(u32 handle)
     // 2. Find the entry in either the window's list of idle request callbacks or list of runnable idle callbacks
     //    that is associated with the value handle.
     // 3. If there is such an entry, remove it from both window's list of idle request callbacks and the list of runnable idle callbacks.
-    m_idle_request_callbacks.remove_first_matching([&](auto& callback) {
-        return callback->handle() == handle;
-    });
-    m_runnable_idle_callbacks.remove_first_matching([&](auto& callback) {
-        return callback->handle() == handle;
-    });
+    auto remove_callback = [&](auto& callbacks) {
+        auto callback = callbacks.take(handle);
+        if (!callback.has_value())
+            return;
+        if ((*callback)->timeout_timer_id().has_value())
+            clear_timeout(*(*callback)->timeout_timer_id());
+    };
+    remove_callback(m_idle_request_callbacks);
+    remove_callback(m_runnable_idle_callbacks);
 }
 
 // https://w3c.github.io/selection-api/#dom-window-getselection
@@ -2085,6 +2223,20 @@ Vector<Utf16FlyString> Window::supported_property_names() const
     return result;
 }
 
+bool Window::is_supported_property_name(Utf16FlyString const& name) const
+{
+    // OPTIMIZATION: Answer membership without constructing the full set of supported names.
+    //               In particular, unrelated element IDs need not be visited for a property lookup.
+    auto& document = associated_document();
+    if (document.element_by_id().contains(name))
+        return true;
+    for (auto element : document.potentially_named_elements()) {
+        if (element->name() == name)
+            return true;
+    }
+    return const_cast<Window&>(*this).document_tree_child_navigable_target_name_property_set().contains(name);
+}
+
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object
 Variant<Empty, GC::Ref<WindowProxy>, GC::Ref<DOM::Element>, GC::Ref<DOM::HTMLCollection>> Window::named_item(Utf16FlyString const& name) const
 {
@@ -2128,8 +2280,7 @@ Variant<Empty, GC::Ref<WindowProxy>, GC::Ref<DOM::Element>, GC::Ref<DOM::HTMLCol
         if ((is<HTMLEmbedElement>(element) || is<HTMLFormElement>(element) || is<HTMLImageElement>(element) || is<HTMLObjectElement>(element))
             && (element.name() == name))
             return true;
-        return element.id() == name;
-    });
+        return element.id() == name; }, DOM::HTMLCollection::AttributeInvalidationType::IdOrName);
     return collection;
 }
 

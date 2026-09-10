@@ -23,6 +23,7 @@
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/UniversalGlobalScope.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WorkletGlobalScope.h>
 #include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
@@ -32,6 +33,13 @@
 namespace Web::HTML {
 
 UniversalGlobalScopeMixin::~UniversalGlobalScopeMixin() = default;
+
+static JS::Realm& relevant_realm_for_universal_global_scope(DOM::EventTarget& global)
+{
+    if (auto* worklet_global_scope = as_if<WorkletGlobalScope>(global))
+        return worklet_global_scope->realm();
+    return relevant_realm(relevant_window_or_worker_global_scope(global));
+}
 
 void UniversalGlobalScopeMixin::visit_edges(GC::Cell::Visitor& visitor)
 {
@@ -111,7 +119,7 @@ WebIDL::ExceptionOr<JS::Value> UniversalGlobalScopeMixin::structured_clone(JS::R
 // https://streams.spec.whatwg.org/#count-queuing-strategy-size-function
 GC::Ref<WebIDL::CallbackType> UniversalGlobalScopeMixin::count_queuing_strategy_size_function()
 {
-    auto& realm = HTML::relevant_realm(HTML::relevant_window_or_worker_global_scope(this_impl()));
+    auto& realm = relevant_realm_for_universal_global_scope(this_impl());
 
     if (!m_count_queuing_strategy_size_function) {
         // 1. Let steps be the following steps:
@@ -134,7 +142,7 @@ GC::Ref<WebIDL::CallbackType> UniversalGlobalScopeMixin::count_queuing_strategy_
 // https://streams.spec.whatwg.org/#byte-length-queuing-strategy-size-function
 GC::Ref<WebIDL::CallbackType> UniversalGlobalScopeMixin::byte_length_queuing_strategy_size_function()
 {
-    auto& realm = HTML::relevant_realm(HTML::relevant_window_or_worker_global_scope(this_impl()));
+    auto& realm = relevant_realm_for_universal_global_scope(this_impl());
 
     if (!m_byte_length_queuing_strategy_size_function) {
         // 1. Let steps be the following steps, given chunk:
@@ -199,11 +207,11 @@ void UniversalGlobalScopeMixin::notify_about_rejected_promises(Badge<EventLoop>)
 
     // 4. Let global be settings object's global object.
     auto& global = this_impl();
-    auto& global_object = relevant_global_object(relevant_window_or_worker_global_scope(global));
+    auto& global_object = relevant_realm_for_universal_global_scope(global).global_object();
 
     // 5. Queue a global task on the DOM manipulation task source given global to run the following substep:
     queue_global_task(Task::Source::DOMManipulation, global_object, GC::create_function(GC::Heap::the(), [this, &global, list = move(list)] {
-        auto& realm = relevant_realm(relevant_window_or_worker_global_scope(global));
+        auto& realm = relevant_realm_for_universal_global_scope(global);
 
         // 1. For each promise p in list:
         for (auto const& promise : list->elements()) {

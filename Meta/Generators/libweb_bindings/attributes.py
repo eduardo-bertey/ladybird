@@ -51,21 +51,47 @@ def attribute_is_nullable_reflected_element(attribute: Attribute) -> bool:
 
 def attribute_uses_cached_js_value(attribute: Attribute) -> bool:
     return (
-        "CachedAttribute" in attribute.extended_attributes
-        or attribute_is_nullable_reflected_frozen_array_of_element(attribute)
+        "CachedAttribute" in attribute.extended_attributes and "LegacyUnforgeable" not in attribute.extended_attributes
+    ) or attribute_is_nullable_reflected_frozen_array_of_element(attribute)
+
+
+def validate_direct_getter(context: GenerationContext, interface: Interface, attribute: Attribute) -> None:
+    if "DirectGetter" not in attribute.extended_attributes:
+        return
+
+    description = f"[DirectGetter] attribute '{attribute.name}' on '{interface.name}'"
+    resolved_type = context.resolve_typedef(attribute.type)
+    target_interface = context.interface(resolved_type)
+    if target_interface is None or target_interface.is_callback_interface:
+        raise RuntimeError(f"{description} must have an interface type")
+    if not cpp_type_for_idl_type_details(resolved_type, context).gc_ref_target_type:
+        raise RuntimeError(f"{description} must convert from a GC pointer")
+
+    incompatible_extended_attributes = (
+        "CachedAttribute",
+        "ImplementedInBindings",
+        "LegacyUnforgeable",
+        "Reflect",
+        "ReturnsJSValue",
     )
+    for extended_attribute in incompatible_extended_attributes:
+        if extended_attribute in attribute.extended_attributes:
+            raise RuntimeError(f"{description} cannot be combined with [{extended_attribute}]")
 
 
 def reflected_attribute_name(attribute: Attribute) -> str:
-    return attribute.extended_attributes.get("Reflect") or attribute.name.lower()
+    reflected = attribute.extended_attributes.get("Reflect")
+    if reflected:
+        return reflected.strip('"')
+    return attribute.name.lower()
 
 
 def is_dom_string_type(attribute: Attribute) -> bool:
-    return attribute.type.name in ("CSSOMString", "DOMString", "Utf16CSSOMString", "Utf16DOMString")
+    return attribute.type.name in ("CSSOMString", "DOMString")
 
 
 def is_usv_string_type(attribute: Attribute) -> bool:
-    return attribute.type.name in ("USVString", "Utf16USVString")
+    return attribute.type.name == "USVString"
 
 
 def attribute_callback_cpp_name(attribute: Attribute) -> str:
@@ -140,9 +166,7 @@ def define_the_regular_attributes(
     interface: Interface,
 ) -> None:
     # 1. Let attributes be the list of regular attributes that are members of definition.
-    attributes = [
-        attribute for attribute in interface.regular_attributes if "FIXME" not in attribute.extended_attributes
-    ]
+    attributes = interface.regular_attributes
 
     # 2. Remove from attributes all the attributes that are unforgeable.
     attributes = [attribute for attribute in attributes if "LegacyUnforgeable" not in attribute.extended_attributes]
@@ -157,9 +181,7 @@ def define_the_unforgeable_attributes(
     interface: Interface,
 ) -> None:
     attributes = [
-        attribute
-        for attribute in interface.regular_attributes
-        if "FIXME" not in attribute.extended_attributes and "LegacyUnforgeable" in attribute.extended_attributes
+        attribute for attribute in interface.regular_attributes if "LegacyUnforgeable" in attribute.extended_attributes
     ]
     define_the_attributes(out, includes, attributes, interface)
 
@@ -177,6 +199,17 @@ def define_the_attributes(
 
     # 1. For each attribute attr of attributes:
     for attribute in attributes:
+        if "FIXME" in attribute.extended_attributes:
+            definition = f'    object.define_unimplemented_property("{attribute.name}"_utf16_fly_string);\n'
+            out.write(
+                wrap_with_extended_attribute_exposure_checks(
+                    includes,
+                    attribute.extended_attributes,
+                    definition,
+                )
+            )
+            continue
+
         getter_name = attribute_getter_callback_name(attribute)
         setter_name = attribute_setter_callback_name(attribute)
         cpp_name = attribute_callback_cpp_name(attribute)
@@ -194,6 +227,24 @@ def define_the_attributes(
             includes.add("LibWeb/Bindings/Intrinsics.h")
             definition.write(
                 f'    auto {native_getter_name} = host_defined_intrinsics(realm).ensure_web_unforgeable_function("{interface.namespaced_name}"_utf16_fly_string, {cpp_name}_id, {getter_name}, UnforgeableKey::Type::Getter);\n'
+            )
+        elif "DirectGetter" in attribute.extended_attributes:
+            direct_getter_field = attribute.extended_attributes.get("DirectGetter") or idl_identifier_cpp_name(
+                attribute
+            )
+            includes.add("LibGC/Weak.h")
+            includes.add("LibJS/Runtime/NativeFunction.h")
+            includes.add("LibWeb/Bindings/PlatformObject.h")
+            includes.add("LibWeb/Bindings/Wrappable.h")
+            implementation_type = fully_qualified_name_for_interface(interface)
+            definition.write(
+                f"""    auto {native_getter_name} = JS::DirectGetterFunction::create(realm, {getter_name}, 0, {cpp_name}_id, {{
+        .wrapper_implementation_offset = PlatformObject::wrapped_implementation_offset(),
+        .implementation_value_offset = {implementation_type}::{direct_getter_field}_offset(),
+        .main_world_wrapper_offset = Wrappable::main_world_wrapper_offset(),
+        .weak_impl_value_offset = GC::WeakImpl::value_offset(),
+    }}, "get"sv);
+"""
             )
         else:
             definition.write(
@@ -214,6 +265,17 @@ def define_the_attributes(
                 definition.write(
                     f'    auto {native_setter_name} = JS::NativeFunction::create(realm, {setter_name}, 1, {cpp_name}_id, &realm, "set"sv);\n'
                 )
+        define_accessor = f"object.define_direct_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes);"
+        if "CachedAttribute" in attribute.extended_attributes and "LegacyUnforgeable" in attribute.extended_attributes:
+            # Cache the result only on the main-world wrapper, whose cached
+            # attributes can be invalidated directly when native state changes.
+            # Non-main-world wrappers do not currently participate in that
+            # invalidation path.
+            includes.add("LibWeb/Bindings/WrapperWorld.h")
+            define_accessor = f"""if (host_defined_wrapper_world(realm).is_main_world())
+        object.define_direct_cached_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes);
+    else
+        object.define_direct_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes);"""
         definition.write(
             f"""
     // 4. Let configurable be false if attr is unforgeable and true otherwise.
@@ -222,7 +284,7 @@ def define_the_attributes(
     // 5. Let desc be the PropertyDescriptor{{[[Get]]: getter, [[Set]]: setter, [[Enumerable]]: true, [[Configurable]]: configurable}}.
 
     // 7. Perform ! DefinePropertyOrThrow(target, id, desc).
-    object.define_direct_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes);
+    {define_accessor}
 
     // 8. FIXME: If attr’s type is an observable array type with type argument T, then set target’s backing observable array exotic object for attr to the result of creating an observable array exotic object in realm, given T, attr’s set an indexed value algorithm, and attr’s delete an indexed value algorithm.
 """
@@ -232,6 +294,7 @@ def define_the_attributes(
                 includes,
                 attribute.extended_attributes,
                 definition.getvalue(),
+                f"{interface.name}.{attribute.name}",
             )
         )
 
@@ -239,9 +302,15 @@ def define_the_attributes(
 def define_the_static_attributes(out: TextIO, includes: GeneratedIncludes, interface: Interface) -> None:
     for attribute in interface.static_attributes:
         if "FIXME" in attribute.extended_attributes:
+            definition = f'    object.define_unimplemented_property("{attribute.name}"_utf16_fly_string);\n'
+            out.write(wrap_with_extended_attribute_exposure_checks(includes, attribute.extended_attributes, definition))
             continue
         definition = f'    object.define_native_accessor(realm, "{attribute.name}"_utf16_fly_string, {attribute_getter_callback_name(attribute)}, nullptr, default_attributes);\n'
-        out.write(wrap_with_extended_attribute_exposure_checks(includes, attribute.extended_attributes, definition))
+        out.write(
+            wrap_with_extended_attribute_exposure_checks(
+                includes, attribute.extended_attributes, definition, f"{interface.name}.{attribute.name}"
+            )
+        )
 
 
 def write_attribute_getters(
@@ -261,6 +330,8 @@ def write_attribute_getter(
     attribute: Attribute,
     receiver_class: str | None = None,
 ) -> None:
+    validate_direct_getter(context, interface, attribute)
+
     if receiver_class is None:
         receiver_class = interface.prototype_class
 
@@ -430,7 +501,7 @@ def write_attribute_getter(
 
     auto R = idl_object->get_the_attribute_associated_elements(content_attribute, TRY(WebIDL::throw_dom_exception_if_needed(vm, *vm.current_realm(), [&] {{ return idl_object->{idl_implementation_cpp_name(attribute)}(); }})));"""
 
-    if "CachedAttribute" in attribute.extended_attributes:
+    if "CachedAttribute" in attribute.extended_attributes and "LegacyUnforgeable" not in attribute.extended_attributes:
         includes.add("LibWeb/Bindings/WrapperWorld.h")
         includes.add(bindings_glue_header_for_interface(interface))
         getter_prelude = f"""    auto& wrapper_world = host_defined_wrapper_world({getter_realm_argument});
@@ -486,7 +557,6 @@ def write_attribute_getter(
         out.write(
             f"""JS_DEFINE_NATIVE_FUNCTION({receiver_class}::{attribute_getter_callback_name(attribute)})
 {{
-    WebIDL::log_trace(vm, "{receiver_class}::{attribute_getter_callback_name(attribute)}");
     [[maybe_unused]] auto& realm = *vm.current_realm();
     {promise_realm_setup}
 
@@ -520,7 +590,6 @@ def write_attribute_getter(
     out.write(
         f"""JS_DEFINE_NATIVE_FUNCTION({receiver_class}::{attribute_getter_callback_name(attribute)})
 {{
-    WebIDL::log_trace(vm, "{receiver_class}::{attribute_getter_callback_name(attribute)}");
     [[maybe_unused]] auto& realm = *vm.current_realm();
 
     [[maybe_unused]] {fully_qualified_name_for_interface(interface)}* idl_object = nullptr;
@@ -565,11 +634,9 @@ def write_attribute_setter(
         receiver_class = interface.prototype_class
 
     includes.add("LibJS/Runtime/Value.h")
-    includes.add("LibWeb/WebIDL/Tracing.h")
     out.write(
         f"""JS_DEFINE_NATIVE_FUNCTION({receiver_class}::{attribute_setter_callback_name(attribute)})
 {{
-    WebIDL::log_trace(vm, "{receiver_class}::{attribute_setter_callback_name(attribute)}");
     [[maybe_unused]] auto& realm = *vm.current_realm();
 
     auto V = JS::js_undefined();
@@ -803,7 +870,6 @@ def write_static_attribute_getter(
 
     out.write(f"""JS_DEFINE_NATIVE_FUNCTION({interface.constructor_class}::{attribute_getter_callback_name(attribute)})
 {{
-    WebIDL::log_trace(vm, "{interface.constructor_class}::{attribute_getter_callback_name(attribute)}");
     [[maybe_unused]] auto& realm = *vm.current_realm();
 
     // Let R be the result of running the getter steps of attribute.

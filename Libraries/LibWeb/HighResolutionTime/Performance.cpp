@@ -6,7 +6,9 @@
  */
 
 #include <LibJS/Runtime/VM.h>
+#include <LibWeb/Bindings/Performance.h>
 #include <LibWeb/Bindings/PerformanceMeasure.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/EventDispatcher.h>
@@ -53,11 +55,9 @@ GC::Ptr<NavigationTiming::PerformanceTiming> Performance::timing()
 GC::Ptr<NavigationTiming::PerformanceNavigation> Performance::navigation()
 {
     if (!m_navigation) {
-        // FIXME: actually determine values for these
-        u16 type = 0;
-        u16 redirect_count = 0;
-
-        m_navigation = NavigationTiming::PerformanceNavigation::create(type, redirect_count);
+        auto* window = HTML::window_from_global_object(relevant_global_object());
+        VERIFY(window);
+        m_navigation = NavigationTiming::PerformanceNavigation::create(*window);
     }
     return m_navigation;
 }
@@ -79,6 +79,10 @@ double Performance::now() const
 // https://w3c.github.io/user-timing/#mark-method
 WebIDL::ExceptionOr<GC::Ref<UserTiming::PerformanceMark>> Performance::mark(Utf16String const& mark_name, Bindings::PerformanceMarkOptions const& mark_options)
 {
+    auto& realm = relevant_global_object().shape().realm();
+    if (is<HTML::Window>(realm.global_object()))
+        as<HTML::Window>(realm.global_object()).associated_document().style_computer().style_engine().record_benchmark_marker(mark_name);
+
     // 1. Run the PerformanceMark constructor and let entry be the newly created object.
     auto entry = TRY(UserTiming::PerformanceMark::create_for_constructor(relevant_global_object(), mark_name, mark_options));
 

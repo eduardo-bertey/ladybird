@@ -9,197 +9,98 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibGC/Heap.h>
 #include <LibTextCodec/Decoder.h>
-#include <LibWeb/Bindings/HostDefined.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/Bindings/Wrappable.h>
-#include <LibWeb/Bindings/WrapperWorld.h>
-#include <LibWeb/CSS/CSSRuleList.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
-#include <LibWeb/CSS/Keyword.h>
-#include <LibWeb/CSS/MediaList.h>
 #include <LibWeb/CSS/Parser/Parser.h>
-#include <LibWeb/HTML/Window.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 
 namespace Web {
 
-GC::Ref<JS::Realm> internal_css_realm()
+NonnullRefPtr<CSS::StyleSheetState> parse_css_stylesheet(CSS::Parser::ParsingParams const& context, StringView css, Optional<::URL::URL> location, CSS::RustMediaList media_list)
 {
-    static auto& realm = *new GC::Root<JS::Realm>;
-    static auto& principal_realm = *new GC::Root<JS::Realm>;
-    static auto& window = *new GC::Root<HTML::Window>;
-    static auto& execution_context = *new OwnPtr<JS::ExecutionContext>;
-    if (!realm) {
-        auto& vm = Bindings::main_thread_vm();
-        auto depth = vm.execution_context_stack().size();
-        principal_realm = Bindings::create_a_principal_javascript_realm();
-        while (vm.execution_context_stack().size() > depth)
-            vm.pop_execution_context();
-
-        GC::Ptr<Bindings::PlatformObject> global_object;
-        execution_context = Bindings::create_a_new_javascript_realm(
-            vm,
-            [&](JS::Realm& new_realm) -> GC::Ref<JS::Object> {
-                window = HTML::Window::create();
-                // initialize_host_defined_realm() asks for the global object
-                // before HostDefined is installed. Cache the wrapper after
-                // installing HostDefined below, matching Window realm setup.
-                global_object = Bindings::create_global_object_wrapper(new_realm, GC::Ref { *window });
-                return global_object.as_nonnull();
-            },
-            [&](JS::Realm&) -> GC::Ref<JS::Object> {
-                return global_object.as_nonnull();
-            });
-
-        realm = *execution_context->realm;
-        auto intrinsics = realm->create<Bindings::Intrinsics>(*realm);
-        auto wrapper_world = GC::Heap::the().allocate<Bindings::WrapperWorld>(Bindings::WrapperWorld::Type::Internal);
-        realm->set_host_defined(make<Bindings::HostDefined>(intrinsics, wrapper_world, *principal_realm));
-        Bindings::cache_global_object_wrapper(*realm);
-    }
-    return *realm;
+    return parse_css_stylesheet(context, Utf16String::from_utf8(css), move(location), move(media_list));
 }
 
-GC::Ref<CSS::CSSStyleSheet> parse_css_stylesheet(CSS::Parser::ParsingParams const& context, StringView css, Optional<::URL::URL> location, GC::Ptr<CSS::MediaList> media_list)
+NonnullRefPtr<CSS::StyleSheetState> parse_css_stylesheet(CSS::Parser::ParsingParams const& context, Utf16View css, Optional<::URL::URL> location, CSS::RustMediaList media_list)
 {
     if (css.is_empty()) {
-        auto rule_list = CSS::CSSRuleList::create();
-        if (!media_list)
-            media_list = CSS::MediaList::create({});
-        auto style_sheet = CSS::CSSStyleSheet::create(rule_list, *media_list, location);
+        auto style_sheet = CSS::StyleSheetState::create(CSS::RustRuleList {}, nullptr, move(media_list), location);
         style_sheet->set_source_text({});
         return style_sheet;
     }
-    auto style_sheet = CSS::Parser::Parser::create(context, css).parse_as_css_stylesheet(location, move(media_list));
-    style_sheet->set_source_text(Utf16String::from_utf8(css));
-    return style_sheet;
-}
-
-GC::Ref<CSS::CSSStyleSheet> parse_css_stylesheet(CSS::Parser::ParsingParams const& context, Utf16View css, Optional<::URL::URL> location, GC::Ptr<CSS::MediaList> media_list)
-{
-    if (css.is_empty()) {
-        auto rule_list = CSS::CSSRuleList::create();
-        if (!media_list)
-            media_list = CSS::MediaList::create({});
-        auto style_sheet = CSS::CSSStyleSheet::create(rule_list, *media_list, location);
-        style_sheet->set_source_text({});
-        return style_sheet;
-    }
-    auto style_sheet = CSS::Parser::Parser::create(context, css).parse_as_css_stylesheet(location, move(media_list));
+    auto style_sheet = CSS::Parser::Parser { context }.parse_as_css_stylesheet(css, location, move(media_list));
     style_sheet->set_source_text(Utf16String::from_utf16(css));
     return style_sheet;
 }
 
-CSS::Parser::Parser::PropertiesAndCustomProperties parse_css_property_declaration_block(CSS::Parser::ParsingParams const& context, Utf16View css)
+CSS::RustDeclarationBlock parse_css_property_declaration_block(CSS::Parser::ParsingParams const& context, Utf16View css)
 {
     if (css.is_empty())
-        return {};
-    return CSS::Parser::Parser::create(context, css).parse_as_property_declaration_block();
+        return { {}, {} };
+    return CSS::Parser::Parser { context }.parse_as_property_declaration_block(css);
 }
 
-Vector<CSS::Descriptor> parse_css_descriptor_declaration_block(CSS::Parser::ParsingParams const& parsing_params, CSS::AtRuleID at_rule_id, Utf16View css)
+CSS::RustDescriptorBlock parse_css_descriptor_declaration_block(CSS::Parser::ParsingParams const& parsing_params, CSS::AtRuleID at_rule_id, Utf16View css)
 {
     if (css.is_empty())
-        return {};
-    return CSS::Parser::Parser::create(parsing_params, css).parse_as_descriptor_declaration_block(at_rule_id);
+        return CSS::RustDescriptorBlock { Vector<CSS::Descriptor> {} };
+    return CSS::Parser::Parser { parsing_params }.parse_as_descriptor_declaration_block(css, at_rule_id);
 }
 
 RefPtr<CSS::StyleValue const> parse_css_value(CSS::Parser::ParsingParams const& context, StringView string, CSS::PropertyID property_id)
 {
     if (string.is_empty())
         return nullptr;
-    return CSS::Parser::Parser::create(context, string).parse_as_css_value(property_id);
+    return parse_css_value(context, Utf16String::from_utf8(string), property_id);
 }
 
 RefPtr<CSS::StyleValue const> parse_css_value(CSS::Parser::ParsingParams const& context, Utf16View string, CSS::PropertyID property_id)
 {
     if (string.is_empty())
         return nullptr;
-    return CSS::Parser::Parser::create(context, string).parse_as_css_value(property_id);
+    return CSS::Parser::Parser { context }.parse_as_css_value(string, property_id);
 }
 
 RefPtr<CSS::StyleValue const> parse_css_type(CSS::Parser::ParsingParams const& context, Utf16View string, CSS::ValueType value_type)
 {
     if (string.is_empty())
         return nullptr;
-    return CSS::Parser::Parser::create(context, string).parse_as_type(value_type);
+    return CSS::Parser::Parser { context }.parse_primitive_value_from_source(value_type, string);
 }
 
-GC::Ptr<CSS::CSSKeyframeRule> CSS::Parser::parse_keyframe_rule(CSS::Parser::ParsingParams const& context, Utf16View string)
-{
-    if (string.is_empty())
-        return nullptr;
-    return CSS::Parser::Parser::create(context, string).parse_as_keyframe_rule();
-}
-
-Vector<CSS::Percentage> CSS::Parser::parse_keyframe_selectors(CSS::Parser::ParsingParams const& context, Utf16View string)
+Optional<CSS::RustRule> CSS::Parser::parse_keyframe_rule(CSS::Parser::ParsingParams const& context, Utf16View string)
 {
     if (string.is_empty())
         return {};
-    return CSS::Parser::Parser::create(context, string).parse_as_keyframe_selectors();
+    return CSS::Parser::Parser { context }.parse_as_keyframe_rule(string);
 }
 
 RefPtr<CSS::StyleValue const> parse_css_descriptor(CSS::Parser::ParsingParams const& parsing_params, CSS::AtRuleID at_rule_id, CSS::DescriptorNameAndID const& descriptor_name_and_id, Utf16View string)
 {
     if (string.is_empty())
         return nullptr;
-    return CSS::Parser::Parser::create(parsing_params, string).parse_as_descriptor_value(at_rule_id, descriptor_name_and_id);
+    return CSS::Parser::Parser { parsing_params }.parse_as_descriptor_value(string, at_rule_id, descriptor_name_and_id);
 }
 
-CSS::CSSRule* parse_css_rule(CSS::Parser::ParsingParams const& context, Utf16View css_text, bool nested)
+Optional<CSS::RustRule> parse_css_rule(CSS::Parser::ParsingParams const& context, Utf16View css_text, bool nested)
 {
-    return CSS::Parser::Parser::create(context, css_text).parse_as_css_rule(nested);
+    return CSS::Parser::Parser { context }.parse_as_css_rule(css_text, nested);
 }
 
 Optional<CSS::SelectorList> parse_selector(CSS::Parser::ParsingParams const& context, Utf16View selector_text)
 {
-    return CSS::Parser::Parser::create(context, selector_text).parse_as_selector();
-}
-
-Optional<CSS::SelectorList> parse_selector_for_nested_style_rule(CSS::Parser::ParsingParams const& context, Utf16View selector_text, CSS::StyleNestingParent parent_is_scope_rule)
-{
-    auto parser = CSS::Parser::Parser::create(context, selector_text);
-
-    auto maybe_selectors = parser.parse_as_relative_selector(CSS::Parser::Parser::SelectorParsingMode::Standard);
-    if (!maybe_selectors.has_value())
-        return {};
-
-    return adapt_nested_relative_selector_list(*maybe_selectors, parent_is_scope_rule);
-}
-
-Optional<CSS::PageSelectorList> parse_page_selector_list(CSS::Parser::ParsingParams const& params, Utf16View selector_text)
-{
-    return CSS::Parser::Parser::create(params, selector_text).parse_as_page_selector_list();
+    return CSS::Parser::Parser { context }.parse_as_selector(selector_text);
 }
 
 Optional<CSS::Selector::PseudoElementSelector> parse_pseudo_element_selector(CSS::Parser::ParsingParams const& context, Utf16View selector_text)
 {
-    return CSS::Parser::Parser::create(context, selector_text).parse_as_pseudo_element_selector();
+    return CSS::Parser::Parser { context }.parse_as_pseudo_element_selector(selector_text);
 }
 
-RefPtr<CSS::MediaQuery> parse_media_query(CSS::Parser::ParsingParams const& context, Utf16View string)
-{
-    return CSS::Parser::Parser::create(context, string).parse_as_media_query();
-}
-
-Vector<NonnullRefPtr<CSS::MediaQuery>> parse_media_query_list(CSS::Parser::ParsingParams const& context, Utf16View string)
-{
-    return CSS::Parser::Parser::create(context, string).parse_as_media_query_list();
-}
-
-RefPtr<CSS::Supports> parse_css_supports(CSS::Parser::ParsingParams const& context, Utf16View string)
+Optional<CSS::RustQueryHandle> parse_css_supports(CSS::Parser::ParsingParams const& context, Utf16View string)
 {
     if (string.is_empty())
         return {};
-    return CSS::Parser::Parser::create(context, string).parse_as_supports();
-}
-
-Vector<CSS::Parser::ComponentValue> parse_component_values_list(CSS::Parser::ParsingParams const& parsing_params, Utf16View string)
-{
-    return CSS::Parser::Parser::create(parsing_params, string).parse_as_list_of_component_values();
+    return CSS::Parser::Parser { context }.parse_as_supports(string);
 }
 
 // https://drafts.csswg.org/css-syntax/#css-decode-bytes
@@ -273,26 +174,9 @@ ErrorOr<Utf16String> css_decode_bytes(Optional<StringView> const& environment_en
     return TextCodec::convert_input_to_utf16_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, encoded_string);
 }
 
-// https://drafts.csswg.org/css-values-4/#identifier-value
-bool is_valid_custom_ident(Utf16View ident, ReadonlySpan<Utf16View> const& blacklist)
+bool is_valid_animation_name_custom_ident(Utf16View ident)
 {
-    // The CSS-wide keywords are not valid <custom-ident>s.
-    if (auto keyword = CSS::keyword_from_string(ident); keyword.has_value() && CSS::is_css_wide_keyword(keyword.value()))
-        return false;
-
-    // The default keyword is reserved and is also not a valid <custom-ident>.
-    if (ident.equals_ignoring_ascii_case("default"sv))
-        return false;
-
-    // Specifications using <custom-ident> must specify clearly what other keywords are excluded from <custom-ident>,
-    // if any—for example by saying that any pre-defined keywords in that property’s value definition are excluded.
-    // Excluded keywords are excluded in all ASCII case permutations.
-    for (auto& value : blacklist) {
-        if (ident.equals_ignoring_ascii_case(value))
-            return false;
-    }
-
-    return true;
+    return CSS::Parser::ValueParserFFI::rust_is_valid_animation_name_custom_ident(CSS::Parser::ffi_utf16_view(ident));
 }
 
 }

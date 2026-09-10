@@ -1,14 +1,13 @@
 /*
  * Copyright (c) 2023, Tim Flynn <trflynn89@serenityos.org>
- * Copyright (c) 2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2025-2026, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Base64.h>
 #include <LibGfx/ImageFormats/PNGWriter.h>
 
-#import <Utilities/Conversions.h>
+#import <UI/AppKit/Utilities/Conversions.h>
 
 namespace Ladybird {
 
@@ -57,14 +56,10 @@ NSData* string_to_ns_data(StringView string)
     return [NSData dataWithBytes:string.characters_without_null_termination() length:string.length()];
 }
 
-NSImage* image_from_base64_png(StringView string, NSSize size)
+NSImage* image_from_png(ReadonlyBytes bytes, NSSize size)
 {
-    auto decoded = decode_base64(string);
-    if (decoded.is_error())
-        return nil;
-
-    auto* data = [NSData dataWithBytes:decoded.value().data()
-                                length:decoded.value().size()];
+    auto* data = [NSData dataWithBytes:bytes.data()
+                                length:bytes.size()];
     auto* image = [[NSImage alloc] initWithData:data];
     [image setSize:size];
     return image;
@@ -178,6 +173,12 @@ NSImage* gfx_bitmap_to_ns_image(Gfx::Bitmap const& bitmap)
                                 length:png.value().size()];
 
     return [[NSImage alloc] initWithData:data];
+}
+
+NSURL* url_to_ns_url(URL::URL const& url)
+{
+    auto serialized_url = url.serialize();
+    return [NSURL URLWithDataRepresentation:string_to_ns_data(serialized_url.bytes_as_string_view()) relativeToURL:nil];
 }
 
 }

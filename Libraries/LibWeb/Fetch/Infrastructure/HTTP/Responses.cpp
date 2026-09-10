@@ -114,15 +114,15 @@ bool Response::is_network_error() const
     return true;
 }
 
-void Response::release_request_for_transfer() const
+void Response::release_request_transfer_lease() const
 {
     if (m_request_server_request.has_value() && m_request_server_request->request)
-        m_request_server_request->request->release_for_transfer();
+        m_request_server_request->request->release_transfer_lease();
 }
 
 void Response::resume_body_delivery() const
 {
-    release_request_for_transfer();
+    release_request_transfer_lease();
     if (m_request_server_request.has_value()) {
         if (m_request_server_request->request)
             m_request_server_request->request->resume_body_delivery();
@@ -209,7 +209,9 @@ GC::Ref<Response> Response::clone(JS::Realm& realm) const
     new_response->set_range_requested(m_range_requested);
     new_response->set_request_includes_credentials(m_request_includes_credentials);
     new_response->set_timing_allow_passed(m_timing_allow_passed);
+    new_response->set_navigation_timing_allow_values_list(m_navigation_timing_allow_values_list);
     new_response->set_body_info(m_body_info);
+    new_response->set_redirect_taint(m_redirect_taint);
     new_response->set_javascript_bytecode_cache(m_javascript_bytecode_cache);
     new_response->set_javascript_bytecode_cache_vary_key(m_javascript_bytecode_cache_vary_key);
     if (m_request_server_request.has_value())

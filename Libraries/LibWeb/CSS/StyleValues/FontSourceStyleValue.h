@@ -19,10 +19,6 @@ public:
     };
     using Source = Variant<Local, URL>;
 
-    static ValueComparingNonnullRefPtr<FontSourceStyleValue const> create(Source source, Optional<Utf16FlyString> format, Vector<FontTech> tech)
-    {
-        return adopt_ref(*new (nothrow) FontSourceStyleValue(move(source), move(format), move(tech)));
-    }
     virtual ~FontSourceStyleValue() override;
 
     Source source() const;
@@ -30,7 +26,7 @@ public:
     {
         if (!m_value->font_source.has_format)
             return {};
-        return Utf16FlyString::from_raw(m_value->font_source.format.raw);
+        return css_string_from_rust(&m_value->font_source.format);
     }
     Vector<FontTech> tech() const
     {
@@ -42,19 +38,10 @@ public:
         return tech;
     }
 
-    void serialize(StringBuilder&, SerializationMode) const;
-
-    bool properties_equal(FontSourceStyleValue const&) const;
-
 private:
     friend class StyleValue;
 
-    FontSourceStyleValue(Source source, Optional<Utf16FlyString> format, Vector<FontTech> tech);
     explicit FontSourceStyleValue(StyleValueFFI::StyleValueData const*);
-
-    static StyleValueFFI::StyleValueData const* make_font_source_data(Source const&, Optional<Utf16FlyString> const&, Vector<FontTech> const&);
-
-    ValueComparingRefPtr<StyleValue const> m_local_name;
 };
 
 }

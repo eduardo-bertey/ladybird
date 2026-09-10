@@ -3,12 +3,14 @@ set(SOURCES
     Calendar.cpp
     Calendars/AdjustedEraCalendar.cpp
     Calendars/ChineseDangiCalendar.cpp
+    CaseMapping.cpp
     CharacterTypes.cpp
     Collator.cpp
     CurrencyCode.cpp
     DateTimeFormat.cpp
     DisplayNames.cpp
     DurationFormat.cpp
+    FullwidthMapping.cpp
     ICU.cpp
     IDNA.cpp
     ListFormat.cpp
@@ -30,7 +32,7 @@ ladybird_lib(LibUnicode unicode)
 
 target_link_libraries(LibUnicode PRIVATE ICU::i18n ICU::uc ICU::data)
 
-import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libunicode_rust FEATURES allocator FFI_HEADER RustFFI.h)
+import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libunicode_rust FEATURES allocator idna FFI_HEADER RustFFI.h)
 target_link_libraries(LibUnicode PRIVATE libunicode_rust)
 
 # FIXME: Add support for building LibGfx in sanitize

@@ -33,6 +33,8 @@ class WEB_API SVGElement
 public:
     virtual bool requires_svg_container() const override { return true; }
 
+    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+
     GC::Ref<SVGAnimatedString> class_name();
     GC::Ptr<SVGSVGElement> owner_svg_element();
     GC::Ptr<SVGElement> viewport_element();
@@ -42,25 +44,31 @@ public:
 
     Gfx::Size<double> viewport_size_for_percentage_resolution();
 
-    GC::Ref<SVGAnimatedLength> svg_animated_length_for_attribute(Utf16FlyString const&, SVGLength::Directionality, NonnullRefPtr<CSS::StyleValue const>&& default_value);
+    GC::Ref<SVGAnimatedLength> svg_animated_length_for_attribute(Utf16FlyString const&, SVGLength::Directionality, SVGLengthValue default_value);
 
     virtual bool is_presentational_hint(Utf16FlyString const&) const final override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const final override;
+    virtual bool publishes_presentational_hints_on_arrival() const final override { return true; }
 
     void register_resource_box_referencing_element(Badge<Layout::LayoutTreeBuilderAccess>, DOM::Element&);
+    void note_svg_paint_resource_description_may_have_changed();
 
 protected:
     SVGElement(DOM::Document&, DOM::QualifiedName);
     virtual void visit_edges(Cell::Visitor&) override;
 
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
+    virtual void adopted_from(DOM::Document&) override;
     virtual WebIDL::ExceptionOr<void> cloned(DOM::Node&, bool) const override;
     virtual void children_changed(ChildrenChangedMetadata const&) override;
     virtual void inserted() override;
     virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
+    virtual void moved_from(IsSubtreeRoot, GC::Ptr<Node> old_ancestor) override;
     void update_use_elements_that_reference_this();
+    bool describes_svg_paint_resource() const;
     void remove_from_use_element_that_reference_this();
     void mark_resource_box_referencing_elements_for_layout_tree_update();
+    void mark_resource_box_referencing_elements_for_layout_update();
 
 private:
     // ^HTML::GlobalEventHandlers
@@ -68,7 +76,14 @@ private:
 
     virtual bool is_svg_element() const final { return true; }
 
+    RefPtr<CSS::StyleValue const> parse_presentation_attribute(CSS::PropertyID, Utf16View) const;
+    Vector<CSS::StyleProperty> const& presentation_attribute_style() const;
+    void update_presentation_attribute_style(Utf16FlyString const& name, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_);
+    void publish_presentation_attribute_style();
+
     GC::Ptr<SVGAnimatedString> m_class_name_animated_string;
+
+    mutable Optional<Vector<CSS::StyleProperty>> m_presentation_attribute_style;
 
     // Many reflecting attributes are marked as SameObject so we cache the objects we create here.
     HashMap<Utf16FlyString, GC::Ref<SVGAnimatedLength>> m_reflected_attribute_cache;

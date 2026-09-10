@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
 
@@ -34,7 +34,7 @@ public:
         return m_clip_path_units.value_or(ClipPathUnits::UserSpaceOnUse);
     }
 
-    virtual RefPtr<Layout::Node> create_layout_node(NonnullRefPtr<CSS::ComputedValues const>) override;
+    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
 
 private:
     SVGClipPathElement(DOM::Document&, DOM::QualifiedName);

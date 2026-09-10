@@ -9,23 +9,12 @@
 
 #include "NumberStyleValue.h"
 #include <LibWeb/CSS/CSSUnitValue.h>
-#include <LibWeb/CSS/Parser/ComponentValue.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/Serialize.h>
 #include <LibWeb/CSS/ValueType.h>
 
 namespace Web::CSS {
-
-void NumberStyleValue::serialize(StringBuilder& builder, SerializationMode) const
-{
-    serialize_a_number(builder, number());
-}
-
-Vector<Parser::ComponentValue> NumberStyleValue::tokenize() const
-{
-    return { Parser::Token::create_number(Number { Number::Type::Number, number() }) };
-}
 
 // https://drafts.css-houdini.org/css-typed-om-1/#reify-a-numeric-value
 GC::Ref<CSSStyleValue> NumberStyleValue::reify(Utf16FlyString const& associated_property) const

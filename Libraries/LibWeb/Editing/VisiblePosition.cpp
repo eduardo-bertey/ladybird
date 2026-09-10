@@ -9,8 +9,7 @@
 #include <LibWeb/Editing/Internal/Algorithms.h>
 #include <LibWeb/Editing/VisiblePosition.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
-#include <LibWeb/Painting/PaintableFragment.h>
-#include <LibWeb/VisualLines.h>
+#include <LibWeb/Layout/TextNode.h>
 
 namespace Web::Editing {
 
@@ -79,29 +78,23 @@ Optional<DOM::BoundaryPoint> VisiblePosition::canonical_boundary_for_extension(W
 
 static bool has_rendered_text_before(DOM::Text const& text, size_t offset)
 {
-    for (auto const& line : collect_visual_lines(text)) {
-        for (auto const* fragment : line.fragments) {
-            if (fragment->length_in_code_units() > 0 && fragment->dom_start_offset_in_node() < offset)
-                return true;
-        }
-    }
-    return false;
+    auto const* layout_node = text.unsafe_layout_node();
+    if (!layout_node)
+        return false;
+    return Layout::RustFFI::layout_arena_text_has_rendered_text_before(layout_node->arena_handle(), Layout::Node::slot_id(layout_node), offset);
 }
 
 static bool has_rendered_text_after(DOM::Text const& text, size_t offset)
 {
-    for (auto const& line : collect_visual_lines(text)) {
-        for (auto const* fragment : line.fragments) {
-            if (fragment->length_in_code_units() > 0 && fragment->dom_end_offset_in_node() > offset)
-                return true;
-        }
-    }
-    return false;
+    auto const* layout_node = text.unsafe_layout_node();
+    if (!layout_node)
+        return false;
+    return Layout::RustFFI::layout_arena_text_has_rendered_text_after(layout_node->arena_handle(), Layout::Node::slot_id(layout_node), offset);
 }
 
 static bool is_rendered_atomic_inline(DOM::Node const& node)
 {
-    auto const* layout_node = node.layout_node();
+    auto const* layout_node = node.unsafe_layout_node();
     return layout_node && layout_node->is_atomic_inline();
 }
 

@@ -57,6 +57,17 @@ pub struct FFIExceptionHandler {
     pub start_offset: u32,
     pub end_offset: u32,
     pub handler_offset: u32,
+    pub catches_exception: bool,
+}
+
+#[repr(C)]
+pub struct FFILocalVariableMetadata {
+    pub is_mutable: bool,
+    pub has_scope_range: bool,
+    pub scope_start_line: u32,
+    pub scope_start_column: u32,
+    pub scope_end_line: u32,
+    pub scope_end_column: u32,
 }
 
 /// Source map entry mapping bytecode offset to source position.
@@ -213,7 +224,8 @@ pub struct FFIExecutableData {
     pub identifier_count: usize,
     pub property_key_table: *const FFIUtf16Slice,
     pub property_key_count: usize,
-    pub string_table: *const FFIUtf16Slice,
+    /// Raw `AK::Utf16String` owners transferred to C++ by `rust_create_executable`.
+    pub owned_string_table: *const usize,
     pub string_count: usize,
     pub constants_data: *const u8,
     pub constants_data_length: usize,
@@ -225,7 +237,10 @@ pub struct FFIExecutableData {
     pub basic_block_offsets: *const usize,
     pub basic_block_count: usize,
     pub local_variable_names: *const FFIUtf16Slice,
+    pub local_variable_metadata: *const FFILocalVariableMetadata,
     pub local_variable_count: usize,
+    pub argument_variable_names: *const FFIUtf16Slice,
+    pub argument_variable_count: usize,
     pub property_lookup_cache_count: u32,
     pub global_variable_cache_count: u32,
     pub environment_coordinate_cache_count: u32,
@@ -718,7 +733,12 @@ pub unsafe fn create_executable(
             },
         );
         let bp_ptrs = materialize_class_blueprints(generator, vm_ptr, source_code_ptr);
-        create_executable_with_dependencies(generator, assembled, vm_ptr, source_code_ptr, &sfd_ptrs, &bp_ptrs)
+        let executable =
+            create_executable_with_dependencies(generator, assembled, vm_ptr, source_code_ptr, &sfd_ptrs, &bp_ptrs);
+
+        // C++ takes ownership of the compiled regular expressions while constructing the executable.
+        generator.compiled_regexes.clear();
+        executable
     }
 }
 
@@ -780,7 +800,63 @@ pub struct ExecutableSlices<'a> {
     pub constants_data: &'a [u8],
     pub constants_count: usize,
     pub local_variable_names: &'a [FFIUtf16Slice],
+    pub local_variable_metadata: &'a [FFILocalVariableMetadata],
+    pub argument_variable_names: &'a [FFIUtf16Slice],
     pub compiled_regexes: &'a [*mut c_void],
+}
+
+struct NativeUtf16StringTable {
+    strings: Vec<usize>,
+    transferred: bool,
+}
+
+impl NativeUtf16StringTable {
+    /// Creates native AK string owners from borrowed FFI slices.
+    ///
+    /// # Safety
+    /// Every slice must point to valid UTF-16 storage for the duration of this call.
+    unsafe fn new(slices: &[FFIUtf16Slice]) -> Self {
+        let mut table = Self {
+            strings: Vec::with_capacity(slices.len()),
+            transferred: false,
+        };
+        for slice in slices {
+            let units = if slice.length == 0 {
+                &[]
+            } else {
+                assert!(!slice.data.is_null());
+                // SAFETY: The caller guarantees that every FFI slice is valid for this call.
+                unsafe { std::slice::from_raw_parts(slice.data, slice.length) }
+            };
+            table.strings.push(ak::Utf16String::from_utf16(units).into_raw());
+        }
+        table
+    }
+
+    fn as_ptr(&self) -> *const usize {
+        self.strings.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.strings.len()
+    }
+
+    fn mark_transferred(&mut self) {
+        self.transferred = true;
+    }
+}
+
+impl Drop for NativeUtf16StringTable {
+    fn drop(&mut self) {
+        if self.transferred {
+            return;
+        }
+
+        for raw in self.strings.drain(..) {
+            // SAFETY: Until the table is marked transferred, it owns every raw reference.
+            drop(unsafe { ak::Utf16String::from_raw_owned(raw) });
+        }
+    }
 }
 
 /// Create a C++ Executable from borrowed FFI slices.
@@ -810,6 +886,7 @@ pub unsafe fn create_executable_from_slices(
                 start_offset: h.start_offset,
                 end_offset: h.end_offset,
                 handler_offset: h.handler_offset,
+                catches_exception: h.catches_exception,
             })
             .collect();
 
@@ -824,6 +901,10 @@ pub unsafe fn create_executable_from_slices(
             })
             .collect();
 
+        // Materialize ordinary strings directly in AK's stable representation. C++ adopts these
+        // owners below without copying character data or changing their reference counts.
+        let mut native_string_table = NativeUtf16StringTable::new(slices.string_table);
+
         let ffi_data = FFIExecutableData {
             bytecode: parts.bytecode.as_ptr(),
             bytecode_length: parts.bytecode.len(),
@@ -832,8 +913,8 @@ pub unsafe fn create_executable_from_slices(
             identifier_count: slices.identifier_table.len(),
             property_key_table: slices.property_key_table.as_ptr(),
             property_key_count: slices.property_key_table.len(),
-            string_table: slices.string_table.as_ptr(),
-            string_count: slices.string_table.len(),
+            owned_string_table: native_string_table.as_ptr(),
+            string_count: native_string_table.len(),
             constants_data: slices.constants_data.as_ptr(),
             constants_data_length: slices.constants_data.len(),
             constants_count: slices.constants_count,
@@ -844,7 +925,10 @@ pub unsafe fn create_executable_from_slices(
             basic_block_offsets: parts.basic_block_start_offsets.as_ptr(),
             basic_block_count: parts.basic_block_start_offsets.len(),
             local_variable_names: slices.local_variable_names.as_ptr(),
+            local_variable_metadata: slices.local_variable_metadata.as_ptr(),
             local_variable_count: slices.local_variable_names.len(),
+            argument_variable_names: slices.argument_variable_names.as_ptr(),
+            argument_variable_count: slices.argument_variable_names.len(),
             property_lookup_cache_count: metadata.property_lookup_cache_count,
             global_variable_cache_count: metadata.global_variable_cache_count,
             environment_coordinate_cache_count: metadata.environment_coordinate_cache_count,
@@ -863,7 +947,10 @@ pub unsafe fn create_executable_from_slices(
             regex_count: slices.compiled_regexes.len(),
         };
 
-        rust_create_executable(vm_ptr, source_code_ptr, &raw const ffi_data)
+        let executable = rust_create_executable(vm_ptr, source_code_ptr, &raw const ffi_data);
+        // C++ adopts all string_count owners before returning, including on validation failure.
+        native_string_table.mark_transferred();
+        executable
     }
 }
 
@@ -913,6 +1000,23 @@ pub unsafe fn create_executable_with_dependencies_from_parts(
             .iter()
             .map(|v| FFIUtf16Slice::from(v.name.as_ref()))
             .collect();
+        let local_variable_metadata: Vec<FFILocalVariableMetadata> = generator
+            .local_variables
+            .iter()
+            .map(|variable| FFILocalVariableMetadata {
+                is_mutable: variable.is_mutable,
+                has_scope_range: variable.scope_range.is_some(),
+                scope_start_line: variable.scope_range.map_or(0, |range| range.start.line),
+                scope_start_column: variable.scope_range.map_or(0, |range| range.start.column),
+                scope_end_line: variable.scope_range.map_or(0, |range| range.end.line),
+                scope_end_column: variable.scope_range.map_or(0, |range| range.end.column),
+            })
+            .collect();
+        let argument_variable_names: Vec<FFIUtf16Slice> = generator
+            .argument_variable_names
+            .iter()
+            .map(|name| FFIUtf16Slice::from(name.as_ref()))
+            .collect();
 
         let metadata = ExecutableMetadata {
             property_lookup_cache_count: generator.next_property_lookup_cache,
@@ -932,6 +1036,8 @@ pub unsafe fn create_executable_with_dependencies_from_parts(
             constants_data: &constants_buffer,
             constants_count: generator.constants.len(),
             local_variable_names: &local_var_slices,
+            local_variable_metadata: &local_variable_metadata,
+            argument_variable_names: &argument_variable_names,
             compiled_regexes: &generator.compiled_regexes,
         };
 

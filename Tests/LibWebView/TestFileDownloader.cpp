@@ -14,8 +14,11 @@
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
+#include <LibCore/Timer.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibMain/Main.h>
+#include <LibRequests/Request.h>
+#include <LibRequests/RequestClient.h>
 #include <LibSync/Mutex.h>
 #include <LibThreading/Thread.h>
 #include <LibURL/Parser.h>
@@ -389,6 +392,107 @@ void expect_file_matches(StringView path, ReadonlyBytes expected)
     VERIFY(contents.bytes() == expected);
 }
 
+void expect_request_can_be_released_from_finish_callback(TestHttpServer& server, size_t expected_body_size)
+{
+    auto url = URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/file", server.port()));
+    VERIFY(url.has_value());
+
+    auto request = WebView::Application::request_server_client().start_request("GET"sv, *url);
+    VERIFY(request);
+
+    size_t delivered_size = 0;
+    bool finished = false;
+
+    request->set_body_delivery_paused(true);
+    request->set_unbuffered_request_callbacks(
+        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CameFromCache) {
+        },
+        [&](Requests::ResponseData data) {
+            delivered_size += data.bytes().size();
+        },
+        [](Core::ImmutableBytes) {
+        },
+        [&](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError>) {
+            request = nullptr;
+            finished = true;
+        });
+
+    // Wait for RequestServer completion to release its reference while the response body remains paused. This makes
+    // the finish callback release the final external reference to the request when body delivery resumes.
+    Core::EventLoop::current().spin_until([&] { return request->ref_count() == 1; });
+
+    request->resume_body_delivery();
+    Core::EventLoop::current().spin_until([&] { return finished; });
+
+    VERIFY(!request);
+    VERIFY(delivered_size == expected_body_size);
+}
+
+void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHttpServer& server, size_t expected_body_size)
+{
+    auto& request_client = WebView::Application::request_server_client();
+
+    auto url = URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/file", server.port()));
+    VERIFY(url.has_value());
+
+    auto request = request_client.start_request("GET"sv, *url, {}, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::Yes);
+    VERIFY(request);
+
+    bool finished = false;
+    bool stopped = false;
+
+    request->set_body_delivery_paused(true);
+    request->set_unbuffered_request_callbacks(
+        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CameFromCache) {
+        },
+        [](Requests::ResponseData) {
+        },
+        [](Core::ImmutableBytes) {
+        },
+        [&](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError>) {
+            finished = true;
+        });
+    request->set_stop_callback([&] {
+        stopped = true;
+    });
+
+    // Let RequestServer finish the request while its body stays paused. That's the state every navigation to a small or
+    // cached document is in by the time the UI process adopts its response.
+    Core::EventLoop::current().spin_until([&] { return request->is_finished(); });
+    VERIFY(!finished);
+
+    // Adopting the finished request transfers it away from its original owner — which has to be told to let go of it.
+    auto adopted_request = request_client.adopt_request(request_client.request_server_client_id(), request->id());
+    VERIFY(adopted_request);
+
+    size_t delivered_size = 0;
+    bool adopted_request_finished = false;
+
+    adopted_request->set_unbuffered_request_callbacks(
+        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CameFromCache) {
+        },
+        [&](Requests::ResponseData data) {
+            delivered_size += data.bytes().size();
+        },
+        [](Core::ImmutableBytes) {
+        },
+        [&](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError>) {
+            adopted_request_finished = true;
+        });
+
+    bool timed_out = false;
+    auto timeout = Core::Timer::create_single_shot(10'000, [&] {
+        timed_out = true;
+    });
+    timeout->start();
+
+    // The transfer stops the original request, and drops the client's reference to it — so, this one is the last.
+    Core::EventLoop::current().spin_until([&] { return (stopped && adopted_request_finished && request->ref_count() == 1) || timed_out; });
+    VERIFY(!timed_out);
+    VERIFY(!finished);
+    VERIFY(delivered_size == expected_body_size);
+}
+
 }
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
@@ -408,6 +512,22 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #else
     auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
 #endif
+
+    {
+        auto response_body = make_body(4 * KiB);
+        TestHttpServer server { response_body, RangeSupport::No };
+
+        expect_request_can_be_released_from_finish_callback(server, response_body.size());
+        outln("release request from finish callback");
+    }
+
+    {
+        auto response_body = make_body(4 * KiB);
+        TestHttpServer server { response_body, RangeSupport::No };
+
+        expect_leased_request_is_torn_down_when_transferred_after_finishing(server, response_body.size());
+        outln("leased request torn down when transferred after finishing");
+    }
 
     auto body = make_body(12 * MiB);
 

@@ -16,6 +16,7 @@
 #include <LibRequests/CacheSizes.h>
 #include <LibRequests/CameFromCache.h>
 #include <LibRequests/RequestTimingInfo.h>
+#include <LibRequests/RequestTransferLease.h>
 #include <LibRequests/WebSocket.h>
 #include <LibWebSocket/WebSocket.h>
 #include <RequestServer/IsPrivate.h>
@@ -34,7 +35,12 @@ class RequestClient final
 public:
     using InitTransport = Messages::RequestServer::InitTransport;
 
-    enum class KeepAliveForTransfer : u8 {
+    enum class TransferLease : u8 {
+        No,
+        Yes,
+    };
+
+    enum class CacheMissNotification {
         No,
         Yes,
     };
@@ -43,10 +49,11 @@ public:
     virtual ~RequestClient() override;
 
     // Best-effort index into the resolved address pool.
-    RefPtr<Request> start_request(ByteString const& method, URL::URL const&, Optional<HTTP::HeaderList const&> request_headers = {}, ReadonlyBytes request_body = {}, HTTP::CacheMode = HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials = HTTP::Cookie::IncludeCredentials::Yes, Core::ProxyData const& = {}, KeepAliveForTransfer = KeepAliveForTransfer::No, Optional<u32> address_selection_hint = {});
-    RefPtr<Request> adopt_request(int source_client_id, u64 source_request_id);
+    RefPtr<Request> start_request(ByteString const& method, URL::URL const&, Optional<HTTP::HeaderList const&> request_headers = {}, ReadonlyBytes request_body = {}, HTTP::CacheMode = HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials = HTTP::Cookie::IncludeCredentials::Yes, TransferLease = TransferLease::No, Optional<u32> address_selection_hint = {}, CacheMissNotification = CacheMissNotification::No);
+    RefPtr<Request> adopt_request(int source_client_id, u64 source_request_id, TransferLease = TransferLease::No);
     bool stop_request(Badge<Request>, Request&);
-    void release_request_for_transfer(Badge<Request>, Request&);
+    void release_request_transfer_lease(Badge<Request>, Request&, RequestTransferLeaseKey);
+    void release_request_transfer_lease(RequestTransferLeaseKey);
     void ensure_connection(URL::URL const&, RequestServer::CacheLevel);
     int request_server_client_id() const { return m_request_server_client_id; }
 
@@ -55,8 +62,11 @@ public:
     RefPtr<WebSocket> websocket_connect(URL::URL const&, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers);
 
     NonnullRefPtr<Core::Promise<CacheSizes>> estimate_cache_size_accessed_since(UnixDateTime since);
+    NonnullRefPtr<Core::Promise<Empty>> clear_cache(UnixDateTime since);
+
     ErrorOr<bool> store_cache_associated_data(URL::URL const&, ByteString const& method, Optional<HTTP::HeaderList const&> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData, ReadonlyBytes);
     ErrorOr<Optional<Core::AnonymousBuffer>> retrieve_cache_associated_data(URL::URL const&, ByteString const& method, Optional<HTTP::HeaderList const&> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData);
+
     ErrorOr<bool> create_synthetic_cache_entry(URL::URL const&, ByteString const& method);
 
     Function<String(URL::URL const&, RequestServer::IsPrivate)> on_retrieve_http_cookie;
@@ -65,6 +75,7 @@ public:
 private:
     virtual void die() override;
 
+    virtual void request_requires_network(u64 request_id) override;
     virtual void request_started(u64 request_id, IPC::File) override;
     virtual void request_body_file_available(u64 request_id, IPC::File, u64 offset, u64 size) override;
     virtual void request_cached_body_file_available(u64 request_id, IPC::File, u64 offset, u64 size) override;
@@ -72,7 +83,7 @@ private:
     virtual void headers_became_available(u64 request_id, Vector<HTTP::Header>, Optional<u32>, Optional<String>, Optional<IPC::File>, u64 javascript_bytecode_size, Optional<u64>, CameFromCache) override;
     virtual void request_transferred(u64 request_id) override;
 
-    virtual void retrieve_http_cookie(int client_id, u64 request_id, RequestServer::RequestType request_type, URL::URL url, RequestServer::IsPrivate) override;
+    virtual void retrieve_http_cookie(int client_id, u64 request_id, RequestServer::RequestType request_type, u64 cookie_request_id, URL::URL url, RequestServer::IsPrivate) override;
 
     virtual void certificate_requested(u64 request_id) override;
 
@@ -85,6 +96,7 @@ private:
     virtual void websocket_certificate_requested(u64 websocket_id) override;
 
     virtual void estimated_cache_size(u64 cache_size_estimation_id, CacheSizes sizes) override;
+    virtual void removed_cache_entries(u64 clear_cache_request_id) override;
 
     HashMap<u64, RefPtr<Request>> m_requests;
     u64 m_next_request_id { 0 };
@@ -95,6 +107,9 @@ private:
 
     HashMap<u64, NonnullRefPtr<Core::Promise<CacheSizes>>> m_pending_cache_size_estimations;
     u64 m_next_cache_size_estimation_id { 0 };
+
+    HashMap<u64, NonnullRefPtr<Core::Promise<Empty>>> m_pending_clear_cache_requests;
+    u64 m_next_clear_cache_request_id { 0 };
 };
 
 }

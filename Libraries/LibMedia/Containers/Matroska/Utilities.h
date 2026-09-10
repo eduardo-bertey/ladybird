@@ -6,42 +6,51 @@
 
 #pragma once
 
-#include <AK/String.h>
 #include <LibMedia/CodecID.h>
+#include <LibMedia/ContainerID.h>
+#include <LibMedia/Containers/Matroska/Document.h>
 
 namespace Media::Matroska {
 
-static constexpr CodecID codec_id_from_matroska_id_string(String const& codec_id)
+constexpr bool supports_codec_in_container(ContainerID container_id, CodecID codec_id)
 {
-    if (codec_id == "V_VP8")
-        return CodecID::VP8;
-    if (codec_id == "V_VP9")
-        return CodecID::VP9;
-    if (codec_id == "V_MPEG1")
-        return CodecID::MPEG1;
-    if (codec_id == "V_MPEG2")
-        return CodecID::H262;
-    if (codec_id == "V_MPEG4/ISO/AVC")
-        return CodecID::H264;
-    if (codec_id == "V_MPEGH/ISO/HEVC")
-        return CodecID::H265;
-    if (codec_id == "A_MPEG/L3")
-        return CodecID::MP3;
-    if (codec_id == "A_AAC" || codec_id == "A_AAC/MPEG4/LC"
-        || codec_id == "A_AAC/MPEG4/LC/SBR" || codec_id == "A_AAC/MPEG4/LTP"
-        || codec_id == "A_AAC/MPEG4/MAIN" || codec_id == "A_AAC/MPEG4/SSR")
-        return CodecID::AAC;
-    if (codec_id == "V_AV1")
-        return CodecID::AV1;
-    if (codec_id == "V_THEORA")
-        return CodecID::Theora;
-    if (codec_id == "A_VORBIS")
-        return CodecID::Vorbis;
-    if (codec_id == "A_OPUS")
-        return CodecID::Opus;
-    if (codec_id == "A_FLAC")
-        return CodecID::FLAC;
-    return CodecID::Unknown;
+    if (container_id == ContainerID::WebM) {
+        switch (codec_id) {
+        case CodecID::VP8:
+        case CodecID::VP9:
+        case CodecID::AV1:
+        case CodecID::Vorbis:
+        case CodecID::Opus:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    if (container_id != ContainerID::Matroska)
+        return false;
+
+    switch (codec_id) {
+    case CodecID::VP8:
+    case CodecID::VP9:
+    case CodecID::H264:
+    case CodecID::H265:
+    case CodecID::MP3:
+    case CodecID::AAC:
+    case CodecID::AV1:
+    case CodecID::Theora:
+    case CodecID::Vorbis:
+    case CodecID::Opus:
+    case CodecID::FLAC:
+    case CodecID::U8:
+    case CodecID::S16LE:
+    case CodecID::S24LE:
+    case CodecID::S32LE:
+    case CodecID::F32LE:
+        return true;
+    default:
+        return false;
+    }
 }
 
 }

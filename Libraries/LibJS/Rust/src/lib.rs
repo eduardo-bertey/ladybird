@@ -52,8 +52,12 @@
 //! - `bytecode/` — Bytecode generator, instruction types, and FFI
 //! - `scope_collector.rs` — Scope analysis
 
+/// cbindgen:ignore
 #[path = "../../../RustAllocator.rs"]
 mod rust_allocator;
+
+#[path = "../../../RustPanic.rs"]
+mod rust_panic;
 
 /// Compile-time conversion of an ASCII string literal to `&'static [u16]`.
 ///
@@ -97,6 +101,7 @@ pub(crate) fn u32_from_usize(value: usize) -> u32 {
     u32::try_from(value).expect("value exceeds u32::MAX")
 }
 
+use crate::rust_panic::abort_on_panic;
 use ast::StatementKind;
 use bytecode::generator::PendingSharedFunctionData;
 use parser::ParseError;
@@ -105,8 +110,6 @@ use parser::ProgramType;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::panic::AssertUnwindSafe;
-use std::panic::catch_unwind;
 use std::rc::Rc;
 
 // Compile-time assertion: `ParsedProgram` travels between the parse worker
@@ -184,25 +187,6 @@ unsafe impl Send for CompiledFunction {}
 // =============================================================================
 // Internal helpers
 // =============================================================================
-
-/// Catch any Rust panics to prevent undefined behavior from unwinding across
-/// the FFI boundary. Aborts the process on panic.
-fn abort_on_panic<F: FnOnce() -> R, R>(f: F) -> R {
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(result) => result,
-        Err(payload) => {
-            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            eprintln!("Rust panic at FFI boundary: {msg}");
-            std::process::abort();
-        }
-    }
-}
 
 /// Write an AST dump string to FFI output pointers.
 ///
@@ -312,6 +296,8 @@ fn convert_local_variables(scope: &ast::ScopeData) -> Vec<bytecode::generator::L
             name: lv.name.clone(),
             is_lexically_declared: lv.kind == ast::LocalVarKind::LetOrConst,
             is_initialized_during_declaration_instantiation: false,
+            is_mutable: lv.is_mutable,
+            scope_range: lv.scope_range,
         })
         .collect()
 }
@@ -347,6 +333,7 @@ fn compile_program_body_to_bytecode(
 
     let entry_block = generator.make_block();
     generator.switch_to_basic_block(entry_block);
+    generator.emit(bytecode::instruction::Instruction::Enter {});
     generator.capture_saved_lexical_environment();
 
     let result = bytecode::codegen::generate_statement(program, generator, None);
@@ -618,11 +605,12 @@ pub unsafe extern "C" fn rust_parse_program(
                 return std::ptr::null_mut();
             };
 
-            let mut parser = if pt == ProgramType::Script {
-                Parser::new_with_line_offset(source_slice, pt, u32_from_usize(initial_line_number))
+            let initial_line_number = if pt == ProgramType::Module && initial_line_number == 0 {
+                1
             } else {
-                Parser::new(source_slice, pt)
+                initial_line_number
             };
+            let mut parser = Parser::new_with_line_offset(source_slice, pt, u32_from_usize(initial_line_number));
 
             let program = parser.parse_program(false);
 
@@ -782,6 +770,33 @@ fn compile_parsed_program_off_thread_impl(
     }
 }
 
+/// Retain an independent parse snapshot for background cache generation.
+/// The immutable arena and compiled regex handles are shared; function-table
+/// ownership is independent so either compilation can consume its functions.
+///
+/// # Safety
+/// `parsed` must point to a valid parsed program with no errors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_clone_parsed_program(parsed: *const ParsedProgram) -> *mut ParsedProgram {
+    unsafe {
+        abort_on_panic(|| {
+            let parsed = &*parsed;
+            assert!(parsed.errors.is_empty());
+            Box::into_raw(Box::new(ParsedProgram {
+                program: parsed.program.clone(),
+                function_table: parsed.function_table.clone(),
+                arena: parsed.arena.clone(),
+                scope_ref: parsed.scope_ref,
+                program_type: parsed.program_type,
+                is_strict_mode: parsed.is_strict_mode,
+                has_top_level_await: parsed.has_top_level_await,
+                errors: Vec::new(),
+                ast_dump: None,
+            }))
+        })
+    }
+}
+
 /// Compile a parsed program to an off-thread bytecode artifact.
 ///
 /// Consumes and frees the ParsedProgram. The returned CompiledProgram still needs to be materialized on the main thread
@@ -819,7 +834,86 @@ pub unsafe extern "C" fn rust_compile_parsed_program_fully_off_thread(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_free_compiled_program(compiled: *mut CompiledProgram) {
     unsafe {
-        drop(Box::from_raw(compiled));
+        fn free_generator_regexes(generator: &mut bytecode::generator::Generator) {
+            for regex in generator.compiled_regexes.drain(..) {
+                unsafe { crate::ast::free_compiled_regex(regex) };
+            }
+            for shared_data in &mut generator.shared_function_data {
+                if let Some(precompiled) = &mut shared_data.precompiled_function {
+                    free_generator_regexes(&mut precompiled.generator);
+                }
+            }
+        }
+
+        let mut compiled = Box::from_raw(compiled);
+        match &mut compiled.bytecode {
+            CompiledProgramBytecode::Program(bytecode) | CompiledProgramBytecode::AsyncModule(bytecode) => {
+                free_generator_regexes(&mut bytecode.generator);
+            }
+        }
+        for declaration in &mut compiled.declaration_functions {
+            if let Some(precompiled) = &mut declaration.precompiled_function {
+                free_generator_regexes(&mut precompiled.generator);
+            }
+        }
+    }
+}
+
+/// Collect all source-map positions from a fully compiled program.
+///
+/// # Safety
+/// `compiled` must be a valid pointer returned by
+/// `rust_compile_parsed_program_fully_off_thread`, and `callback` must be valid
+/// for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_collect_compiled_program_breakpoint_positions(
+    compiled: *const CompiledProgram,
+    context: *mut c_void,
+    callback: unsafe extern "C" fn(context: *mut c_void, line: u32, column: u32),
+) {
+    fn collect_precompiled_function(
+        precompiled: &bytecode::generator::PrecompiledFunction,
+        context: *mut c_void,
+        callback: unsafe extern "C" fn(context: *mut c_void, line: u32, column: u32),
+    ) {
+        collect_bytecode(&precompiled.generator, &precompiled.assembled, context, callback);
+    }
+
+    fn collect_bytecode(
+        generator: &bytecode::generator::Generator,
+        assembled: &bytecode::generator::AssembledBytecode,
+        context: *mut c_void,
+        callback: unsafe extern "C" fn(context: *mut c_void, line: u32, column: u32),
+    ) {
+        for entry in &assembled.source_map {
+            if entry.line != 0 {
+                unsafe { callback(context, entry.line, entry.column) };
+            }
+        }
+        for shared_data in &generator.shared_function_data {
+            if let Some(precompiled) = &shared_data.precompiled_function {
+                collect_precompiled_function(precompiled, context, callback);
+            }
+        }
+    }
+
+    unsafe {
+        abort_on_panic(|| {
+            if compiled.is_null() {
+                return;
+            }
+            let compiled = &*compiled;
+            match &compiled.bytecode {
+                CompiledProgramBytecode::Program(bytecode) | CompiledProgramBytecode::AsyncModule(bytecode) => {
+                    collect_bytecode(&bytecode.generator, &bytecode.assembled, context, callback);
+                }
+            }
+            for declaration in &compiled.declaration_functions {
+                if let Some(precompiled) = &declaration.precompiled_function {
+                    collect_precompiled_function(precompiled, context, callback);
+                }
+            }
+        });
     }
 }
 
@@ -2557,6 +2651,7 @@ fn compile_module_as_async_to_bytecode(
 
     let entry_block = generator.make_block();
     generator.switch_to_basic_block(entry_block);
+    generator.emit(Instruction::Enter {});
 
     // Async function start: emit initial Yield before GetLexicalEnvironment.
     let start_block = generator.make_block();
@@ -3182,6 +3277,19 @@ fn compile_function_payload_to_bytecode(
     generator.function_table = payload.function_table;
     generator.source_len = source_len;
     generator.enclosing_function_kind = function_data.kind;
+    generator.argument_variable_names = function_data
+        .parameters
+        .iter()
+        .map(|parameter| match parameter.binding {
+            ast::FunctionParameterBinding::Identifier(identifier)
+                if generator.arena.identifiers[identifier].local_type == Some(ast::LocalType::Argument) =>
+            {
+                generator.arena.name_of(identifier).to_owned()
+            }
+            ast::FunctionParameterBinding::BindingPattern(_) => ast::Utf16String::default(),
+            _ => ast::Utf16String::default(),
+        })
+        .collect();
 
     if let Some(scope_id) = body_scope {
         let arena_clone = generator.arena.clone();
@@ -3190,6 +3298,7 @@ fn compile_function_payload_to_bytecode(
 
     let entry_block = generator.make_block();
     generator.switch_to_basic_block(entry_block);
+    generator.emit(bytecode::instruction::Instruction::Enter {});
 
     // https://tc39.es/ecma262/#sec-async-functions-abstract-operations-async-function-start
     // For async (non-generator) functions, emit the initial Yield BEFORE

@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/HashMap.h>
 #include <LibTest/TestCase.h>
 
 #include <LibURL/Parser.h>
@@ -715,6 +716,18 @@ TEST_CASE(same_origin_domain)
     EXPECT(!opaque1.is_same_origin_domain(a_relaxed));
 }
 
+TEST_CASE(origin_hash_uses_same_origin_semantics)
+{
+    auto origin = URL::Origin { "https"_string, "a.ladybird.org"_string, 443 };
+    auto origin_with_domain = URL::Origin { "https"_string, "a.ladybird.org"_string, 443, "ladybird.org"_string };
+
+    EXPECT_EQ(origin, origin_with_domain);
+
+    HashMap<URL::Origin, int> origins;
+    origins.set(origin, 42);
+    EXPECT_EQ(origins.get(origin_with_domain), Optional<int> { 42 });
+}
+
 // resource:// URLs are internal browser resources. They share a single tuple origin regardless
 // of host, so that same-origin checks pass between any resource:// documents or worker scripts.
 TEST_CASE(resource_url_origin)
@@ -743,4 +756,33 @@ TEST_CASE(authority_state_lots_of_at_symbols)
     auto many_at_symbols = MUST(String::repeated('@', 500'000));
     auto horror_url = MUST(String::formatted("ws::{}", many_at_symbols));
     EXPECT(!URL::Parser::basic_parse(horror_url).has_value());
+}
+
+TEST_CASE(host_is_loopback_or_localhost)
+{
+    auto host_of = [](StringView input) {
+        auto url = URL::Parser::basic_parse(input);
+        VERIFY(url.has_value());
+        VERIFY(url->host().has_value());
+        return url->host().value();
+    };
+
+    EXPECT(host_of("http://localhost"sv).is_loopback_or_localhost());
+    EXPECT(host_of("http://localhost."sv).is_loopback_or_localhost());
+    EXPECT(host_of("http://foo.localhost"sv).is_loopback_or_localhost());
+    EXPECT(host_of("http://foo.localhost."sv).is_loopback_or_localhost());
+    EXPECT(host_of("http://127.0.0.1"sv).is_loopback_or_localhost());
+    EXPECT(host_of("http://127.255.255.255"sv).is_loopback_or_localhost());
+    EXPECT(host_of("http://[::1]"sv).is_loopback_or_localhost());
+
+    EXPECT(!host_of("http://localhost4"sv).is_loopback_or_localhost());
+    EXPECT(!host_of("http://localhost6"sv).is_loopback_or_localhost());
+    EXPECT(!host_of("http://localhost.example"sv).is_loopback_or_localhost());
+    EXPECT(!host_of("http://126.255.255.255"sv).is_loopback_or_localhost());
+    EXPECT(!host_of("http://128.0.0.1"sv).is_loopback_or_localhost());
+    EXPECT(!host_of("http://[::2]"sv).is_loopback_or_localhost());
+    EXPECT(!host_of("http://[::ffff:127.0.0.1]"sv).is_loopback_or_localhost());
+    EXPECT(!host_of("http://[fe80::1]"sv).is_loopback_or_localhost());
+    EXPECT(!host_of("http://example.com"sv).is_loopback_or_localhost());
+    EXPECT(!host_of("http://0.0.0.0"sv).is_loopback_or_localhost());
 }

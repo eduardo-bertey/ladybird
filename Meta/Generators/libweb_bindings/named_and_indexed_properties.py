@@ -497,6 +497,7 @@ public:
 
 private:
     virtual JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> internal_get_own_property(JS::PropertyKey const&) const override;
+    virtual bool is_cacheable_for_property_absence() const override {{ return false; }}
     virtual JS::ThrowCompletionOr<bool> internal_define_own_property(JS::PropertyKey const&, JS::PropertyDescriptor&, Optional<JS::PropertyDescriptor>* precomputed_get_own_property = nullptr) override;
     virtual JS::ThrowCompletionOr<bool> internal_delete(JS::PropertyKey const&) override;
     virtual JS::ThrowCompletionOr<bool> internal_set_prototype_of(JS::Object* prototype) override;
@@ -760,7 +761,6 @@ def write_indexed_property_getter(
     out.write(
         f"""JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::{idl_identifier_cpp_name(operation)})
 {{
-    WebIDL::log_trace(vm, "{interface.prototype_class}::{idl_identifier_cpp_name(operation)}");
     auto& realm = *vm.current_realm();
     auto this_value = vm.this_value();
     [[maybe_unused]] auto* idl_object = TRY(impl_from(vm, this_value));
@@ -809,7 +809,6 @@ def write_named_property_getter(
     out.write(
         f"""JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::{idl_identifier_cpp_name(operation)})
 {{
-    WebIDL::log_trace(vm, "{interface.prototype_class}::{idl_identifier_cpp_name(operation)}");
     auto& realm = *vm.current_realm();
     auto this_value = vm.this_value();
     [[maybe_unused]] auto* idl_object = TRY(impl_from(vm, this_value));
@@ -883,7 +882,6 @@ def write_named_property_operation(
     out.write(
         f"""JS_DEFINE_NATIVE_FUNCTION({interface.prototype_class}::{idl_identifier_cpp_name(operation)})
 {{
-    WebIDL::log_trace(vm, "{interface.prototype_class}::{idl_identifier_cpp_name(operation)}");
     auto& realm = *vm.current_realm();
     auto this_value = vm.this_value();
     [[maybe_unused]] auto* idl_object = TRY(impl_from(vm, this_value));

@@ -1,5 +1,7 @@
+-webkit-font-smoothing: auto
 -webkit-text-fill-color: rgb(0, 0, 0)
 accent-color: auto
+block-ellipsis: no-ellipsis
 border-collapse: separate
 border-spacing: 0px
 caption-side: top
@@ -60,7 +62,6 @@ stroke-width: 1px
 tab-size: 8
 text-align: start
 text-anchor: start
-text-decoration-line: none
 text-decoration-skip-ink: auto
 text-indent: 0px
 text-justify: auto
@@ -77,6 +78,7 @@ widows: 2
 word-break: normal
 word-spacing: 0px
 writing-mode: horizontal-tb
+-webkit-box-orient: horizontal
 align-content: normal
 align-items: normal
 align-self: auto
@@ -106,7 +108,7 @@ background-position-x: 0%
 background-position-y: 0%
 background-repeat: repeat
 background-size: auto
-block-size: 1404px
+block-size: 1430px
 border-block-end-color: rgb(0, 0, 0)
 border-block-end-style: none
 border-block-end-width: 0px
@@ -145,21 +147,34 @@ border-top-right-radius: 0px
 border-top-style: none
 border-top-width: 0px
 bottom: auto
+box-decoration-break: slice
 box-shadow: none
 box-sizing: content-box
+break-after: auto
+break-before: auto
+break-inside: auto
 clear: none
 clip: auto
 clip-path: none
 column-count: auto
+column-fill: balance
 column-gap: normal
 column-height: auto
+column-rule-color: rgb(0, 0, 0)
+column-rule-style: none
+column-rule-width: 3px
 column-span: none
 column-width: auto
 contain: none
+contain-intrinsic-block-size: none
+contain-intrinsic-height: none
+contain-intrinsic-inline-size: none
+contain-intrinsic-width: none
 container-name: none
 container-type: normal
 content: normal
 content-visibility: visible
+continue: auto
 corner-bottom-left-shape: round
 corner-bottom-right-shape: round
 corner-end-end-shape: round
@@ -194,7 +209,7 @@ grid-row-start: auto
 grid-template-areas: none
 grid-template-columns: none
 grid-template-rows: none
-height: 2548px
+height: 2743px
 inline-size: 784px
 inset-block-end: auto
 inset-block-start: auto
@@ -225,6 +240,7 @@ mask-type: luminance
 max-block-size: none
 max-height: none
 max-inline-size: none
+max-lines: none
 max-width: none
 min-block-size: auto
 min-height: auto
@@ -292,6 +308,9 @@ scroll-padding-inline-start: auto
 scroll-padding-left: auto
 scroll-padding-right: auto
 scroll-padding-top: auto
+scroll-snap-align: none
+scroll-snap-stop: normal
+scroll-snap-type: none
 scroll-timeline-axis: block
 scroll-timeline-name: none
 scrollbar-gutter: auto
@@ -303,6 +322,7 @@ stop-color: rgb(0, 0, 0)
 stop-opacity: 1
 table-layout: auto
 text-decoration-color: rgb(0, 0, 0)
+text-decoration-line: none
 text-decoration-style: solid
 text-decoration-thickness: auto
 text-overflow: clip
@@ -311,7 +331,7 @@ top: auto
 touch-action: auto
 transform: none
 transform-box: view-box
-transform-origin: 50% 50% 0px
+transform-origin: 392px 2164.5px
 transform-style: flat
 transition-behavior: normal
 transition-delay: 0s

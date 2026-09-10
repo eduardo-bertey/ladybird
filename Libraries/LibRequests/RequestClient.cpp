@@ -51,11 +51,14 @@ void RequestClient::die()
 
     for (auto& [id, promise] : m_pending_cache_size_estimations)
         promise->reject(Error::from_string_literal("RequestServer process died"));
+    for (auto& [id, promise] : m_pending_clear_cache_requests)
+        promise->reject(Error::from_string_literal("RequestServer process died"));
 
     auto websockets = move(m_websockets);
 
     m_requests.clear();
     m_pending_cache_size_estimations.clear();
+    m_pending_clear_cache_requests.clear();
     m_websockets.clear();
 
     for (auto& [id, websocket] : websockets) {
@@ -77,23 +80,29 @@ void RequestClient::die()
     }
 }
 
-RefPtr<Request> RequestClient::start_request(ByteString const& method, URL::URL const& url, Optional<HTTP::HeaderList const&> request_headers, ReadonlyBytes request_body, HTTP::CacheMode cache_mode, HTTP::Cookie::IncludeCredentials include_credentials, Core::ProxyData const& proxy_data, KeepAliveForTransfer keep_alive_for_transfer, Optional<u32> address_selection_hint)
+RefPtr<Request> RequestClient::start_request(ByteString const& method, URL::URL const& url, Optional<HTTP::HeaderList const&> request_headers, ReadonlyBytes request_body, HTTP::CacheMode cache_mode, HTTP::Cookie::IncludeCredentials include_credentials, TransferLease transfer_lease, Optional<u32> address_selection_hint, CacheMissNotification cache_miss_notification)
 {
     auto request_id = m_next_request_id++;
     auto headers = request_headers.map([](auto const& headers) { return headers.headers().span(); }).value_or({});
 
-    IPCProxy::async_start_request(request_id, method, url, headers, request_body, cache_mode, include_credentials, proxy_data, keep_alive_for_transfer == KeepAliveForTransfer::Yes, address_selection_hint);
-    auto request = Request::create_from_id({}, *this, request_id);
+    auto transfer_lease_key = transfer_lease == TransferLease::Yes
+        ? Optional<RequestTransferLeaseKey> { { m_request_server_client_id, request_id } }
+        : Optional<RequestTransferLeaseKey> {};
+    IPCProxy::async_start_request(request_id, method, url, headers, request_body, cache_mode, include_credentials, transfer_lease_key.has_value(), address_selection_hint, cache_miss_notification == CacheMissNotification::Yes);
+    auto request = Request::create_from_id({}, *this, request_id, move(transfer_lease_key));
     m_requests.set(request_id, request);
     return request;
 }
 
-RefPtr<Request> RequestClient::adopt_request(int source_client_id, u64 source_request_id)
+RefPtr<Request> RequestClient::adopt_request(int source_client_id, u64 source_request_id, TransferLease transfer_lease)
 {
     auto request_id = m_next_request_id++;
 
-    IPCProxy::async_adopt_request(source_client_id, source_request_id, request_id);
-    auto request = Request::create_from_id({}, *this, request_id);
+    auto transfer_lease_key = transfer_lease == TransferLease::Yes
+        ? Optional<RequestTransferLeaseKey> { { source_client_id, source_request_id } }
+        : Optional<RequestTransferLeaseKey> {};
+    IPCProxy::async_adopt_request(source_client_id, source_request_id, request_id, transfer_lease_key.has_value());
+    auto request = Request::create_from_id({}, *this, request_id, move(transfer_lease_key));
     m_requests.set(request_id, request);
     return request;
 }
@@ -130,9 +139,18 @@ bool RequestClient::stop_request(Badge<Request>, Request& request)
     return true;
 }
 
-void RequestClient::release_request_for_transfer(Badge<Request>, Request& request)
+void RequestClient::release_request_transfer_lease(Badge<Request>, Request& request, RequestTransferLeaseKey transfer_lease)
 {
-    async_release_request_for_transfer(request.id());
+    release_request_transfer_lease(transfer_lease);
+
+    // A request that has finished stays registered only for the sake of its lease — so it goes along with the lease.
+    if (request.is_finished())
+        m_requests.remove(request.id());
+}
+
+void RequestClient::release_request_transfer_lease(RequestTransferLeaseKey transfer_lease)
+{
+    async_release_request_transfer_lease(transfer_lease.source_client_id, transfer_lease.source_request_id);
 }
 
 void RequestClient::ensure_connection(URL::URL const& url, RequestServer::CacheLevel cache_level)
@@ -164,6 +182,32 @@ void RequestClient::estimated_cache_size(u64 cache_size_estimation_id, CacheSize
 {
     if (auto promise = m_pending_cache_size_estimations.take(cache_size_estimation_id); promise.has_value())
         (*promise)->resolve(sizes);
+}
+
+NonnullRefPtr<Core::Promise<Empty>> RequestClient::clear_cache(UnixDateTime since)
+{
+    auto promise = Core::Promise<Empty>::construct();
+
+    auto clear_cache_request_id = m_next_clear_cache_request_id++;
+    m_pending_clear_cache_requests.set(clear_cache_request_id, promise);
+
+    async_remove_cache_entries_accessed_since(clear_cache_request_id, since);
+
+    return promise;
+}
+
+void RequestClient::removed_cache_entries(u64 clear_cache_request_id)
+{
+    if (auto promise = m_pending_clear_cache_requests.take(clear_cache_request_id); promise.has_value())
+        (*promise)->resolve({});
+}
+
+void RequestClient::request_requires_network(u64 request_id)
+{
+    if (auto request = m_requests.get(request_id); request.has_value()) {
+        if ((*request)->on_requires_network)
+            (*request)->on_requires_network();
+    }
 }
 
 void RequestClient::request_started(u64 request_id, IPC::File response_file)
@@ -204,10 +248,19 @@ void RequestClient::request_cached_body_file_available(u64 request_id, IPC::File
 
 void RequestClient::request_finished(u64 request_id, u64 total_size, RequestTimingInfo timing_info, Optional<NetworkError> network_error)
 {
-    if (RefPtr<Request> request = m_requests.get(request_id).value_or(nullptr)) {
-        request->did_finish({}, total_size, timing_info, network_error);
+    RefPtr<Request> request = m_requests.get(request_id).value_or(nullptr);
+    if (!request)
+        return;
+
+    request->did_finish({}, total_size, timing_info, network_error);
+
+    // A leased request stays registered after it finishes — just as RequestServer keeps a leased request alive after
+    // completion: Another client may still adopt it — and the request_transferred that follows has to find the request
+    // here to tear it down. It's unregistered when it's transferred, when its lease is released, or when it's stopped.
+    // Gecko and WebKit work the same way: The process a navigation response is taken away from keeps its state for the
+    // request until the one notification telling it to let go — and nothing tears it down before that notification.
+    if (!request->has_transfer_lease())
         m_requests.remove(request_id);
-    }
 }
 
 void RequestClient::headers_became_available(u64 request_id, Vector<HTTP::Header> response_headers, Optional<u32> status_code, Optional<String> reason_phrase, Optional<IPC::File> javascript_bytecode_file, u64 javascript_bytecode_size, Optional<u64> javascript_bytecode_cache_vary_key, CameFromCache came_from_cache)
@@ -231,14 +284,14 @@ void RequestClient::request_transferred(u64 request_id)
     (*request)->did_transfer({});
 }
 
-void RequestClient::retrieve_http_cookie(int client_id, u64 request_id, RequestServer::RequestType request_type, URL::URL url, RequestServer::IsPrivate is_private)
+void RequestClient::retrieve_http_cookie(int client_id, u64 request_id, RequestServer::RequestType request_type, u64 cookie_request_id, URL::URL url, RequestServer::IsPrivate is_private)
 {
     String cookie;
 
     if (on_retrieve_http_cookie)
         cookie = on_retrieve_http_cookie(url, is_private);
 
-    async_retrieved_http_cookie(client_id, request_id, request_type, cookie);
+    async_retrieved_http_cookie(client_id, request_id, request_type, cookie_request_id, cookie);
 }
 
 void RequestClient::certificate_requested(u64 request_id)

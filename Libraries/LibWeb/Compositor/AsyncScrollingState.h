@@ -7,8 +7,10 @@
 #pragma once
 
 #include <AK/Forward.h>
+#include <AK/HashFunctions.h>
 #include <AK/Optional.h>
 #include <AK/StringView.h>
+#include <AK/Traits.h>
 #include <AK/Types.h>
 #include <AK/Vector.h>
 #include <LibGfx/Color.h>
@@ -18,7 +20,7 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
-#include <LibWeb/Painting/ScrollNodeState.h>
+#include <LibWeb/Painting/ScrollState.h>
 
 namespace Web::Compositor {
 
@@ -27,7 +29,7 @@ using AsyncScrollOperationID = u64;
 // Stable identifier for a scroll node in a document; the node index alone is not unique across nested documents.
 struct AsyncScrollNodeID {
     UniqueNodeID document_id;
-    Painting::VisualContextIndex scroll_node_index;
+    Painting::SpatialNodeIndex scroll_node_index;
 
     bool operator==(AsyncScrollNodeID const&) const = default;
 };
@@ -37,6 +39,8 @@ enum class AsyncScrollNodeKind : u8 {
     Element,
     PseudoElement,
 };
+
+WEB_API AsyncScrollNodeKind async_scroll_node_kind_for(Painting::CompositorScrollNodeKind);
 
 // Stable identity for reconciling compositor-side scroll offsets after the paint snapshot has been rebuilt.
 struct AsyncScrollNodeStableID {
@@ -59,38 +63,23 @@ struct AsyncScrollNode {
     AsyncScrollNodeStableID stable_node_id;
     Optional<AsyncScrollNodeID> parent_node_id;
     Gfx::IntRect scrollport_rect;
+    Gfx::FloatPoint min_scroll_offset;
     Gfx::FloatPoint max_scroll_offset;
     bool is_viewport { false };
     bool can_be_wheel_scrolled_horizontally { false };
     bool can_be_wheel_scrolled_vertically { false };
-};
-
-// Sticky elements are represented as scroll nodes whose offset is derived from ancestor scroll offsets. Keep only
-// the precomputed geometry needed to replay that calculation on the compositor thread after an async scroll mutation.
-struct AsyncStickyArea {
-    UniqueNodeID document_id;
-    Painting::VisualContextIndex scroll_node_index;
-    Painting::VisualContextIndex parent_scroll_node_index;
-    Painting::VisualContextIndex nearest_scrolling_ancestor_index;
-    Gfx::FloatPoint position_relative_to_scroll_ancestor;
-    Gfx::FloatSize border_box_size;
-    Gfx::FloatSize scrollport_size;
-    Gfx::FloatRect containing_block_region;
-    bool needs_parent_offset_adjustment { false };
-    Optional<float> inset_top;
-    Optional<float> inset_right;
-    Optional<float> inset_bottom;
-    Optional<float> inset_left;
+    bool snaps_scroll_position_horizontally { false };
+    bool snaps_scroll_position_vertically { false };
 };
 
 // A region with a non-passive wheel listener. Wheels inside it must stay on the main thread because script may cancel.
 struct BlockingWheelEventRegion {
-    Painting::VisualContextIndex visual_context_index;
+    Painting::ContextRef context;
     Gfx::FloatRect rect;
 };
 
 struct WheelHitTestTarget {
-    Painting::VisualContextIndex visual_context_index;
+    Painting::ContextRef context;
     Gfx::FloatRect rect;
     Gfx::CornerRadii corner_radii;
     Optional<AsyncScrollNodeID> target_node_id;
@@ -98,19 +87,20 @@ struct WheelHitTestTarget {
 
 // A region that must always use main-thread wheel routing even without a blocking listener, such as a nested navigable.
 struct MainThreadWheelEventRegion {
-    Painting::VisualContextIndex visual_context_index;
+    Painting::ContextRef context;
     Gfx::FloatRect rect;
 };
 
 struct ViewportScrollbar {
     AsyncScrollNodeID scroll_node_id;
-    Painting::VisualContextIndex scroll_node_index;
+    Painting::SpatialNodeIndex scroll_node_index;
     Gfx::IntRect gutter_rect;
     Gfx::IntRect thumb_rect;
     Gfx::IntRect expanded_gutter_rect;
     Gfx::IntRect expanded_thumb_rect;
     double scroll_size { 0 };
     double expanded_scroll_size { 0 };
+    float min_scroll_offset { 0 };
     float max_scroll_offset { 0 };
     Color thumb_color;
     Color track_color;
@@ -119,7 +109,6 @@ struct ViewportScrollbar {
 
 struct AsyncScrollingState {
     Vector<AsyncScrollNode> scroll_nodes;
-    Vector<AsyncStickyArea> sticky_areas;
     Vector<WheelHitTestTarget> wheel_hit_test_targets;
     Vector<MainThreadWheelEventRegion> main_thread_wheel_event_regions;
     Vector<ViewportScrollbar> viewport_scrollbars;
@@ -146,6 +135,16 @@ enum class WheelRoutingAdmission {
     StaleWheelEventListeners,
 };
 
+// A discrete wheel step and the momentum of a flick both scroll straight to the snap position they select, and only
+// the main thread holds the snap positions to select from, so the compositor declines the deltas of either whose
+// scrolling box snaps along an axis they travel in.
+enum class SnapContainerHandling : u8 {
+    ScrollOnCompositor,
+    DeferToMainThread,
+};
+
+WEB_API SnapContainerHandling snap_container_handling_for(WheelDeltaPrecision, ScrollGesturePhase);
+
 enum class WheelScrollAdmission {
     Accepted,
     NoScrollableTarget,
@@ -158,6 +157,15 @@ WEB_API AsyncScrollingState async_scrolling_state_from_display_list(Painting::Di
 WEB_API WheelRoutingAdmission wheel_routing_admission_for(AsyncScrollingState const&);
 WEB_API Utf16View wheel_routing_admission_to_utf16_view(WheelRoutingAdmission);
 WEB_API bool blocks_wheel_event_at_position(AsyncScrollingState const&, RefPtr<Painting::DisplayList const> const&, Painting::AccumulatedVisualContextTree const*, Painting::ScrollStateSnapshot const&, Gfx::FloatPoint position);
-WEB_API WheelScrollAdmission admit_wheel_scroll(AsyncScrollingState const&, RefPtr<Painting::DisplayList const> const&, Painting::AccumulatedVisualContextTree const*, Painting::ScrollStateSnapshot const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, bool blocking_wheel_event_regions_are_current);
+WEB_API WheelScrollAdmission admit_wheel_scroll(AsyncScrollingState const&, RefPtr<Painting::DisplayList const> const&, Painting::AccumulatedVisualContextTree const*, Painting::ScrollStateSnapshot const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, SnapContainerHandling, bool blocking_wheel_event_regions_are_current);
 
 }
+
+template<>
+struct AK::Traits<Web::Compositor::AsyncScrollNodeStableID> : DefaultTraits<Web::Compositor::AsyncScrollNodeStableID> {
+    static unsigned hash(Web::Compositor::AsyncScrollNodeStableID const& stable_node_id)
+    {
+        return pair_int_hash(u64_hash(static_cast<u64>(stable_node_id.node_id.value())),
+            pair_int_hash(to_underlying(stable_node_id.kind), stable_node_id.pseudo_element_type));
+    }
+};

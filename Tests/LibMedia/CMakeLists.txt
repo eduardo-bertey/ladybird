@@ -2,27 +2,41 @@ include(audio)
 
 set(TEST_SOURCES
     TestAudioBlockTimingRing.cpp
-    TestCICP.cpp
+    TestBitReader.cpp
     TestBufferedRanges.cpp
+    TestCICP.cpp
+    TestCodecConfigurations.cpp
+    TestCodecParameters.cpp
+    TestContainerID.cpp
     TestDecodedAudioProducer.cpp
+    TestDecodedVideoProducer.cpp
+    TestDecoderRegistry.cpp
+    TestDemuxerRegistry.cpp
     TestDisplayingVideoSink.cpp
     TestFFmpegAudioNormalization.cpp
     TestFFmpegDemuxer.cpp
     TestH264Decode.cpp
     TestIncrementallyPopulatedStream.cpp
+    TestISOBMFF.cpp
     TestMatroskaDemuxer.cpp
+    TestMediaSupport.cpp
+    TestMediaTime.cpp
     TestParseMatroska.cpp
     TestPipelineNodes.cpp
-    TestRemoteVideoNode.cpp
-    TestMediaTime.cpp
     TestPlaybackStream.cpp
+    TestRemoteVideoNode.cpp
+    TestSpscAudioFrameRing.cpp
+    TestTimeRanges.cpp
     TestVideoEdgeQueue.cpp
     TestVideoFramePool.cpp
     TestVorbisDecode.cpp
-    TestTimeRanges.cpp
     TestVP9Decode.cpp
     TestWav.cpp
 )
+
+if (APPLE)
+    list(APPEND TEST_SOURCES TestVideoToolboxDecode.cpp)
+endif()
 
 foreach(source IN LISTS TEST_SOURCES)
     ladybird_test("${source}" LibMedia LIBS LibMedia LibFileSystem LibSync)
@@ -38,6 +52,7 @@ target_link_libraries(TestMediaTime PRIVATE LibThreading)
 target_link_libraries(TestVideoFramePool PRIVATE LibThreading)
 target_link_libraries(TestIncrementallyPopulatedStream PRIVATE LibThreading)
 target_link_libraries(TestRemoteVideoNode PRIVATE LibThreading LibGfx LibIPC)
+target_link_libraries(TestSpscAudioFrameRing PRIVATE LibThreading)
 
 if (LADYBIRD_AUDIO_BACKEND STREQUAL "PULSE")
     target_compile_definitions(TestPlaybackStream PRIVATE HAVE_PULSEAUDIO=1)

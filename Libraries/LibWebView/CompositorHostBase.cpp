@@ -219,10 +219,10 @@ void CompositorHostBase::update_display_list(Web::Compositor::CompositorContextI
         connection->update_display_list(context_id, display_list, visual_context_tree, resource_transaction, scroll_state_snapshot);
 }
 
-void CompositorHostBase::update_visual_context_tree(Web::Compositor::CompositorContextId context_id, Web::Painting::AccumulatedVisualContextTree visual_context_tree)
+void CompositorHostBase::update_visual_context_tree(Web::Compositor::CompositorContextId context_id, Web::Painting::AccumulatedVisualContextTree visual_context_tree, Web::Painting::DisplayListResourceTransaction&& resource_transaction)
 {
     if (auto* connection = compositor_connection())
-        connection->update_visual_context_tree(context_id, visual_context_tree);
+        connection->update_visual_context_tree(context_id, visual_context_tree, move(resource_transaction));
 }
 
 void CompositorHostBase::add_video_sink(Media::VideoSinkHandle video_sink_handle)
@@ -237,10 +237,10 @@ void CompositorHostBase::remove_video_sink(Media::VideoSinkHandle video_sink_han
         connection->remove_video_sink(video_sink_handle);
 }
 
-void CompositorHostBase::set_video_update_flags(Media::VideoSinkHandle video_sink_handle, Web::Compositor::VideoUpdateFlags flags)
+void CompositorHostBase::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
 {
     if (auto* connection = compositor_connection())
-        connection->set_video_update_flags(video_sink_handle, flags);
+        connection->set_video_sink_ticking(video_sink_handle, should_tick);
 }
 
 void CompositorHostBase::update_scroll_state(Web::Compositor::CompositorContextId context_id, Web::Painting::ScrollStateSnapshot&& scroll_state_snapshot)
@@ -256,17 +256,17 @@ void CompositorHostBase::invalidate_wheel_event_listener_state(Web::Compositor::
 }
 
 Web::Compositor::AsyncScrollEnqueueResult CompositorHostBase::async_scroll_by(Web::Compositor::CompositorContextId context_id, Web::UniqueNodeID expected_document_id, Gfx::FloatPoint position,
-    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, Web::Compositor::AsyncScrollOperationTracking operation_tracking)
+    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, Web::Compositor::SnapContainerHandling snap_container_handling, Web::Compositor::AsyncScrollOperationTracking operation_tracking)
 {
     if (auto* connection = compositor_connection())
-        return connection->async_scroll_by(context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, operation_tracking);
+        return connection->async_scroll_by(context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, snap_container_handling, operation_tracking);
     return {};
 }
 
-Web::Compositor::AsyncScrollEnqueueResult CompositorHostBase::smooth_scroll_to(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel)
+Web::Compositor::AsyncScrollEnqueueResult CompositorHostBase::smooth_scroll_to(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::FloatPoint main_thread_offset_in_device_pixels, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel, Web::Compositor::ScrollAnimationKind animation_kind)
 {
     if (auto* connection = compositor_connection())
-        return connection->smooth_scroll_to(context_id, stable_node_id, offset_in_device_pixels, viewport_rect, device_pixels_per_css_pixel);
+        return connection->smooth_scroll_to(context_id, stable_node_id, offset_in_device_pixels, main_thread_offset_in_device_pixels, viewport_rect, device_pixels_per_css_pixel, animation_kind);
     return {};
 }
 
@@ -276,10 +276,10 @@ void CompositorHostBase::cancel_smooth_scroll(Web::Compositor::CompositorContext
         connection->cancel_smooth_scroll(context_id, stable_node_id);
 }
 
-Web::Compositor::PendingAsyncScrollUpdates CompositorHostBase::take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id)
+Web::Compositor::PendingAsyncScrollUpdates CompositorHostBase::take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollUpdateFreshness freshness)
 {
     if (auto* connection = compositor_connection())
-        return connection->take_pending_async_scroll_updates(context_id);
+        return connection->take_pending_async_scroll_updates(context_id, freshness);
     return {};
 }
 
@@ -289,10 +289,23 @@ void CompositorHostBase::viewport_size_updated(Web::Compositor::CompositorContex
         connection->viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
 }
 
-void CompositorHostBase::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
+bool CompositorHostBase::request_rendering_opportunity(Web::Compositor::CompositorContextId context_id, double maximum_frames_per_second)
 {
     if (auto* connection = compositor_connection())
-        connection->present_frame(context_id, viewport_rect, damage_rect);
+        return connection->request_rendering_opportunity(context_id, maximum_frames_per_second);
+    return false;
+}
+
+void CompositorHostBase::hurry_rendering_opportunity(Web::Compositor::CompositorContextId context_id)
+{
+    if (auto* connection = compositor_connection())
+        connection->hurry_rendering_opportunity(context_id);
+}
+
+void CompositorHostBase::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect)
+{
+    if (auto* connection = compositor_connection())
+        connection->present_frame(context_id, viewport_rect);
 }
 
 void CompositorHostBase::request_screenshot(Web::Compositor::CompositorContextId context_id, NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)

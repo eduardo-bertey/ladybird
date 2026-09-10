@@ -37,7 +37,7 @@ CHECKED_SUFFIXES = {
 # the same change. If it goes up, justify the architecture change here.
 ALLOWED_REALM_MENTIONS = {
     "Animations": (5, 14, "animation callbacks/events and CSS value materialization still pass spec-selected realms"),
-    "CSS": (9, 27, "CSS Typed OM, parser-facing reification, and style-value JS materialization"),
+    "CSS": (7, 21, "CSS Typed OM, parser-facing reification, and style-value JS materialization"),
     "Clipboard": (4, 16, "clipboard item/data callbacks still materialize JS values in caller-selected realms"),
     "Compression": (4, 8, "compression streams still use realms for stream/chunk conversion plumbing"),
     "ContentSecurityPolicy": (4, 14, "CSP violation/report objects and callbacks still materialize JS-facing values"),
@@ -47,15 +47,15 @@ ALLOWED_REALM_MENTIONS = {
     "DOMURL": (2, 8, "URLSearchParams iterator objects still materialize JS iterator results in selected realms"),
     "Fetch": (
         22,
-        62,
-        "Fetch bodies, headers, requests, responses, and controllers still materialize JS values/streams",
+        66,
+        "Fetch bodies, headers, requests, responses, and controllers still materialize JS values/streams; the body receiver's delivery and close tasks carry the realm its stream is enqueued and closed in",
     ),
     "FileAPI": (6, 11, "File/Blob/FileReader algorithms still create streams, buffers, and events in selected realms"),
     "Geometry": (8, 8, "geometry constructors and structured clone still materialize JS-facing geometry objects"),
     "HTML": (
-        64,
-        201,
-        "HTML algorithms still contain structured serialization, canvas, navigation, worker, and event realm use",
+        68,
+        218,
+        "HTML algorithms still contain structured serialization, including posted-message preparation, canvas, navigation transfer/reconstruction, worker/worklet, and event realm use",
     ),
     "IndexedDB": (
         14,
@@ -78,10 +78,14 @@ ALLOWED_REALM_MENTIONS = {
     "TrustedTypes": (2, 9, "Trusted Types policy factory operations still use selected realms"),
     "WebAssembly": (
         12,
-        102,
+        104,
         "WebAssembly constructors/exports instantiate JS objects/functions in spec-selected realms",
     ),
-    "WebAudio": (2, 7, "WebAudio buffers still materialize JS buffers and callback/promise values in selected realms"),
+    "WebAudio": (
+        8,
+        19,
+        "WebAudio buffers, AudioParamMap, and AudioWorklet APIs still materialize JS buffers and callback/promise values in selected realms",
+    ),
     "WebDriver": (2, 7, "WebDriver execute/JSON conversion still materializes JS values for automation"),
     "WebGL": (72, 120, "WebGL APIs still materialize buffers, typed arrays, extensions, and wrapper objects"),
     "WebLocks": (6, 7, "Web Locks queue/callback algorithms still use callback and promise realms"),

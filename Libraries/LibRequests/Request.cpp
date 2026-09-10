@@ -49,9 +49,10 @@ ErrorOr<NonnullOwnPtr<ReadStream>> ReadStream::create(int reader_fd)
 #endif
 }
 
-Request::Request(RequestClient& client, u64 request_id)
+Request::Request(RequestClient& client, u64 request_id, Optional<RequestTransferLeaseKey> transfer_lease)
     : m_client(client)
     , m_request_id(request_id)
+    , m_transfer_lease(move(transfer_lease))
 {
 }
 
@@ -73,6 +74,8 @@ bool Request::stop()
     // The client may already be gone if the RequestServer connection was lost while this request was in flight.
     auto client = m_client.strong_ref();
     auto had_active_request = client && client->stop_request({}, *this);
+    if (!had_active_request)
+        release_transfer_lease();
     auto on_stop = move(m_on_stop);
 
     defer_teardown();
@@ -106,10 +109,15 @@ void Request::resume_body_delivery_up_to(size_t byte_count)
     set_body_delivery_paused(false);
 }
 
-void Request::release_for_transfer()
+void Request::release_transfer_lease()
 {
+    if (!m_transfer_lease.has_value())
+        return;
+
+    // Releasing the lease can unregister this request from its client, which may hold the last reference to it.
+    NonnullRefPtr protector { *this };
     if (auto client = m_client.strong_ref())
-        client->release_request_for_transfer({}, *this);
+        client->release_request_transfer_lease({}, *this, m_transfer_lease.release_value());
 }
 
 bool Request::has_file_backed_response_body() const
@@ -250,6 +258,8 @@ void Request::set_stop_callback(RequestStopped on_stop)
 
 void Request::did_finish(Badge<RequestClient>, u64 total_size, RequestTimingInfo const& timing_info, Optional<NetworkError> const& network_error)
 {
+    m_finished = true;
+
     auto effective_network_error = m_body_delivery_error.has_value() ? m_body_delivery_error : network_error;
     if (on_finish)
         on_finish(total_size, timing_info, effective_network_error);
@@ -273,6 +283,7 @@ void Request::did_request_certificates(Badge<RequestClient>)
 
 void Request::did_transfer(Badge<RequestClient>)
 {
+    m_transfer_lease.clear();
     auto on_stop = move(m_on_stop);
 
     defer_teardown();
@@ -326,7 +337,13 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
         auto has_received_all_reported_bytes = m_internal_stream_data->request_done && m_internal_stream_data->delivered_size >= m_internal_stream_data->total_size;
         if (!m_internal_stream_data->user_finish_called && (!m_internal_stream_data->read_stream || m_internal_stream_data->read_stream->is_eof() || has_received_all_reported_bytes)) {
             m_internal_stream_data->user_finish_called = true;
+            m_internal_stream_data->read_notifier->close();
+            m_internal_stream_data->read_notifier = nullptr;
+            m_internal_stream_data->read_stream = nullptr;
+            // The request has finished for its owner, so a stop or transfer that follows has nothing left to report.
+            m_on_stop = nullptr;
             user_on_finish(m_internal_stream_data->total_size, m_internal_stream_data->timing_info, m_internal_stream_data->network_error);
+            defer_teardown();
         }
     };
 
@@ -335,8 +352,10 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
         static char buffer[buffer_size];
 
         // If the request was stopped while this IPC was in-flight, just bail.
-        if (!m_internal_stream_data)
+        if (!m_internal_stream_data || !m_internal_stream_data->read_stream)
             return;
+
+        NonnullRefPtr protector { *this };
 
         do {
             auto bytes_to_read = buffer_size;
@@ -360,8 +379,10 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
 
             m_internal_stream_data->delivered_size += read_bytes.size();
             m_internal_stream_data->on_data_available(ResponseData::from_bytes(read_bytes));
-            if (!m_internal_stream_data)
+            if (!m_internal_stream_data || !m_internal_stream_data->read_stream)
                 return;
+            if (m_body_delivery_paused)
+                break;
 
             if (m_internal_stream_data->body_delivery_remaining_byte_count.has_value()) {
                 if (read_bytes.size() >= *m_internal_stream_data->body_delivery_remaining_byte_count) {

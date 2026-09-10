@@ -4,7 +4,20 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#[derive(Clone, Copy, Debug)]
+use super::*;
+
+// NB: Keep the addition order shared with intrinsic sizing: CssPixels arithmetic saturates.
+pub(crate) fn inline_advance(
+    leading_margin: CssPixels,
+    leading_size: CssPixels,
+    content_inline_size: CssPixels,
+    trailing_size: CssPixels,
+    trailing_margin: CssPixels,
+) -> CssPixels {
+    leading_margin + leading_size + content_inline_size + trailing_size + trailing_margin
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct StaticPositionMarker {
     pub(crate) box_: Node,
     pub(crate) inline_offset: CssPixels,
@@ -15,25 +28,36 @@ pub(crate) struct StaticPositionMarker {
 
 impl StaticPositionMarker {
     pub(crate) fn offset(self) -> (CssPixels, CssPixels) {
-        to_physical(self.writing_mode, self.inline_offset, self.block_offset)
+        geometry::to_physical(self.writing_mode, self.inline_offset, self.block_offset)
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct LineBoxData {
-    pub(crate) fragments: Vec<LineBoxFragmentData>,
-    pub(crate) static_position_markers: Vec<StaticPositionMarker>,
-    pub(crate) inline_length: CssPixels,
-    pub(crate) block_length: CssPixels,
-    pub(crate) block_end: CssPixels,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct InlineBoxBaseline {
+    pub(crate) box_: Node,
     pub(crate) baseline: CssPixels,
-    pub(crate) block_level_box_block_end_margin: CssPixels,
-    pub(crate) direction: u8,
-    pub(crate) writing_mode: u8,
-    pub(crate) original_available_inline_size: AvailableSize,
-    pub(crate) has_break: bool,
-    pub(crate) has_forced_break: bool,
-    pub(crate) has_block_level_box: bool,
+    pub(crate) accumulated_vertical_shift: CssPixels,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct LineBoxData {
+    pub(crate) fragments: Vec<line_box_fragment::LineBoxFragmentData>,
+    pub(crate) static_position_markers: Vec<StaticPositionMarker>,
+    pub(crate) inline_box_baselines: Vec<InlineBoxBaseline>,
+    pub(crate) record: inline_content::LineRecord,
+}
+
+impl std::ops::Deref for LineBoxData {
+    type Target = inline_content::LineRecord;
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+
+impl std::ops::DerefMut for LineBoxData {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.record
+    }
 }
 
 impl LineBoxData {
@@ -41,30 +65,24 @@ impl LineBoxData {
         Self {
             fragments: Vec::new(),
             static_position_markers: Vec::new(),
-            inline_length: CssPixels::default(),
-            block_length: CssPixels::default(),
-            block_end: CssPixels::default(),
-            baseline: CssPixels::default(),
-            block_level_box_block_end_margin: CssPixels::default(),
-            direction,
-            writing_mode,
-            original_available_inline_size: AvailableSize::Indefinite,
-            has_break: false,
-            has_forced_break: false,
-            has_block_level_box: false,
+            inline_box_baselines: Vec::new(),
+            record: inline_content::LineRecord {
+                direction,
+                writing_mode,
+                is_empty: true,
+                ..Default::default()
+            },
         }
     }
 
-    pub(crate) fn physical_horizontal_extent(&self) -> CssPixels {
-        to_physical(self.writing_mode, self.inline_length, self.block_length).0
-    }
-
-    pub(crate) fn physical_vertical_extent(&self) -> CssPixels {
-        to_physical(self.writing_mode, self.inline_length, self.block_length).1
-    }
-
-    pub(crate) fn physical_vertical_end(&self) -> CssPixels {
-        to_physical(self.writing_mode, self.inline_length, self.block_end).1
+    pub(crate) fn retained_metrics(&self) -> inline_content::LineRecord {
+        inline_content::LineRecord {
+            layout_fragment_count: self.fragments.len(),
+            first_fragment_node: self.fragments.first().map(|fragment| fragment.layout_node),
+            is_empty: self.is_empty(),
+            horizontal_extent: inline_formatting_context::line_physical_horizontal_extent(self),
+            ..self.record
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -81,15 +99,16 @@ impl LineBoxData {
         content_block_size: CssPixels,
         border_box_block_start: CssPixels,
         border_box_block_end: CssPixels,
-        glyphs: Option<GlyphData>,
-        facts: FragmentBuildFacts,
+        glyphs: Option<line_box_fragment::GlyphData>,
+        facts: line_box_fragment::FragmentBuildFacts,
         text_align_is_justify: bool,
-        trailing_whitespace: TrailingWhitespace,
+        trailing_whitespace: line_box_fragment::TrailingWhitespace,
     ) {
         let can_merge = glyphs.as_ref().is_some_and(|glyphs| {
             !text_align_is_justify
                 && self.fragments.last().is_some_and(|last| {
-                    last.layout_node == layout_node
+                    !last.has_soft_wrap_opportunity_after
+                        && last.layout_node == layout_node
                         && last
                             .glyphs
                             .as_ref()
@@ -108,8 +127,8 @@ impl LineBoxData {
                 last.trailing_whitespace = trailing_whitespace;
             }
         } else {
-            let inline_offset = leading_margin + leading_size + self.inline_length;
-            let mut fragment = LineBoxFragmentData::new(
+            let inline_offset = leading_margin + leading_size + self.record.inline_length;
+            let mut fragment = line_box_fragment::LineBoxFragmentData::new(
                 layout_node,
                 start,
                 length,
@@ -126,7 +145,13 @@ impl LineBoxData {
             fragment.trailing_whitespace = trailing_whitespace;
             self.fragments.push(fragment);
         }
-        self.inline_length += leading_margin + leading_size + content_inline_size + trailing_size + trailing_margin;
+        self.record.inline_length += inline_advance(
+            leading_margin,
+            leading_size,
+            content_inline_size,
+            trailing_size,
+            trailing_margin,
+        );
         self.block_length = self
             .block_length
             .max(content_block_size + border_box_block_start + border_box_block_end);
@@ -135,17 +160,41 @@ impl LineBoxData {
     pub(crate) fn add_static_position_marker(&mut self, box_: Node, preceded_by_inline_box_start_edges: bool) {
         self.static_position_markers.push(StaticPositionMarker {
             box_,
-            inline_offset: self.inline_length,
+            inline_offset: self.record.inline_length,
             block_offset: CssPixels::default(),
             writing_mode: self.writing_mode,
             preceded_by_in_flow_content: !self.fragments.is_empty() || preceded_by_inline_box_start_edges,
         });
     }
 
+    pub(crate) fn set_inline_box_baseline(
+        &mut self,
+        box_: Node,
+        baseline: CssPixels,
+        accumulated_vertical_shift: CssPixels,
+    ) -> bool {
+        if self.inline_box_baselines.iter().any(|entry| entry.box_ == box_) {
+            return false;
+        }
+        self.inline_box_baselines.push(InlineBoxBaseline {
+            box_,
+            baseline,
+            accumulated_vertical_shift,
+        });
+        true
+    }
+
+    pub(crate) fn inline_box_baseline(&self, box_: Node) -> Option<InlineBoxBaseline> {
+        self.inline_box_baselines
+            .iter()
+            .find(|entry| entry.box_ == box_)
+            .copied()
+    }
+
     pub(crate) fn clamp_static_position_markers_to_inline_length(&mut self) {
         for marker in &mut self.static_position_markers {
-            if marker.inline_offset > self.inline_length {
-                marker.inline_offset = self.inline_length;
+            if marker.inline_offset > self.record.inline_length {
+                marker.inline_offset = self.record.inline_length;
             }
         }
     }
@@ -174,7 +223,7 @@ impl LineBoxData {
             whitespace_inline_size += fragment.inline_length;
             trailing_whitespace_inline_size += fragment.inline_length;
             if should_remove {
-                self.inline_length -= fragment.inline_length;
+                self.record.inline_length -= fragment.inline_length;
                 self.fragments.remove(fragment_index);
                 self.clamp_static_position_markers_to_inline_length();
             }
@@ -196,8 +245,8 @@ impl LineBoxData {
             let fragment = &mut self.fragments[last_fragment_index];
             fragment.length_in_code_units -= fragment_trailing_whitespace.length_in_code_units;
             fragment.inline_length -= fragment_trailing_whitespace.inline_size;
-            fragment.trailing_whitespace = TrailingWhitespace::default();
-            self.inline_length -= fragment_trailing_whitespace.inline_size;
+            fragment.trailing_whitespace = line_box_fragment::TrailingWhitespace::default();
+            self.record.inline_length -= fragment_trailing_whitespace.inline_size;
             self.clamp_static_position_markers_to_inline_length();
         }
 
@@ -219,10 +268,32 @@ impl LineBoxData {
         self.calculate_or_trim_trailing_whitespace(true);
     }
 
+    pub(crate) fn trim_trailing_whitespace_before_block_ellipsis(&mut self) {
+        while let Some(fragment) = self.fragments.last_mut() {
+            let whitespace = std::mem::take(&mut fragment.trailing_whitespace);
+            if whitespace.length_in_code_units == 0 {
+                break;
+            }
+            self.record.inline_length -= whitespace.inline_size;
+            if whitespace.length_in_code_units == fragment.length_in_code_units {
+                self.fragments.pop();
+                continue;
+            }
+            fragment.length_in_code_units -= whitespace.length_in_code_units;
+            fragment.inline_length -= whitespace.inline_size;
+            fragment.has_trailing_whitespace = true;
+            break;
+        }
+        self.clamp_static_position_markers_to_inline_length();
+    }
     pub(crate) fn is_empty_or_ends_in_whitespace(&self) -> bool {
         self.fragments
             .last()
-            .is_none_or(LineBoxFragmentData::ends_in_whitespace)
+            .is_none_or(line_box_fragment::LineBoxFragmentData::ends_in_whitespace)
+    }
+
+    pub(crate) fn visible_fragments(&self) -> impl DoubleEndedIterator<Item = &line_box_fragment::LineBoxFragmentData> {
+        self.fragments.iter().filter(|fragment| !fragment.is_fully_truncated)
     }
 
     pub(crate) fn is_empty(&self) -> bool {

@@ -25,6 +25,8 @@ ProcessType process_type_from_name(StringView name)
         return ProcessType::RequestServer;
     if (name == "ImageDecoder"sv)
         return ProcessType::ImageDecoder;
+    if (name == "WasmCompiler"sv)
+        return ProcessType::WasmCompiler;
 
     dbgln("Unknown process type: '{}'", name);
     VERIFY_NOT_REACHED();
@@ -45,6 +47,8 @@ StringView process_name_from_type(ProcessType type)
         return "RequestServer"sv;
     case ProcessType::ImageDecoder:
         return "ImageDecoder"sv;
+    case ProcessType::WasmCompiler:
+        return "WasmCompiler"sv;
     }
     VERIFY_NOT_REACHED();
 }
@@ -53,8 +57,10 @@ ProcessManager::ProcessManager()
     : on_process_added([](Process&) {})
     , on_process_exited([](Process&&, Optional<int>) {})
     , m_process_monitor(ProcessMonitor([this](pid_t pid, Optional<int> exit_status) {
-        if (auto process = remove_process(pid); process.has_value())
+        if (auto process = remove_process(pid); process.has_value()) {
+            process->save_crash_report(exit_status);
             on_process_exited(process.release_value(), exit_status);
+        }
     }))
 {
     add_process(Process(WebView::ProcessType::Browser, nullptr, Core::Process::current()));

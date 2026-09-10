@@ -5,10 +5,11 @@
  */
 
 #include "AbstractCanvasMixin.h"
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/Parser/RustSyntaxParsing.h>
 #include <LibWeb/CSS/ValueType.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/ValueParserRustFFI.h>
 
 namespace Web::HTML {
 
@@ -18,7 +19,44 @@ Optional<Color> AbstractCanvasMixin::parse_a_css_color_value(Utf16View value) co
     // To parse a CSS <color> value, given a string input, and an optional context element element:
 
     // 1. Parse input as a <color>. If the result is failure, return failure; otherwise, let color be the result.
-    auto color = parse_css_type(CSS::Parser::ParsingParams { CSS::Parser::SpecialContext::CanvasContextGenericValue }, value, CSS::ValueType::Color);
+    RefPtr<CSS::StyleValue const> color;
+    Optional<Color> resolved_color;
+    bool found_cached_value = false;
+    bool const input_is_cacheable = value.length_in_code_units() <= max_color_cache_input_length;
+    if (input_is_cacheable) {
+        for (size_t index = 0; index < m_color_cache.size(); ++index) {
+            if (m_color_cache[index].input != value)
+                continue;
+
+            color = m_color_cache[index].parsed_value;
+            resolved_color = m_color_cache[index].resolved_color;
+            found_cached_value = true;
+
+            if (index != m_color_cache.size() - 1) {
+                auto entry = move(m_color_cache[index]);
+                m_color_cache.remove(index);
+                m_color_cache.append(move(entry));
+            }
+            break;
+        }
+    }
+
+    if (!found_cached_value) {
+        auto parsed_color = CSS::Parser::ValueParserFFI::rust_parse_simple_color(CSS::Parser::ffi_utf16_view(value));
+        if (parsed_color.success)
+            resolved_color = Color(parsed_color.red, parsed_color.green, parsed_color.blue, parsed_color.alpha);
+        if (!resolved_color.has_value())
+            color = parse_css_type(CSS::Parser::ParsingParams { CSS::Parser::SpecialContext::CanvasContextGenericValue }, value, CSS::ValueType::Color);
+
+        if (input_is_cacheable) {
+            if (m_color_cache.size() == max_color_cache_size)
+                m_color_cache.remove(0);
+            m_color_cache.append({ Utf16String::from_utf16(value), color, resolved_color });
+        }
+    }
+
+    if (resolved_color.has_value())
+        return resolved_color;
 
     if (!color)
         return {};
@@ -36,9 +74,9 @@ Optional<Color> AbstractCanvasMixin::parse_a_css_color_value(Utf16View value) co
 
     auto color_resolution_context = canvas_element().visit(
         [&](GC::Ref<HTMLCanvasElement> const& canvas_element) {
-            canvas_element->document().update_style_if_needed_for_element(*canvas_element);
+            canvas_element->document().update_style_for_element(*canvas_element, DOM::Document::StyleUpdateMode::OnlyIfNeeded);
 
-            if (canvas_element->computed_values())
+            if (canvas_element->has_style())
                 return CSS::ColorResolutionContext::for_element(*canvas_element);
 
             return CSS::ColorResolutionContext {};

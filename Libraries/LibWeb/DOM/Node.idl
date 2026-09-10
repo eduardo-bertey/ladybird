@@ -14,27 +14,27 @@ interface Node : EventTarget {
     const unsigned short DOCUMENT_FRAGMENT_NODE = 11;
     const unsigned short NOTATION_NODE = 12; // legacy
     readonly attribute unsigned short nodeType;
-    readonly attribute Utf16DOMString nodeName;
+    readonly attribute DOMString nodeName;
 
-    readonly attribute Utf16USVString baseURI;
+    readonly attribute USVString baseURI;
 
     readonly attribute boolean isConnected;
     readonly attribute Document? ownerDocument;
     Node getRootNode(optional GetRootNodeOptions options = {});
-    readonly attribute Node? parentNode;
+    [DirectGetter] readonly attribute Node? parentNode;
     readonly attribute Element? parentElement;
     boolean hasChildNodes();
     [SameObject] readonly attribute NodeList childNodes;
-    readonly attribute Node? firstChild;
-    readonly attribute Node? lastChild;
-    readonly attribute Node? previousSibling;
-    readonly attribute Node? nextSibling;
+    [DirectGetter] readonly attribute Node? firstChild;
+    [DirectGetter] readonly attribute Node? lastChild;
+    [DirectGetter] readonly attribute Node? previousSibling;
+    [DirectGetter] readonly attribute Node? nextSibling;
 
-    [CEReactions] attribute Utf16DOMString? nodeValue;
-    [CEReactions] attribute Utf16DOMString? textContent;
+    [CEReactions] attribute DOMString? nodeValue;
+    [CEReactions] attribute DOMString? textContent;
     [CEReactions] undefined normalize();
 
-    [CEReactions] Node cloneNode(optional boolean deep = false);
+    [CEReactions] Node cloneNode(optional boolean subtree = false);
     boolean isEqualNode(Node? otherNode);
     boolean isSameNode(Node? otherNode); // legacy alias of ===
 
@@ -44,17 +44,17 @@ interface Node : EventTarget {
     const unsigned short DOCUMENT_POSITION_CONTAINS = 0x08;
     const unsigned short DOCUMENT_POSITION_CONTAINED_BY = 0x10;
     const unsigned short DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 0x20;
-    unsigned short compareDocumentPosition(Node? otherNode);
+    unsigned short compareDocumentPosition(Node other);
     boolean contains(Node? other);
 
-    Utf16DOMString? lookupPrefix(Utf16DOMString? namespace);
-    Utf16DOMString? lookupNamespaceURI(Utf16DOMString? prefix);
-    boolean isDefaultNamespace(Utf16DOMString? namespace);
+    DOMString? lookupPrefix(DOMString? namespace);
+    DOMString? lookupNamespaceURI(DOMString? prefix);
+    boolean isDefaultNamespace(DOMString? namespace);
 
-    [ImplementedAs=pre_insert, CEReactions] Node insertBefore(Node node, Node? child);
+    [CEReactions, ImplementedAs=pre_insert] Node insertBefore(Node node, Node? child);
     [CEReactions] Node appendChild(Node node);
     [CEReactions] Node replaceChild(Node node, Node child);
-    [ImplementedAs=pre_remove, CEReactions] Node removeChild(Node child);
+    [CEReactions, ImplementedAs=pre_remove] Node removeChild(Node child);
 };
 
 dictionary GetRootNodeOptions {

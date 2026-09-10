@@ -5,8 +5,10 @@ set(SOURCES
     ContextState.cpp
     ConnectionFromClient.cpp
     ConnectionFromWebContent.cpp
+    FontClient.cpp
     HostWebGLContext.cpp
     OpenGLContext.cpp
+    PausedDebuggerOverlay.cpp
     VSyncScheduler.cpp
     ViewportScrollbarController.cpp
     WebGLObjectMap.cpp
@@ -25,6 +27,8 @@ invoke_py_generator(
 set(GENERATED_SOURCES
     CompositorControlClientEndpoint.h
     CompositorControlServerEndpoint.h
+    CompositorFontClientEndpoint.h
+    CompositorFontServerEndpoint.h
     CompositorWebContentClientEndpoint.h
     CompositorWebContentServerEndpoint.h
     ${CMAKE_BINARY_DIR}/Libraries/LibWeb/WebGL/GLFunctions.cpp
@@ -53,7 +57,7 @@ target_link_libraries(Compositor PRIVATE compositorservice LibCore LibMain LibSa
 target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibIPC LibMedia LibSync LibWeb ${ANGLE_TARGETS} skia)
 
 if (APPLE)
-    target_link_libraries(Compositor PRIVATE "-framework CoreGraphics" "-framework CoreVideo")
+    target_link_libraries(compositorservice PUBLIC "-framework CoreGraphics" "-framework CoreVideo")
 endif()
 
 if (WIN32)

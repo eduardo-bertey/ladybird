@@ -13,10 +13,11 @@
 //! before/after counts on deterministic workloads. Reading and resetting is
 //! exposed to C++ for the `internals.styleFfiCounters()` test surface.
 //!
-//! The counters are always compiled in: one relaxed atomic increment per
-//! crossing is negligible next to the crossing itself.
+//! The counters are always compiled in but disabled until first read. The
+//! disabled hot path is one relaxed atomic load per crossing.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 macro_rules! define_ffi_ops {
     ($($variant:ident => $name:literal,)+) => {
@@ -37,12 +38,11 @@ macro_rules! define_ffi_ops {
 
 define_ffi_ops! {
     // Entries: C++ -> Rust.
-    SelectorMatchEntry => "selectorMatchEntries",
     CascadeBulkEntry => "cascadeBulkEntries",
     CascadedStoreQueryEntry => "cascadedStoreQueryEntries",
     CustomPropertyStoreLifecycleEntry => "customPropertyStoreLifecycleEntries",
-    CustomPropertyStoreQueryEntry => "customPropertyStoreQueryEntries",
     LonghandDriverEntry => "longhandDriverEntries",
+    LonghandDriverPhaseCallback => "longhandDriverPhaseCallbacks",
     ShorthandExpansionEntry => "shorthandExpansionEntries",
     NestedPropertyComputeEntry => "nestedPropertyComputeEntries",
     CalcOperationEntry => "calcOperationEntries",
@@ -52,30 +52,158 @@ define_ffi_ops! {
     StyleValueCreateEntry => "styleValueCreateEntries",
     StyleValueDestroyEntry => "styleValueDestroyEntries",
     StyleValueQueryEntry => "styleValueQueryEntries",
+    StyleValueSerializeEntry => "styleValueSerializeEntries",
     StyleGroupCloneEntry => "styleGroupCloneEntries",
     StyleGroupFreeEntry => "styleGroupFreeEntries",
+    AnimationKeyframeLonghandEntry => "animationKeyframeLonghandEntries",
     AnimationEvaluationEntry => "animationEvaluationEntries",
     TransitionDecisionEntry => "transitionDecisionEntries",
-    // Callbacks: Rust -> C++.
-    SelectorDomReadCallback => "selectorDomReadCallbacks",
-    SelectorMetadataCallback => "selectorMetadataCallbacks",
-    CascadeResolveUnresolvedCallback => "cascadeResolveUnresolvedCallbacks",
-    CascadeParseSubstitutedCallback => "cascadeParseSubstitutedCallbacks",
-    CascadeSourceSlotCallback => "cascadeSourceSlotCallbacks",
-    CascadeCustomPropertyBatchCallback => "cascadeCustomPropertyBatchCallbacks",
-    ShorthandSetLonghandCallback => "shorthandSetLonghandCallbacks",
-    LonghandStoreBatchCallback => "longhandStoreBatchCallbacks",
-    LonghandCppComputeFallback => "longhandCppComputeFallbacks",
-    LonghandParentValueFetchCallback => "longhandParentValueFetchCallbacks",
+    // Computed longhand table passes whose cost follows the table's width rather than a change.
+    LonghandTableClone => "longhandTableClones",
+    LonghandTableFullHash => "longhandTableFullHashes",
+    LonghandTableSlotHash => "longhandTableSlotHashes",
+    SubstitutionCallbackFreeParse => "substitutionCallbackFreeParses",
+    SubstitutionCallbackParseRequest => "substitutionCallbackParseRequests",
+    SizesAttributeParseEntry => "sizesAttributeParseEntries",
+    // Ownership callbacks: Rust -> C++.
     StringRetainReleaseCallback => "stringRetainReleaseCallbacks",
-    AnimationComputeBatchCallback => "animationComputeBatchCallbacks",
+    SubstitutionOracleCallback => "substitutionOracleCallbacks",
+    // CSS parser callbacks: Rust -> C++.
+    InternUtf16FlyStringCallback => "internUtf16FlyStringCallbacks",
+    EvaluateConditionCallback => "evaluateConditionCallbacks",
+    MediaEnvironmentCallback => "mediaEnvironmentCallbacks",
 }
 
 static COUNTERS: [AtomicU64; FFI_OP_COUNT] = [const { AtomicU64::new(0) }; FFI_OP_COUNT];
+static COUNTERS_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CPP_CALLBACK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+thread_local! {
+    static COMPLETE_STYLE_UPDATE_STATE: RefCell<CompleteStyleUpdateState> = const { RefCell::new(CompleteStyleUpdateState::new()) };
+}
+
+#[derive(Default)]
+struct DeferredCppReleases {
+    fly_strings: Vec<usize>,
+}
+
+impl DeferredCppReleases {
+    const fn new() -> Self {
+        Self {
+            fly_strings: Vec::new(),
+        }
+    }
+}
+
+struct CompleteStyleUpdateState {
+    depth: u32,
+    releases: DeferredCppReleases,
+    has_outstanding_view: bool,
+}
+
+impl CompleteStyleUpdateState {
+    const fn new() -> Self {
+        Self {
+            depth: 0,
+            releases: DeferredCppReleases::new(),
+            has_outstanding_view: false,
+        }
+    }
+}
+
+#[repr(C)]
+pub struct FfiDeferredCppReleases {
+    pub fly_strings: *const usize,
+    pub fly_string_count: usize,
+}
+
+unsafe extern "C" {
+    fn ladybird_utf16_fly_string_unref(raw: usize);
+}
 
 #[inline]
 pub(crate) fn bump(op: FfiOp) {
-    COUNTERS[op as usize].fetch_add(1, Ordering::Relaxed);
+    if COUNTERS_ENABLED.load(Ordering::Relaxed) {
+        COUNTERS[op as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn bump_cpp_callback(op: FfiOp) {
+    #[cfg(test)]
+    CPP_CALLBACK_COUNT.set(CPP_CALLBACK_COUNT.get() + 1);
+    bump(op);
+}
+
+pub(crate) fn release_utf16_fly_string(raw: usize) {
+    let deferred = COMPLETE_STYLE_UPDATE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.depth == 0 {
+            return false;
+        }
+        state.releases.fly_strings.push(raw);
+        true
+    });
+    if deferred {
+        return;
+    }
+    bump_cpp_callback(FfiOp::StringRetainReleaseCallback);
+    unsafe { ladybird_utf16_fly_string_unref(raw) };
+}
+
+/// Marks a complete C++-orchestrated style update, from transaction planning
+/// through consumption of every published style reaction.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_ffi_complete_style_update_begin() {
+    COMPLETE_STYLE_UPDATE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        assert!(
+            !state.has_outstanding_view,
+            "complete style update entered while deferred releases are being drained"
+        );
+        state.depth = state
+            .depth
+            .checked_add(1)
+            .expect("complete style update depth overflow");
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_ffi_complete_style_update_end() -> FfiDeferredCppReleases {
+    COMPLETE_STYLE_UPDATE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.depth = state
+            .depth
+            .checked_sub(1)
+            .expect("unbalanced complete style update scope");
+        if state.depth != 0 {
+            return FfiDeferredCppReleases {
+                fly_strings: std::ptr::null(),
+                fly_string_count: 0,
+            };
+        }
+        assert!(!state.has_outstanding_view, "deferred release view was not cleared");
+        state.has_outstanding_view = true;
+        FfiDeferredCppReleases {
+            fly_strings: state.releases.fly_strings.as_ptr(),
+            fly_string_count: state.releases.fly_strings.len(),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_deferred_cpp_releases_clear() {
+    COMPLETE_STYLE_UPDATE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if !state.has_outstanding_view {
+            return;
+        }
+        assert_eq!(state.depth, 0, "deferred releases cleared during a style update");
+        state.releases.fly_strings.clear();
+        state.has_outstanding_view = false;
+    });
 }
 
 /// Returns the number of FFI boundary counters.
@@ -102,6 +230,7 @@ pub extern "C" fn rust_style_ffi_counters_reset() {
     for counter in &COUNTERS {
         counter.store(0, Ordering::Relaxed);
     }
+    COUNTERS_ENABLED.store(true, Ordering::Relaxed);
 }
 
 /// Notes the adoption of a Rust style value allocation by a C++ shell; called

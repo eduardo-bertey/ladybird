@@ -6,7 +6,7 @@
 
 #include <LibGC/Heap.h>
 #include <LibURL/URL.h>
-#include <LibWeb/Layout/SVGTextPathBox.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGTextPathElement.h>
 
@@ -24,7 +24,7 @@ void SVGTextPathElement::attribute_changed(Utf16FlyString const& name, Optional<
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == SVG::AttributeNames::startOffset)
-        m_start_offset = AttributeParser::parse_number_percentage(value.value_or({}));
+        m_start_offset = parse_number_percentage(value.value_or({}));
 }
 
 GC::Ptr<SVGGeometryElement const> SVGTextPathElement::path_or_shape() const
@@ -49,9 +49,9 @@ void SVGTextPathElement::visit_edges(Cell::Visitor& visitor)
     SVGURIReferenceMixin::visit_edges(visitor);
 }
 
-RefPtr<Layout::Node> SVGTextPathElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+Layout::Node* SVGTextPathElement::create_layout_node(CSS::LayoutStyle style)
 {
-    return make_ref_counted<Layout::SVGTextPathBox>(document(), *this, style);
+    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGTextPathBox);
 }
 
 };

@@ -5,6 +5,7 @@
  */
 
 #include <AK/Assertions.h>
+#include <LibWeb/DOM/Node.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -13,7 +14,9 @@
 namespace Web::Layout {
 
 NodeArena::NodeArena()
-    : m_handle(RustFFI::layout_arena_create())
+    : m_handle(RustFFI::layout_arena_create([](void* shell) {
+        return as<TextNode>(*static_cast<Node*>(shell)).text_source();
+    }))
 {
     VERIFY(m_handle);
 }
@@ -23,73 +26,54 @@ NodeArena::~NodeArena()
     RustFFI::layout_arena_destroy(m_handle);
 }
 
-RustFFI::NodeAllocation NodeArena::allocate()
+RustFFI::NodeSlotId NodeArena::allocate(RustFFI::FfiNodeConstructionFacts const& construction_facts)
 {
-    auto allocation = RustFFI::layout_arena_allocate(m_handle);
-    VERIFY(allocation.data);
-    return allocation;
+    return RustFFI::layout_arena_allocate(m_handle, construction_facts);
 }
 
-void NodeArena::free(RustFFI::NodeSlotId slot, u32 generation)
+void NodeArena::free_subtree(RustFFI::NodeSlotId root)
 {
-    RustFFI::layout_arena_free(m_handle, slot, generation);
+    RustFFI::layout_arena_free_subtree(m_handle, root);
 }
 
-void NodeArena::enroll_text_node_for_content_sync(TextNode const& text_node)
+u64 NodeArena::formatting_context_run_cache_hit_count() const
 {
-    m_text_nodes_enrolled_for_content_sync.append(text_node.make_weak_ptr<TextNode>());
+    return RustFFI::layout_arena_fc_run_cache_hit_count(m_handle);
 }
 
-void NodeArena::sync_enrolled_text_node_content()
+u64 NodeArena::table_cell_measurement_cache_miss_count() const
 {
-    if (m_text_nodes_enrolled_for_content_sync.is_empty())
-        return;
-    // A node that is alive but detached keeps its enrollment: it cannot
-    // resolve style-dependent text without a parent, and it may be reinserted
-    // by a later tree update without another enrollment trigger.
-    Vector<WeakPtr<TextNode>> still_detached_text_nodes;
-    for (auto& weak_text_node : m_text_nodes_enrolled_for_content_sync) {
-        auto const* text_node = weak_text_node.ptr();
-        if (!text_node)
-            continue;
-        if (!text_node->parent()) {
-            still_detached_text_nodes.append(move(weak_text_node));
-            continue;
-        }
-        text_node->sync_text_content_to_arena();
-    }
-    m_text_nodes_enrolled_for_content_sync = move(still_detached_text_nodes);
+    return RustFFI::layout_arena_table_cell_measurement_cache_miss_count(m_handle);
 }
 
-void NodeArena::enroll_node_for_replaced_content_facts_sync(Node const& node)
+u64 NodeArena::intrinsic_measurement_count() const
 {
-    m_nodes_enrolled_for_replaced_content_facts_sync.append(node.make_weak_ptr<Node>());
+    return RustFFI::layout_arena_intrinsic_measurement_count(m_handle);
+}
+
+void NodeArena::visit_dom_nodes(GC::Cell::Visitor& visitor) const
+{
+    RustFFI::layout_arena_visit_dom_nodes(m_handle, &visitor, [](void* visitor_pointer, void* dom_node_pointer) {
+        static_cast<GC::Cell::Visitor*>(visitor_pointer)->visit(static_cast<DOM::Node*>(dom_node_pointer));
+    });
+}
+
+bool destroy_layout_subtree(Node& node)
+{
+    return RustFFI::layout_arena_detach_and_free_subtree(node.arena_handle(), Node::slot_id(&node));
 }
 
 void NodeArena::sync_enrolled_content_for_layout()
 {
     if (layout_pass_currently_running())
         return;
-    sync_enrolled_text_node_content();
-    sync_enrolled_replaced_content_facts();
-}
-
-void NodeArena::sync_enrolled_replaced_content_facts()
-{
-    bool any_enrolled_node_died = false;
-    for (auto& weak_node : m_nodes_enrolled_for_replaced_content_facts_sync) {
-        auto const* node = weak_node.ptr();
-        if (!node) {
-            any_enrolled_node_died = true;
-            continue;
-        }
-        RustFFI::FfiReplacedContentFacts facts {};
-        if (auto const* box = as_if<Box>(*node))
-            facts = box->build_replaced_content_facts_for_arena();
-        RustFFI::layout_arena_set_replaced_content_facts(m_handle, Node::slot_id(node), facts);
-    }
-    if (any_enrolled_node_died)
-        m_nodes_enrolled_for_replaced_content_facts_sync.remove_all_matching([](auto& weak_node) { return !weak_node.ptr(); });
+    RustFFI::layout_arena_sync_enrolled_content_for_layout(
+        m_handle, nullptr,
+        [](void*, void* node_shell, RustFFI::FfiReplacedContentFacts* facts) {
+            auto const& node = *static_cast<Node const*>(node_shell);
+            if (auto const* box = as_if<Box>(node))
+                *facts = box->build_replaced_content_facts_for_arena();
+        });
 }
 
 }

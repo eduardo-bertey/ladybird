@@ -30,6 +30,13 @@ namespace Gfx {
 
 class Font;
 
+struct SystemFontIdentifier {
+    u64 generation { 0 };
+    u64 face_id { 0 };
+
+    bool operator==(SystemFontIdentifier const&) const = default;
+};
+
 struct FontCacheKey {
     float point_size;
     Vector<FontVariationAxis> axes;
@@ -53,6 +60,7 @@ struct FontCacheKey {
 class Typeface : public RefCounted<Typeface> {
 public:
     static ErrorOr<NonnullRefPtr<Typeface>> try_load_from_resource(Core::Resource const&, u32 ttc_index = 0);
+    static ErrorOr<NonnullRefPtr<Typeface>> try_load_from_mapped_file(NonnullOwnPtr<Core::MappedFile>, u32 ttc_index = 0);
     static ErrorOr<NonnullRefPtr<Typeface>> try_load_from_anonymous_buffer(Core::AnonymousBuffer, u32 ttc_index = 0);
     static ErrorOr<NonnullRefPtr<Typeface>> try_load_from_temporary_memory(ReadonlyBytes bytes, u32 ttc_index = 0);
     static ErrorOr<NonnullRefPtr<Typeface>> try_load_from_externally_owned_memory(ReadonlyBytes bytes, u32 ttc_index = 0);
@@ -67,9 +75,28 @@ public:
     virtual u16 width() const = 0;
     virtual u8 slope() const = 0;
 
+    ReadonlyBytes font_data() const LIFETIME_BOUND { return buffer(); }
+    u32 collection_index() const { return ttc_index(); }
+
     [[nodiscard]] NonnullRefPtr<Font> font(float point_size, FontVariationSettings const& variations = {}, Gfx::ShapeFeatures const& shape_features = {}) const;
 
+    void set_system_font_identifier(SystemFontIdentifier identifier) { m_system_font_identifier = identifier; }
+    Optional<SystemFontIdentifier> system_font_identifier() const { return m_system_font_identifier; }
+
     hb_face_t* harfbuzz_typeface() const;
+
+    // Union of all glyph bounding boxes as recorded in the `head` table, in font units with y pointing up.
+    // is_empty() when the face has no usable `head` table (e.g. bitmap-only fonts).
+    struct BoundingBoxInFontUnits {
+        i16 x_min { 0 };
+        i16 y_min { 0 };
+        i16 x_max { 0 };
+        i16 y_max { 0 };
+        u16 units_per_em { 0 };
+
+        bool is_empty() const { return x_min >= x_max || y_min >= y_max || units_per_em == 0; }
+    };
+    BoundingBoxInFontUnits bounding_box_in_font_units() const;
 
     template<typename T>
     bool fast_is() const = delete;
@@ -81,6 +108,8 @@ protected:
         RawFontData,
         ResourceFontData,
         SystemFont,
+        SystemUIFont,
+        SystemFontId,
     };
 
     Typeface();
@@ -92,22 +121,29 @@ protected:
 
     void set_anonymous_font_data(Core::AnonymousBuffer);
     void set_resource_font_data(Core::Resource const&);
+    void set_mapped_font_data(NonnullRefPtr<Core::SharedMappedFile>);
     void copy_font_data_from(Typeface const&);
     bool has_font_data_backing() const { return m_font_data.has_value(); }
 
 private:
+    friend class SharedFontProvider;
+
     template<typename T>
     friend ErrorOr<void> IPC::encode(IPC::Encoder&, T const&);
 
     template<typename T>
     friend ErrorOr<T> IPC::decode(IPC::Decoder&);
 
-    using FontDataBacking = Variant<Core::AnonymousBuffer, NonnullRefPtr<Core::Resource const>>;
+    using FontDataBacking = Variant<Core::AnonymousBuffer, NonnullRefPtr<Core::Resource const>, NonnullRefPtr<Core::SharedMappedFile>>;
     Optional<FontDataBacking> m_font_data;
+    Optional<SystemFontIdentifier> m_system_font_identifier;
+
+    void clear_font_cache() const;
 
     mutable HashMap<FontCacheKey, NonnullRefPtr<Font>> m_fonts;
     mutable hb_blob_t* m_harfbuzz_blob { nullptr };
     mutable hb_face_t* m_harfbuzz_face { nullptr };
+    mutable Optional<BoundingBoxInFontUnits> m_bounding_box_in_font_units;
 };
 
 }

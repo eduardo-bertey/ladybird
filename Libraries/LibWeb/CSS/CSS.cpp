@@ -11,7 +11,6 @@
 #include <LibWeb/CSS/CSSUnitValue.h>
 #include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/Parser/Parser.h>
-#include <LibWeb/CSS/Parser/Syntax.h>
 #include <LibWeb/CSS/Parser/SyntaxParsing.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
@@ -46,7 +45,7 @@ WebIDL::ExceptionOr<bool> supports(JS::VM& vm, Utf16View condition_text)
 {
     (void)vm;
     // 1. If conditionText, parsed and evaluated as a <supports-condition>, would return true, return true.
-    if (auto supports = parse_css_supports(Parser::ParsingParams {}, condition_text); supports && supports->matches())
+    if (auto supports = parse_css_supports(Parser::ParsingParams {}, condition_text); supports.has_value() && supports_condition_matches(*supports))
         return true;
 
     // 2. Otherwise, If conditionText, wrapped in parentheses and then parsed and evaluated as a <supports-condition>, would return true, return true.
@@ -56,7 +55,7 @@ WebIDL::ExceptionOr<bool> supports(JS::VM& vm, Utf16View condition_text)
     wrapped_condition_text_builder.append_code_unit(u')');
     auto wrapped_condition_text = wrapped_condition_text_builder.to_string();
 
-    if (auto supports = parse_css_supports(Parser::ParsingParams {}, wrapped_condition_text); supports && supports->matches())
+    if (auto supports = parse_css_supports(Parser::ParsingParams {}, wrapped_condition_text); supports.has_value() && supports_condition_matches(*supports))
         return true;
 
     // 3. Otherwise, return false.
@@ -83,16 +82,15 @@ WebIDL::ExceptionOr<void> register_property(DOM::Document& document, PropertyDef
 
     // 3. Attempt to consume a syntax definition from syntax. If it returns failure, throw a SyntaxError.
     //    Otherwise, let syntax definition be the returned syntax definition.
-    auto syntax_component_values = parse_component_values_list(parsing_params, definition.syntax);
-    auto maybe_syntax = parse_as_syntax(syntax_component_values, Parser::LimitSingleComponentIdentToCustomIdent::Yes);
-    if (!maybe_syntax) {
+    auto maybe_syntax = parse_as_syntax(definition.syntax, Parser::LimitSingleComponentIdentToCustomIdent::Yes);
+    if (!maybe_syntax.has_value()) {
         return WebIDL::SyntaxError::create("Invalid syntax definition"_utf16);
     }
 
     RefPtr<StyleValue const> initial_value_maybe;
 
     // 4. If syntax definition is the universal syntax definition, and initialValue is not present,
-    if (maybe_syntax->type() == Parser::SyntaxNode::NodeType::Universal) {
+    if (maybe_syntax->is_universal()) {
         if (!definition.initial_value.has_value()) {
             // let parsed initial value be empty.
             // This must be treated identically to the "default" initial value of custom properties, as defined in [css-variables].
@@ -117,11 +115,9 @@ WebIDL::ExceptionOr<void> register_property(DOM::Document& document, PropertyDef
         // Otherwise, parse initialValue according to syntax definition.
         // NB: We don't need to worry about explicitly rejecting arbitrary substitution functions here since all
         //     supported syntaxes implicitly reject them
-        auto initial_value_component_values = parse_component_values_list(parsing_params, definition.initial_value.value());
-
         initial_value_maybe = Parser::parse_with_a_syntax(
             parsing_params,
-            initial_value_component_values,
+            definition.initial_value.value(),
             *maybe_syntax);
 
         // If this fails, throw a SyntaxError and exit this algorithm.
@@ -143,13 +139,13 @@ WebIDL::ExceptionOr<void> register_property(DOM::Document& document, PropertyDef
     //    an initial value of parsed initial value, and an inherit flag of inherit flag.
     CustomPropertyRegistration registered_property {
         .property_name = property_name,
-        .syntax = maybe_syntax.release_nonnull(),
+        .syntax = maybe_syntax.release_value(),
         .inherit = definition.inherits,
         .initial_value = initial_value_maybe,
     };
     // Append registered property to property set.
     property_set.set(registered_property.property_name, move(registered_property));
-    document.did_change_custom_property_registrations();
+    document.did_change_custom_property_registrations(property_name);
 
     return {};
 }

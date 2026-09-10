@@ -28,22 +28,18 @@ public:
 
     virtual ~CounterStyleStyleValue() override = default;
 
-    void serialize(StringBuilder&, SerializationMode) const;
-
     RefPtr<CounterStyle const> resolve_counter_style(StyleScope const&) const;
     Variant<Utf16FlyString, SymbolsFunction> value() const
     {
         auto const& data = m_value->counter_style;
         if (!data.is_symbols)
-            return Utf16FlyString::from_raw(data.name.raw);
+            return css_string_from_rust(&data.name);
         Vector<Utf16FlyString> symbols;
         symbols.ensure_capacity(data.symbols.length);
         for (size_t i = 0; i < data.symbols.length; ++i)
-            symbols.unchecked_append(Utf16FlyString::from_raw(data.symbols.pointer[i].raw));
+            symbols.unchecked_append(css_string_from_rust(&data.symbols.pointer[i]));
         return SymbolsFunction { static_cast<SymbolsType>(data.symbols_type), move(symbols) };
     }
-
-    bool properties_equal(CounterStyleStyleValue const& other) const { return value() == other.value(); }
 
 private:
     friend class StyleValue;

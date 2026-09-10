@@ -7,7 +7,7 @@
 #include <LibGfx/Path.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/SVG/AttributeNames.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGLineElement.h>
 
 namespace Web::SVG {
@@ -24,20 +24,20 @@ void SVGLineElement::attribute_changed(Utf16FlyString const& name, Optional<Utf1
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == SVG::AttributeNames::x1) {
-        m_x1 = AttributeParser::parse_number_percentage(value.value_or({}));
+        m_x1 = parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::y1) {
-        m_y1 = AttributeParser::parse_number_percentage(value.value_or({}));
+        m_y1 = parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::x2) {
-        m_x2 = AttributeParser::parse_number_percentage(value.value_or({}));
+        m_x2 = parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::y2) {
-        m_y2 = AttributeParser::parse_number_percentage(value.value_or({}));
+        m_y2 = parse_number_percentage(value.value_or({}));
     }
 
     if (name.is_one_of(SVG::AttributeNames::x1, SVG::AttributeNames::y1, SVG::AttributeNames::x2, SVG::AttributeNames::y2))
         set_needs_layout_update(DOM::SetNeedsLayoutReason::StyleChange);
 }
 
-Gfx::Path SVGLineElement::get_path(CSSPixelSize viewport_size)
+Gfx::Path SVGLineElement::get_path(CSSPixelSize viewport_size, CSS::ComputedValues const&)
 {
     auto const viewport_width = viewport_size.width().to_float();
     auto const viewport_height = viewport_size.height().to_float();

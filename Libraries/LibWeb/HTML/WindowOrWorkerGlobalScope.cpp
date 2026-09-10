@@ -7,23 +7,30 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Base64.h>
 #include <AK/NumericLimits.h>
 #include <AK/QuickSort.h>
 #include <AK/String.h>
+#include <AK/StringBuilder.h>
 #include <AK/Utf8View.h>
 #include <AK/Vector.h>
+#include <LibCore/Timer.h>
 #include <LibGC/Function.h>
 #include <LibGC/Heap.h>
+#include <LibGC/HeapVector.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/ScalingMode.h>
+#include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/PrimitiveString.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/Bindings/MessagePort.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/Crypto/Crypto.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/Fetch/BindingsGlue.h>
 #include <LibWeb/Fetch/FetchMethod.h>
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
@@ -33,12 +40,15 @@
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventSource.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
-#include <LibWeb/HTML/ImageBitmap.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/PromiseRejectionEvent.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/Scripting/Fetching.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/Timer.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
@@ -52,6 +62,8 @@
 #include <LibWeb/IndexedDB/Internal/Algorithms.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/Infra/Strings.h>
+#include <LibWeb/Loader/ResourceLoader.h>
+#include <LibWeb/NavigationTiming/PerformanceNavigationTiming.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/PerformanceTimeline/EntryTypes.h>
 #include <LibWeb/PerformanceTimeline/EventNames.h>
@@ -69,7 +81,6 @@
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/Types.h>
-#include <LibWeb/WebSockets/WebSocket.h>
 
 namespace Web::Bindings {
 
@@ -100,6 +111,19 @@ void WindowOrWorkerGlobalScopeMixin::initialize()
         });
     ENUMERATE_SUPPORTED_PERFORMANCE_ENTRY_TYPES
 #undef __ENUMERATE_SUPPORTED_PERFORMANCE_ENTRY_TYPES
+
+    if (is<HTML::Window>(this_impl())) {
+#define __ENUMERATE_SUPPORTED_PERFORMANCE_ENTRY_TYPES(entry_type, cpp_class) \
+    m_performance_entry_buffer_map.set(entry_type,                           \
+        PerformanceTimeline::PerformanceEntryTuple {                         \
+            .performance_entry_buffer = {},                                  \
+            .max_buffer_size = cpp_class::max_buffer_size(),                 \
+            .available_from_timeline = cpp_class::available_from_timeline(), \
+            .dropped_entries_count = 0,                                      \
+        });
+        ENUMERATE_WINDOW_SUPPORTED_PERFORMANCE_ENTRY_TYPES
+#undef __ENUMERATE_SUPPORTED_PERFORMANCE_ENTRY_TYPES
+    }
 }
 
 void WindowOrWorkerGlobalScopeMixin::visit_edges(JS::Cell::Visitor& visitor)
@@ -115,11 +139,17 @@ void WindowOrWorkerGlobalScopeMixin::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_cache_storage);
     visitor.visit(m_resource_timing_secondary_buffer);
     visitor.visit(m_trusted_type_policy_factory);
+    visitor.visit(m_count_queuing_strategy_size_function);
+    visitor.visit(m_byte_length_queuing_strategy_size_function);
+    visitor.ignore(m_outstanding_rejected_promises_weak_set);
+    visitor.visit(m_about_to_be_notified_rejected_promises_list);
 }
 
 void WindowOrWorkerGlobalScopeMixin::finalize()
 {
     clear_map_of_active_timers();
+    if (m_intensive_timer_throttling_grace_timer)
+        m_intensive_timer_throttling_grace_timer->stop();
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#dom-origin
@@ -143,6 +173,60 @@ bool WindowOrWorkerGlobalScopeMixin::cross_origin_isolated() const
     return relevant_settings_object(*this).cross_origin_isolated_capability() == CanUseCrossOriginIsolatedAPIs::Yes;
 }
 
+// https://html.spec.whatwg.org/multipage/webappapis.html#dom-btoa
+WebIDL::ExceptionOr<Utf16String> WindowOrWorkerGlobalScopeMixin::btoa(Utf16View data) const
+{
+    auto& vm = this_impl().vm();
+
+    // The btoa(data) method must throw an "InvalidCharacterError" DOMException if data contains any character whose code point is greater than U+00FF.
+    Vector<u8> byte_string;
+    byte_string.ensure_capacity(data.length_in_code_units());
+    for (u32 code_point : data) {
+        if (code_point > 0xff)
+            return WebIDL::InvalidCharacterError::create(*vm.current_realm(), "Data contains characters outside the range U+0000 and U+00FF"_utf16);
+        byte_string.append(code_point);
+    }
+
+    // Otherwise, the user agent must convert data to a byte sequence whose nth byte is the eight-bit representation of the nth code point of data,
+    // and then must apply forgiving-base64 encode to that byte sequence and return the result.
+    return TRY_OR_THROW_OOM(vm, encode_base64_to_utf16(byte_string.span()));
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#dom-atob
+WebIDL::ExceptionOr<Utf16String> WindowOrWorkerGlobalScopeMixin::atob(Utf16View data) const
+{
+    auto& vm = this_impl().vm();
+    auto& realm = *vm.current_realm();
+
+    // 1. Let decodedData be the result of running forgiving-base64 decode on data.
+    ByteBuffer decoded_data;
+    TRY_OR_THROW_OOM(vm, decoded_data.try_resize(size_required_to_decode_base64(data)));
+    auto decode_result = decode_base64_into(data, decoded_data);
+
+    // 2. If decodedData is failure, then throw an "InvalidCharacterError" DOMException.
+    if (decode_result.is_error())
+        return WebIDL::InvalidCharacterError::create(realm, "Input string is not valid base64 data"_utf16);
+
+    // 3. Return decodedData.
+    Utf16StringBuilder builder { decoded_data.size() };
+    for (auto byte : decoded_data.bytes())
+        builder.append_code_unit(byte);
+    return builder.to_string();
+}
+
+// https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-queuemicrotask
+void WindowOrWorkerGlobalScopeMixin::queue_microtask(WebIDL::CallbackType& callback)
+{
+    GC::Ptr<DOM::Document> document;
+    if (is<Window>(this_impl()))
+        document = &static_cast<Window&>(this_impl()).associated_document();
+
+    // The queueMicrotask(callback) method must queue a microtask to invoke callback with « » and "report".
+    HTML::queue_a_microtask(document, GC::create_function(GC::Heap::the(), [&callback] {
+        (void)WebIDL::invoke_callback(callback, {}, WebIDL::ExceptionBehavior::Report, {});
+    }));
+}
+
 // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#dom-createimagebitmap
 void WindowOrWorkerGlobalScopeMixin::create_image_bitmap(JS::Realm& realm, ImageBitmapSource image, ImageBitmapOptions options, GC::Ref<WebIDL::Promise> promise) const
 {
@@ -153,6 +237,19 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap(JS::Realm& realm, Image
 void WindowOrWorkerGlobalScopeMixin::create_image_bitmap(JS::Realm& realm, ImageBitmapSource image, WebIDL::Long sx, WebIDL::Long sy, WebIDL::Long sw, WebIDL::Long sh, ImageBitmapOptions options, GC::Ref<WebIDL::Promise> promise) const
 {
     create_image_bitmap_impl(realm, promise, image, sx, sy, sw, sh, move(options));
+}
+
+// https://html.spec.whatwg.org/multipage/structured-data.html#dom-structuredclone
+WebIDL::ExceptionOr<JS::Value> WindowOrWorkerGlobalScopeMixin::structured_clone(JS::Realm& realm, JS::Value value, Bindings::StructuredSerializeOptions const& options)
+{
+    // 1. Let serialized be ? StructuredSerializeWithTransfer(value, options["transfer"]).
+    auto serialized = TRY(HTML::structured_serialize_with_transfer(realm, value, options.transfer));
+
+    // 2. Let deserializeRecord be ? StructuredDeserializeWithTransfer(serialized, this's relevant realm).
+    auto deserialized = TRY(HTML::structured_deserialize_with_transfer(serialized, realm));
+
+    // 3. Return deserializeRecord.[[Deserialized]].
+    return deserialized.deserialized;
 }
 
 // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#cropped-to-the-source-rectangle-with-formatting
@@ -552,7 +649,6 @@ void WindowOrWorkerGlobalScopeMixin::clear_timeout(i32 id)
     if (auto timer = m_timers.get(id); timer.has_value())
         timer.value()->stop();
     m_timers.remove(id);
-    m_timer_nesting_levels.remove(id);
 }
 
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-clearinterval
@@ -561,7 +657,6 @@ void WindowOrWorkerGlobalScopeMixin::clear_interval(i32 id)
     if (auto timer = m_timers.get(id); timer.has_value())
         timer.value()->stop();
     m_timers.remove(id);
-    m_timer_nesting_levels.remove(id);
 }
 
 void WindowOrWorkerGlobalScopeMixin::clear_map_of_active_timers()
@@ -569,7 +664,6 @@ void WindowOrWorkerGlobalScopeMixin::clear_map_of_active_timers()
     for (auto& it : m_timers)
         it.value->stop();
     m_timers.clear();
-    m_timer_nesting_levels.clear();
 }
 
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timer-initialisation-steps
@@ -583,9 +677,12 @@ i32 WindowOrWorkerGlobalScopeMixin::run_timer_initialization_steps(TimerHandler 
 
     // 3. If the surrounding agent's event loop's currently running task is a task that was created by this algorithm,
     //    then let nesting level be the task's timer nesting level. Otherwise, let nesting level be 0.
+    // NB: Only a task created by this algorithm carries a nonzero timer nesting level — so reading the level of
+    //     whatever task is running covers both cases. A microtask counts as its own task here — so a timer scheduled
+    //     from one starts over at 0 even when the checkpoint follows a deeply-nested timer callback.
     u32 nesting_level = 0;
-    if (previous_id.has_value())
-        nesting_level = m_timer_nesting_levels.get(previous_id.value()).value_or(0);
+    if (auto currently_running_task = relevant_agent(relevant_global_object(*this)).event_loop->currently_running_task())
+        nesting_level = currently_running_task->timer_nesting_level();
 
     // 4. If timeout is less than 0, then set timeout to 0.
     if (timeout < 0)
@@ -594,6 +691,15 @@ i32 WindowOrWorkerGlobalScopeMixin::run_timer_initialization_steps(TimerHandler 
     // 5. If nesting level is greater than 5, and timeout is less than 4, then set timeout to 4.
     if (nesting_level > 5 && timeout < 4)
         timeout = 4;
+
+    // A hidden document leaves a timer with no delay alone — the page's own yield points, which Chrome keeps prompt
+    // too — and holds every other one back, a timer past nesting level 5 the hardest: a page re-arming timers from
+    // their own callbacks is just what a hidden page shouldn't stay busy with (see throttled_timer_delay()).
+    auto throttling_class = TimerThrottlingClass::Delayed;
+    if (nesting_level > 5)
+        throttling_class = TimerThrottlingClass::Chained;
+    else if (timeout == 0)
+        throttling_class = TimerThrottlingClass::Immediate;
 
     // 6. Let realm be global's relevant realm.
     auto& realm = relevant_realm(*this);
@@ -702,7 +808,6 @@ i32 WindowOrWorkerGlobalScopeMixin::run_timer_initialization_steps(TimerHandler 
         // 10. Otherwise, remove global's map of active timers[id].
         case Repeat::No:
             m_timers.remove(id);
-            m_timer_nesting_levels.remove(id);
             break;
         }
     }));
@@ -711,20 +816,27 @@ i32 WindowOrWorkerGlobalScopeMixin::run_timer_initialization_steps(TimerHandler 
     nesting_level++;
 
     // 11. Set task's timer nesting level to nesting level.
-    m_timer_nesting_levels.set(id, nesting_level);
-
     // 12. Let completionStep be an algorithm step which queues a global task on the timer task source given global to run task.
-    Function<void()> completion_step = [this, task = move(task)]() mutable {
-        queue_global_task(Task::Source::TimerTask, relevant_global_object(*this), GC::create_function(GC::Heap::the(), [this, task] {
+    // NB: The task the event loop runs is the one completionStep queues — so that's what carries step 11's nesting
+    //     level. queue_global_task() creates its task internally; so, this queues one by hand to get at it — and a
+    //     fresh one per firing, since a repeating timer's next firing can queue before the previous task has run.
+    Function<void()> completion_step = [this, task = move(task), nesting_level]() mutable {
+        auto& global = relevant_global_object(*this);
+        GC::Ptr<DOM::Document const> document;
+        if (auto* window = window_from_global_object(global))
+            document = &window->associated_document();
+        auto queued_task = Task::create(Task::Source::TimerTask, document, GC::create_function(GC::Heap::the(), [this, task] {
             HTML::TemporaryExecutionContext execution_context { relevant_settings_object(*this), HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
             task->function()();
         }));
+        queued_task->set_timer_nesting_level(nesting_level);
+        relevant_agent(global).event_loop->task_queue().add(queued_task);
     };
 
     // 13. Set uniqueHandle to the result of running steps after a timeout given global, "setTimeout/setInterval",
     //     timeout, and completionStep.
     //     FIXME: run_steps_after_a_timeout() needs to be updated to return a unique internal value that can be used here.
-    run_steps_after_a_timeout_impl(timeout, move(completion_step), id, repeat);
+    run_steps_after_a_timeout_impl(timeout, throttling_class, move(completion_step), id, repeat);
 
     // FIXME: 14. Set global's map of setTimeout and setInterval IDs[id] to uniqueHandle.
 
@@ -1136,15 +1248,43 @@ WindowOrWorkerGlobalScopeMixin::AffectedAnyWebSockets WindowOrWorkerGlobalScopeM
 }
 
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#run-steps-after-a-timeout
-void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout(i32 timeout, Function<void()> completion_step)
+i32 WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout(i32 timeout, Function<void()> completion_step)
 {
-    run_steps_after_a_timeout_impl(timeout, move(completion_step), {});
+    auto timer_key = m_timer_id_allocator.allocate();
+    auto remove_timer_and_complete = [this, timer_key, completion_step = move(completion_step)] mutable {
+        m_timers.remove(timer_key);
+        completion_step();
+    };
+    // NB: A timeout another specification waits on — an idle callback's, an AbortSignal's — isn't one of the page's
+    //     own yield points, so a hidden document holds it back like a chained timer, however short it is.
+    run_steps_after_a_timeout_impl(timeout, TimerThrottlingClass::Chained, move(remove_timer_and_complete), timer_key);
+    return timer_key;
 }
 
-void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout, Function<void()> completion_step, Optional<i32> timer_key, Repeat repeat)
+void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout, TimerThrottlingClass throttling_class, Function<void()> completion_step, Optional<i32> timer_key, Repeat repeat)
 {
     // 1. Assert: if timerKey is given, then the caller of this algorithm is the timer initialization steps. (Other specifications must not pass timerKey.)
     // Note: This is enforced by the caller.
+
+    // NB: A hidden document holds a delayed timer back past its deadline to its next wake-up (see
+    //     throttled_timer_delay()), so the delay the timer is armed with can differ from the one it was asked for.
+    auto deadline = HighResolutionTime::unsafe_shared_current_time() + timeout;
+    auto throttled_delay = throttled_timer_delay(throttling_class, deadline);
+
+    // NB: The intensive tier paces chained timers by their wake-ups (see throttled_timer_delay()), so note when one
+    //     runs while the document is hidden. The step itself goes into a GC::Function rather than into the wrapper's
+    //     captures: Timer::visit_edges() scans only the bytes of the callable the timer holds, and an AK::Function
+    //     nested in there keeps its own captures out of line once they outgrow its inline storage, where that scan
+    //     can't see them. An AbortSignal.timeout() signal lives nowhere else until it aborts, so a collection would
+    //     sweep it. A GC::Function scans its own callable's captures, whatever their size.
+    if (throttling_class == TimerThrottlingClass::Chained) {
+        auto step = GC::create_function(GC::Heap::the(), move(completion_step));
+        completion_step = [this, step] {
+            if (timers_are_throttled())
+                m_last_chained_timer_wake_up = HighResolutionTime::unsafe_shared_current_time();
+            step->function()();
+        };
+    }
 
     // NB: We deviate from the spec here slightly by reusing existing timers if a timer_key is provided.
     GC::Ptr<Timer> existing_timer;
@@ -1153,7 +1293,14 @@ void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout,
         if (result.has_value()) {
             existing_timer = result.value().ptr();
             existing_timer->set_callback(move(completion_step));
-            existing_timer->set_interval(timeout);
+            existing_timer->set_throttling_class(throttling_class);
+            existing_timer->set_deadline(deadline);
+            // A throttled delay runs from now to the wake-up, so the timer restarts on it; unthrottled, a repeating
+            // timer keeps the schedule it's on (see below).
+            if (throttled_delay.has_value())
+                existing_timer->restart(*throttled_delay);
+            else
+                existing_timer->set_interval(timeout);
         }
     } else {
         // 2. If timerKey is not given, then set it to a new unique non-numeric value.
@@ -1167,7 +1314,7 @@ void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout,
     // completed. The task callback still calls run_timer_initialization_steps to update nesting
     // levels and potentially clamp the interval.
     auto repeating = repeat == Repeat::Yes ? Timer::Repeating::Yes : Timer::Repeating::No;
-    auto timer = existing_timer ? GC::Ref { *existing_timer } : Timer::create(timeout, move(completion_step), timer_key.value(), repeating);
+    auto timer = existing_timer ? GC::Ref { *existing_timer } : Timer::create(throttled_delay.value_or(timeout), move(completion_step), timer_key.value(), repeating, throttling_class, deadline);
 
     // FIXME: 4. Set global's map of active timers[timerKey] to startTime plus milliseconds.
     m_timers.set(timer_key.value(), timer);
@@ -1184,6 +1331,253 @@ void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout,
     // restarting it would cause drift (next fire = now + interval instead of previous fire + interval).
     if (!existing_timer)
         timer->start();
+}
+
+// A delay for Core::Timer: whole milliseconds, never negative, and no more than it can hold.
+static i32 timer_delay_from(double milliseconds)
+{
+    return static_cast<i32>(min(ceil(max(milliseconds, 0.0)), static_cast<double>(NumericLimits<i32>::max())));
+}
+
+// Whether the document holds its timers back at all. A document takes its visibility state from its navigable when
+// that activates it; until then — while it's still being populated, e.g. — the state is the default, hidden. So only
+// a fully active document counts as hidden here.
+bool WindowOrWorkerGlobalScopeMixin::document_is_hidden() const
+{
+    auto const* window = as_if<Window>(this_impl());
+    if (!window)
+        return false;
+    auto& document = window->associated_document();
+    return document.is_fully_active() && document.hidden();
+}
+
+// Whether the document holds its timers back right now: it's hidden, and it isn't playing audio — a document playing
+// audio is doing what the user asked of it, as a music player is, so it keeps its timers, as it does in Chrome.
+bool WindowOrWorkerGlobalScopeMixin::timers_are_throttled() const
+{
+    return document_is_hidden() && !as<Window>(this_impl()).associated_document().is_playing_audio();
+}
+
+// A hidden document runs a delayed timer only at a wake-up. The wake-ups are one wake-up interval apart, on a grid
+// aligned to the time origin of the page's local root document — the same grid for every frame of the page, so all
+// of their timers run in one wake-up rather than each frame's in its own — and the timer runs at the first wake-up
+// at or after its deadline. Once the document has been hidden for the grace period, a chained timer runs only at an
+// intensive wake-up, an intensive interval apart on the same grid — though the next ordinary wake-up will do when no
+// chained timer has run for an intensive interval, so a page that wakes rarely isn't made to wait a whole one for a
+// single wake-up. That's Chrome's rule too. Returns the delay that takes the timer to its wake-up, or nothing when the
+// timer runs at its deadline as usual: the document is visible or playing audio, the timer has no delay, or the
+// global isn't a Window.
+Optional<i32> WindowOrWorkerGlobalScopeMixin::throttled_timer_delay(TimerThrottlingClass throttling_class, double deadline) const
+{
+    if (throttling_class == TimerThrottlingClass::Immediate || !timers_are_throttled())
+        return {};
+
+    auto& document = as<Window>(this_impl()).associated_document();
+    auto grid_origin = [&] {
+        auto& page = document.page();
+        if (page.has_local_root_navigable()) {
+            if (auto root_document = page.local_root_navigable()->active_document())
+                return relevant_settings_object(*root_document).time_origin();
+        }
+        return relevant_settings_object(document).time_origin();
+    }();
+    auto wake_up_at_or_after = [&](double time, double interval) {
+        return grid_origin + ceil((time - grid_origin) / interval) * interval;
+    };
+
+    auto now = HighResolutionTime::unsafe_shared_current_time();
+    auto due = max(now, deadline);
+    auto interval = m_hidden_document_timer_wake_up_interval;
+    auto wake_up = wake_up_at_or_after(due, interval);
+    if (throttling_class == TimerThrottlingClass::Chained && m_chained_timers_intensively_throttled) {
+        auto intensive_interval = m_intensive_timer_wake_up_interval;
+        auto ordinary_wake_up_from = m_last_chained_timer_wake_up.has_value() ? max(due, *m_last_chained_timer_wake_up + intensive_interval) : due;
+        wake_up = min(wake_up_at_or_after(due, intensive_interval), wake_up_at_or_after(ordinary_wake_up_from, interval));
+    }
+    return timer_delay_from(wake_up - now);
+}
+
+// Re-arms every timer still on the clock for the wake-up it's due at now (see throttled_timer_delay()).
+void WindowOrWorkerGlobalScopeMixin::realign_timers()
+{
+    auto now = HighResolutionTime::unsafe_shared_current_time();
+    for (auto& [id, timer] : m_timers) {
+        // A timer that has fired and has its task queued is done with the clock.
+        if (!timer->is_active())
+            continue;
+        auto delay = throttled_timer_delay(timer->throttling_class(), timer->deadline());
+        timer->restart(delay.value_or(timer_delay_from(timer->deadline() - now)));
+    }
+}
+
+// The page visibility change steps for timers: every timer still on the clock is re-armed for the document's new
+// visibility — a hidden document's delayed timers wait for their wake-up, and a visible document's fire at their own
+// deadlines, right away if those have passed. And the grace period before a hidden document's chained timers move
+// to the intensive tier starts over whenever the document hides, playing audio or not, and is off while it's
+// visible. Which grace period applies is decided as the document hides — the shorter one if it had finished loading
+// by then, the longer one if it was still loading — so a document that finishes loading while hidden keeps the
+// longer one, as in Chrome.
+void WindowOrWorkerGlobalScopeMixin::document_visibility_state_changed(Badge<DOM::Document>)
+{
+    m_chained_timers_intensively_throttled = false;
+    if (document_is_hidden()) {
+        if (!m_intensive_timer_throttling_grace_timer) {
+            m_intensive_timer_throttling_grace_timer = Core::Timer::create_single_shot(0, [this] {
+                m_chained_timers_intensively_throttled = true;
+                realign_timers();
+            });
+        }
+        auto& document = as<Window>(this_impl()).associated_document();
+        auto grace_period = document.readiness() == DocumentReadyState::Complete
+            ? m_intensive_timer_throttling_grace_period_once_loaded
+            : m_intensive_timer_throttling_grace_period_while_loading;
+        m_intensive_timer_throttling_grace_timer->restart(timer_delay_from(grace_period));
+    } else if (m_intensive_timer_throttling_grace_timer) {
+        m_intensive_timer_throttling_grace_timer->stop();
+    }
+    realign_timers();
+}
+
+// A document that starts or stops playing audio while hidden loses or regains its throttling (see
+// timers_are_throttled()); the grace period keeps running either way.
+void WindowOrWorkerGlobalScopeMixin::document_audio_play_state_changed(Badge<DOM::Document>)
+{
+    realign_timers();
+}
+
+// https://streams.spec.whatwg.org/#count-queuing-strategy-size-function
+GC::Ref<WebIDL::CallbackType> WindowOrWorkerGlobalScopeMixin::count_queuing_strategy_size_function()
+{
+    auto& realm = HTML::relevant_realm(*this);
+
+    if (!m_count_queuing_strategy_size_function) {
+        // 1. Let steps be the following steps:
+        auto steps = [](auto const&) {
+            // 1. Return 1.
+            return 1.0;
+        };
+
+        // 2. Let F be ! CreateBuiltinFunction(steps, 0, "size", « », globalObject’s relevant Realm).
+        auto function = JS::NativeFunction::create(realm, move(steps), 0, "size"_utf16_fly_string, &realm);
+
+        // 3. Set globalObject’s count queuing strategy size function to a Function that represents a reference to F, with callback context equal to globalObject’s relevant settings object.
+        // FIXME: Update spec comment to pass globalObject's relevant realm once Streams spec is updated for ShadowRealm spec
+        m_count_queuing_strategy_size_function = GC::Heap::the().allocate<WebIDL::CallbackType>(*function, realm);
+    }
+
+    return GC::Ref { *m_count_queuing_strategy_size_function };
+}
+
+// https://streams.spec.whatwg.org/#byte-length-queuing-strategy-size-function
+GC::Ref<WebIDL::CallbackType> WindowOrWorkerGlobalScopeMixin::byte_length_queuing_strategy_size_function()
+{
+    auto& realm = HTML::relevant_realm(*this);
+
+    if (!m_byte_length_queuing_strategy_size_function) {
+        // 1. Let steps be the following steps, given chunk:
+        auto steps = [](JS::VM& vm) {
+            auto chunk = vm.argument(0);
+
+            // 1. Return ? GetV(chunk, "byteLength").
+            return chunk.get(vm, vm.names.byteLength);
+        };
+
+        // 2. Let F be ! CreateBuiltinFunction(steps, 1, "size", « », globalObject’s relevant Realm).
+        auto function = JS::NativeFunction::create(realm, Function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)> { move(steps) }, 1, "size"_utf16_fly_string, &realm);
+
+        // 3. Set globalObject’s byte length queuing strategy size function to a Function that represents a reference to F, with callback context equal to globalObject’s relevant settings object.
+        // FIXME: Update spec comment to pass globalObject's relevant realm once Streams spec is updated for ShadowRealm spec
+        m_byte_length_queuing_strategy_size_function = GC::Heap::the().allocate<WebIDL::CallbackType>(*function, realm);
+    }
+
+    return GC::Ref { *m_byte_length_queuing_strategy_size_function };
+}
+
+void WindowOrWorkerGlobalScopeMixin::push_onto_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise> promise)
+{
+    m_outstanding_rejected_promises_weak_set.append(promise);
+}
+
+bool WindowOrWorkerGlobalScopeMixin::remove_from_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise> promise)
+{
+    return m_outstanding_rejected_promises_weak_set.remove_first_matching([&](GC::Ptr<JS::Promise> promise_in_set) {
+        return promise == promise_in_set;
+    });
+}
+
+void WindowOrWorkerGlobalScopeMixin::push_onto_about_to_be_notified_rejected_promises_list(GC::Ref<JS::Promise> promise)
+{
+    if (!m_about_to_be_notified_rejected_promises_list)
+        m_about_to_be_notified_rejected_promises_list = GC::Heap::the().allocate<GC::HeapVector<GC::Ref<JS::Promise>>>();
+    m_about_to_be_notified_rejected_promises_list->elements().append(promise);
+}
+
+bool WindowOrWorkerGlobalScopeMixin::remove_from_about_to_be_notified_rejected_promises_list(GC::Ref<JS::Promise> promise)
+{
+    if (!m_about_to_be_notified_rejected_promises_list)
+        return false;
+    return m_about_to_be_notified_rejected_promises_list->elements().remove_first_matching([&](auto& promise_in_list) {
+        return promise == promise_in_list;
+    });
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#notify-about-rejected-promises
+void WindowOrWorkerGlobalScopeMixin::notify_about_rejected_promises(Badge<EventLoop>)
+{
+    // 1. Let list be a copy of settings object's about-to-be-notified rejected promises list.
+    auto list = m_about_to_be_notified_rejected_promises_list;
+
+    // 2. If list is empty, return.
+    if (!list || list->elements().is_empty())
+        return;
+
+    // 3. Clear settings object's about-to-be-notified rejected promises list.
+    m_about_to_be_notified_rejected_promises_list = nullptr;
+
+    // 4. Let global be settings object's global object.
+    auto& global = this_impl();
+    auto& global_object = relevant_global_object(*this);
+
+    // 5. Queue a global task on the DOM manipulation task source given global to run the following substep:
+    queue_global_task(Task::Source::DOMManipulation, global_object, GC::create_function(GC::Heap::the(), [this, &global, list = move(list)] {
+        auto& realm = relevant_realm(*this);
+
+        // 1. For each promise p in list:
+        for (auto const& promise : list->elements()) {
+
+            // 1. If p's [[PromiseIsHandled]] internal slot is true, continue to the next iteration of the loop.
+            if (promise->is_handled())
+                continue;
+
+            // 2. Let notHandled be the result of firing an event named unhandledrejection at global, using PromiseRejectionEvent, with the cancelable attribute initialized to true,
+            //    the promise attribute initialized to p, and the reason attribute initialized to the value of p's [[PromiseResult]] internal slot.
+            PromiseRejectionEventInit event_init {
+                {
+                    .bubbles = false,
+                    .cancelable = true,
+                    .composed = false,
+                },
+                // Sadly we can't use .promise and .reason here, as we can't use the designator on the initialization of EventInit above.
+                /* .promise = */ *promise,
+                /* .reason = */ promise->result(),
+            };
+
+            auto promise_rejection_event = PromiseRejectionEvent::create(realm.global_object(), HTML::EventNames::unhandledrejection, event_init);
+
+            bool not_handled = global.dispatch_event(*promise_rejection_event);
+
+            // 3. If notHandled is false, then the promise rejection is handled. Otherwise, the promise rejection is not handled.
+
+            // 4. If p's [[PromiseIsHandled]] internal slot is false, add p to settings object's outstanding rejected promises weak set.
+            if (!promise->is_handled())
+                m_outstanding_rejected_promises_weak_set.append(*promise);
+
+            // This algorithm results in promise rejections being marked as handled or not handled. These concepts parallel handled and not handled script errors.
+            // If a rejection is still not handled after this, then the rejection may be reported to a developer console.
+            if (not_handled)
+                HTML::report_exception_to_console(promise->result(), realm, ErrorInPromise::Yes);
+        }
+    }));
 }
 
 // https://w3c.github.io/hr-time/#dom-windoworworkerglobalscope-performance
@@ -1324,6 +1718,33 @@ Optional<URL::Origin> WindowOrWorkerGlobalScopeMixin::window_or_worker_global_sc
 
     // 2. Return this's relevant settings object's origin.
     return relevant_origin;
+}
+
+static bool s_experimental_interfaces_exposed = false;
+
+void WindowOrWorkerGlobalScopeMixin::set_experimental_interfaces_exposed(bool exposed)
+{
+    s_experimental_interfaces_exposed = exposed;
+}
+
+bool WindowOrWorkerGlobalScopeMixin::expose_experimental_interfaces()
+{
+    return s_experimental_interfaces_exposed;
+}
+
+// A site-compatibility rule can expose a gated interface or member to the documents and workers it matches, without
+// exposing it to the web at large. The rule is keyed by the URL the environment was created with, so it holds for the
+// lifetime of that global, the same way the global switch does.
+bool WindowOrWorkerGlobalScopeMixin::expose_experimental_interface(EnvironmentSettingsObject& settings, StringView name)
+{
+    if (s_experimental_interfaces_exposed)
+        return true;
+
+    // The first global of a page is set up before the loader exists, and holds nothing a rule could match anyway.
+    if (!ResourceLoader::is_initialized())
+        return false;
+
+    return ResourceLoader::the().site_compatibility_exposes_experimental_interface(settings.creation_url, name);
 }
 
 }

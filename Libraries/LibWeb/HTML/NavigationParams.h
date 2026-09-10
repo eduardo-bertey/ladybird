@@ -11,6 +11,7 @@
 #include <LibGC/CellAllocator.h>
 #include <LibGC/Ptr.h>
 #include <LibURL/Origin.h>
+#include <LibWeb/Bindings/PerformanceNavigationTiming.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Forward.h>
@@ -43,6 +44,11 @@ struct NavigationParams : GC::Cell {
     // null or a fetch controller
     GC::Ptr<Fetch::Infrastructure::FetchController> fetch_controller { nullptr };
 
+    // AD-HOC: The fetch controller stays in the process that ran the navigation fetch. Navigation params rebuilt from
+    //         a descriptor carry the fetch's timing info here instead, so the new Document's navigation timing entry
+    //         still sees it.
+    GC::Ptr<Fetch::Infrastructure::FetchTimingInfo> fetch_timing_info { nullptr };
+
     // null or an algorithm accepting a Document, once it has been created
     GC::Ptr<GC::Function<void(DOM::Document&)>> commit_early_hints { nullptr };
 
@@ -67,7 +73,8 @@ struct NavigationParams : GC::Cell {
     // an opener policy to use for the new Document
     OpenerPolicy opener_policy;
 
-    // FIXME: a NavigationTimingType used for creating the navigation timing entry for the new Document
+    // a NavigationTimingType used for creating the navigation timing entry for the new Document
+    Bindings::NavigationTimingType navigation_timing_type { Bindings::NavigationTimingType::Navigate };
 
     // a URL or null used to populate the new Document's about base URL
     Optional<URL::URL> about_base_url;
@@ -92,6 +99,7 @@ protected:
         SandboxingFlagSet final_sandboxing_flag_set,
         ReferrerPolicy::ReferrerPolicy iframe_element_referrer_policy,
         OpenerPolicy opener_policy,
+        Bindings::NavigationTimingType navigation_timing_type,
         Optional<URL::URL> about_base_url,
         UserNavigationInvolvement user_involvement)
         : id(move(id))
@@ -107,6 +115,7 @@ protected:
         , final_sandboxing_flag_set(final_sandboxing_flag_set)
         , iframe_element_referrer_policy(iframe_element_referrer_policy)
         , opener_policy(opener_policy)
+        , navigation_timing_type(navigation_timing_type)
         , about_base_url(move(about_base_url))
         , user_involvement(user_involvement)
     {
@@ -136,7 +145,8 @@ struct NonFetchSchemeNavigationParams : JS::Cell {
     // an origin possibly for use in a user-facing prompt to confirm the invocation of an external software package
     URL::Origin initiator_origin;
 
-    // FIXME: a NavigationTimingType used for creating the navigation timing entry for the new Document
+    // a NavigationTimingType used for creating the navigation timing entry for the new Document
+    Bindings::NavigationTimingType navigation_timing_type { Bindings::NavigationTimingType::Navigate };
 
     // a user navigation involvement used when obtaining a browsing context for the new Document (if one is created)
     UserNavigationInvolvement user_involvement;
@@ -149,6 +159,7 @@ protected:
         SandboxingFlagSet target_snapshot_sandboxing_flags,
         bool source_snapshot_has_transient_activation,
         URL::Origin initiator_origin,
+        Bindings::NavigationTimingType navigation_timing_type,
         UserNavigationInvolvement user_involvement)
         : id(move(id))
         , navigable(navigable)
@@ -156,12 +167,16 @@ protected:
         , target_snapshot_sandboxing_flags(target_snapshot_sandboxing_flags)
         , source_snapshot_has_transient_activation(source_snapshot_has_transient_activation)
         , initiator_origin(move(initiator_origin))
+        , navigation_timing_type(navigation_timing_type)
         , user_involvement(user_involvement)
     {
     }
 
     void visit_edges(Visitor& visitor) override;
 };
+
+using NavigationParamsNullOrError = Optional<Utf16String>;
+using NavigationParamsVariant = Variant<NavigationParamsNullOrError, GC::Ref<NavigationParams>, GC::Ref<NonFetchSchemeNavigationParams>>;
 
 bool check_a_navigation_responses_adherence_to_x_frame_options(GC::Ptr<Fetch::Infrastructure::Response> response, LocalNavigable* navigable, GC::Ref<ContentSecurityPolicy::PolicyList const> csp_list, URL::Origin destination_origin);
 

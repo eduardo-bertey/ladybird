@@ -35,6 +35,8 @@
 
 namespace Web::CSS {
 
+WEB_API Utf16FlyString css_string_from_rust(void const*);
+
 #define ENUMERATE_CSS_STYLE_VALUE_TYPES                                                                                        \
     __ENUMERATE_CSS_STYLE_VALUE_TYPE(Anchor, anchor, AnchorStyleValue)                                                         \
     __ENUMERATE_CSS_STYLE_VALUE_TYPE(AnchorSize, anchor_size, AnchorSizeStyleValue)                                            \
@@ -108,11 +110,52 @@ namespace Web::CSS {
     __ENUMERATE_CSS_STYLE_VALUE_TYPE(URL, url, URLStyleValue)                                                                  \
     __ENUMERATE_CSS_STYLE_VALUE_TYPE(ValueList, value_list, StyleValueList)
 
+// Style value types whose absolutization still has a C++ fallback. The Rust recursion in
+// Rust/src/css/absolutize.rs runs first and declines back to these: the element-bound values
+// (tree counting, random sharing, image base URLs) decline by design, lengths decline for
+// container-relative units, calculations decline when the tree carries external leaves
+// (anchor(), attr(), shared random values), and every composite declines transitively when a
+// child does. Types whose Rust arm can never decline lose their C++ absolutized() methods and
+// leave this list; types absent from the old per-type dispatch compute to themselves through
+// the default case.
+#define ENUMERATE_CSS_STYLE_VALUE_TYPES_WITH_CPP_ABSOLUTIZATION                                                    \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(BackgroundSize, background_size, BackgroundSizeStyleValue)                    \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(BorderRadius, border_radius, BorderRadiusStyleValue)                          \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(BorderRadiusRect, border_radius_rect, BorderRadiusRectStyleValue)             \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Calculated, calculated, CalculatedStyleValue)                                 \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Color, color, ColorStyleValue)                                                \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(CounterDefinitions, counter_definitions, CounterDefinitionsStyleValue)        \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(CounterStyleSystem, counter_style_system, CounterStyleSystemStyleValue)       \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Cursor, cursor, CursorStyleValue)                                             \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Edge, edge, EdgeStyleValue)                                                   \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Filter, filter, FilterStyleValue)                                             \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(FontStyle, font_style, FontStyleStyleValue)                                   \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Function, function, FunctionStyleValue)                                       \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Image, image, ImageStyleValue)                                                \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(ImageSet, image_set, ImageSetStyleValue)                                      \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Length, length, LengthStyleValue)                                             \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(OpacityValue, opacity_value, OpacityValueStyleValue)                          \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(OpenTypeTagged, open_type_tagged, OpenTypeTaggedStyleValue)                   \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(OverflowClipMargin, overflow_clip_margin, OverflowClipMarginStyleValue)       \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Position, position, PositionStyleValue)                                       \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(RadialSize, radial_size, RadialSizeStyleValue)                                \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(RandomValueSharing, random_value_sharing, RandomValueSharingStyleValue)       \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Ratio, ratio, RatioStyleValue)                                                \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Rect, rect, RectStyleValue)                                                   \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(ScrollbarColor, scrollbar_color, ScrollbarColorStyleValue)                    \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Shadow, shadow, ShadowStyleValue)                                             \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Superellipse, superellipse, SuperellipseStyleValue)                           \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(TextIndent, text_indent, TextIndentStyleValue)                                \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(Transformation, transformation, TransformationStyleValue)                     \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(TreeCountingFunction, tree_counting_function, TreeCountingFunctionStyleValue) \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(ValueList, value_list, StyleValueList)
+
 struct ColorResolutionContext {
     Optional<PreferredColorScheme> color_scheme;
     Optional<Color> current_color;
     // Unlike current_color, this preserves precision and missing components, as needed by relative color origins.
     RefPtr<StyleValue const> current_color_style_value {};
+    void const* current_color_style_value_data { nullptr };
     CalculationResolutionContext calculation_resolution_context;
 
     [[nodiscard]] static ColorResolutionContext for_element(DOM::AbstractElement const&);
@@ -181,17 +224,28 @@ public:
     // Wrap a transferred strong Rust reference in its corresponding typed C++ facade.
     static ValueComparingNonnullRefPtr<StyleValue const> adopt_rust_style_value_data(StyleValueFFI::StyleValueData const*);
 
+    // Mint a fresh typed facade for a Rust payload child, taking a new strong reference.
+    static ValueComparingNonnullRefPtr<StyleValue const> wrap_rust_child(StyleValueFFI::RetainedStyleValueData const& child)
+    {
+        return adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(child.pointer)));
+    }
+    static ValueComparingRefPtr<StyleValue const> wrap_rust_child_or_null(StyleValueFFI::RetainedStyleValueData const& child)
+    {
+        if (!child.pointer)
+            return nullptr;
+        return wrap_rust_child(child);
+    }
+
     String to_string(SerializationMode) const;
     Utf16String to_utf16_string(SerializationMode) const;
     void serialize(StringBuilder&, SerializationMode) const;
     void serialize(Utf16StringBuilder&, SerializationMode) const;
-    Vector<Parser::ComponentValue> tokenize() const;
     GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
     // The default reification, used by types without a bespoke one and by impls that fall back.
     GC::Ref<CSSStyleValue> default_reify(Utf16FlyString const& associated_property) const;
     StyleValueVector subdivide_into_iterations(PropertyNameAndID const&) const;
 
-    void set_style_sheet(GC::Ptr<CSSStyleSheet>);
+    void set_style_sheet(StyleSheetState*);
     bool has_style_sheet_context() const { return m_has_style_sheet_context; }
 
     bool equals(StyleValue const& other) const;
@@ -221,14 +275,6 @@ template<typename T>
 struct StyleValueWithDefaultOperators : public StyleValue {
     using StyleValue::StyleValue;
     using Base = StyleValue;
-
-    bool equals(StyleValue const& other) const
-    {
-        if (type() != other.type())
-            return false;
-        auto const& typed_other = static_cast<T const&>(other);
-        return static_cast<T const&>(*this).properties_equal(typed_other);
-    }
 };
 
 i32 int_from_style_value(NonnullRefPtr<StyleValue const> const& style_value);

@@ -14,6 +14,7 @@
 #include <LibFileSystem/FileSystem.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Bytecode/Instruction.h>
+#include <LibJS/Debugger.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/GlobalObject.h>
 #include <LibJS/Runtime/ModuleRequest.h>
@@ -573,6 +574,32 @@ TEST_CASE(bytecode_cache_materializes_function_executables_lazily)
     EXPECT(!shared_data.m_cached_bytecode_executable);
 }
 
+TEST_CASE(bytecode_cache_preserves_debugger_argument_names)
+{
+    auto vm = JS::VM::create();
+    auto root_execution_context = JS::create_simple_execution_context<JS::GlobalObject>(*vm);
+    auto& realm = *root_execution_context->realm;
+
+    auto test_data = create_bytecode_cache_blob("function inspect(argument) { debugger; } inspect(42);"sv);
+    auto decoded_blob = decode_bytecode_cache_blob(test_data.blob, JS::RustIntegration::ProgramType::Script, test_data.source_hash.bytes());
+    auto script_or_error = JS::Script::create_from_bytecode_cache(decoded_blob, test_data.source_code, realm, "test.js"sv);
+    VERIFY(!script_or_error.is_error());
+
+    vm->enable_debugging();
+    vm->debugger()->set_pause_callback([&](JS::Debugger::PauseInfo const& pause_info) {
+        auto* frame = pause_info.stack_trace.first().execution_context;
+        VERIFY(frame);
+
+        auto bindings = vm->debugger()->bindings_for_frame(*frame);
+        auto argument = bindings.find_if([](auto const& binding) { return binding.name == "argument"_utf16; });
+        VERIFY(argument != bindings.end());
+        EXPECT_EQ(argument->value.as_i32(), 42);
+        vm->debugger()->continue_execution();
+    });
+
+    EXPECT(!vm->run(*script_or_error.value()).is_error());
+}
+
 TEST_CASE(decoded_bytecode_cache_backing_materializes_independently)
 {
     auto vm = JS::VM::create();
@@ -1073,4 +1100,58 @@ TEST_CASE(fresh_instruction_stream_is_readonly_mapped)
     EXPECT(died_from_inaccessible_memory);
 #    endif
 #endif
+}
+
+TEST_CASE(parse_snapshot_survives_independent_execution_and_cache_compilation)
+{
+    for (bool execute_before_cache : { false, true }) {
+        auto vm = JS::VM::create();
+        auto root_execution_context = JS::create_simple_execution_context<JS::GlobalObject>(*vm);
+        auto& realm = *root_execution_context->realm;
+        auto source = R"JS(
+            function outer(text) {
+                class Matcher {
+                    #pattern = /a+/u;
+                    matches() { return this.#pattern.test(text); }
+                }
+                return () => new Matcher().matches();
+            }
+            outer("aaa")();
+        )JS"sv;
+        auto source_code = JS::SourceCode::create("snapshot.js"_utf16, Utf16String::from_utf8(source));
+        auto* parsed = JS::RustIntegration::parse_program(source_code->utf16_data(), source_code->length_in_code_units(), JS::RustIntegration::ProgramType::Script);
+        VERIFY(parsed);
+        VERIFY(!JS::RustIntegration::parsed_program_has_errors(parsed));
+        auto* snapshot = JS::RustIntegration::clone_parsed_program(parsed);
+        VERIFY(snapshot);
+
+        auto* compiled = JS::RustIntegration::compile_parsed_program_off_thread(parsed, source_code->length_in_code_units());
+        VERIFY(compiled);
+        auto script_or_error = JS::Script::create_from_compiled(compiled, source_code, realm, "snapshot.js"sv);
+        VERIFY(!script_or_error.is_error());
+        auto script = script_or_error.release_value();
+        auto execute_original = [&] {
+            auto result = vm->run(script);
+            VERIFY(!result.is_throw_completion());
+            EXPECT_EQ(result.value(), JS::Value(true));
+        };
+        if (execute_before_cache)
+            execute_original();
+
+        auto* compiled_snapshot = JS::RustIntegration::compile_parsed_program_fully_off_thread(snapshot, source_code->length_in_code_units());
+        VERIFY(compiled_snapshot);
+        auto source_hash = bytecode_cache_source_hash(source, "UTF-8"sv);
+        auto blob = JS::RustIntegration::serialize_compiled_program_for_bytecode_cache(*compiled_snapshot, JS::RustIntegration::ProgramType::Script, source_hash.bytes());
+        JS::RustIntegration::free_compiled_program(compiled_snapshot);
+        VERIFY(!blob.is_empty());
+        if (!execute_before_cache)
+            execute_original();
+
+        auto decoded = decode_bytecode_cache_blob(Core::ImmutableBytes::adopt(move(blob)), JS::RustIntegration::ProgramType::Script, source_hash.bytes());
+        auto cached_script = JS::Script::create_from_bytecode_cache(decoded, source_code, realm, "snapshot.js"sv);
+        VERIFY(!cached_script.is_error());
+        auto result = vm->run(cached_script.release_value());
+        VERIFY(!result.is_throw_completion());
+        EXPECT_EQ(result.value(), JS::Value(true));
+    }
 }

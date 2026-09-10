@@ -54,6 +54,8 @@ public:
 
     GC::Ptr<MessagePort> entangled_port() { return m_remote_port; }
     GC::Ptr<MessagePort const> entangled_port() const { return m_remote_port; }
+    size_t pending_outgoing_message_count() const { return m_pending_outgoing_messages.size(); }
+    void fail_next_transfer_for_testing() { m_fail_next_transfer_for_testing = true; }
 
     // https://html.spec.whatwg.org/multipage/web-messaging.html#dom-messageport-postmessage
     WebIDL::ExceptionOr<void> post_message(JS::Realm&, JS::Value message, GC::RootVector<GC::Ref<JS::Object>> const& transfer);
@@ -66,6 +68,7 @@ public:
     void start();
 
     void close();
+    void discard_pending_messages();
 
     void set_onmessageerror(GC::Ptr<WebIDL::CallbackType>);
     GC::Ptr<WebIDL::CallbackType> onmessageerror();
@@ -104,6 +107,8 @@ private:
 
     // https://html.spec.whatwg.org/multipage/web-messaging.html#has-been-shipped
     bool m_has_been_shipped { false };
+    bool m_has_ever_been_entangled { false };
+    bool m_fail_next_transfer_for_testing { false };
 
     OwnPtr<IPC::Transport> m_transport;
 
@@ -112,6 +117,7 @@ private:
 
     Vector<SerializedTransferRecord> m_pending_incoming_messages;
     Vector<SerializedTransferRecord> m_pending_outgoing_messages;
+    u64 m_message_task_generation { 0 };
     bool m_should_shutdown_on_enable { false };
     bool m_enabled { false };
 };

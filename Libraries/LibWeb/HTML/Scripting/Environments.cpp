@@ -22,10 +22,11 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
-#include <LibWeb/HTML/UniversalGlobalScope.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HTML/WorkerAgentParent.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
+#include <LibWeb/HTML/WorkletGlobalScope.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/SecureContexts/AbstractOperations.h>
@@ -56,11 +57,6 @@ EnvironmentSettingsObject::EnvironmentSettingsObject(NonnullOwnPtr<JS::Execution
     : m_realm_execution_context(move(realm_execution_context))
 {
     m_module_map = GC::Heap::the().allocate<ModuleMap>();
-    if (auto* window = window_from_global_object(global_object()))
-        m_universal_global_scope = window;
-    else
-        m_universal_global_scope = Bindings::worker_global_scope_from_global_object(global_object());
-    VERIFY(m_universal_global_scope);
 
     // Register with the responsible event loop so we can perform step 4 of "perform a microtask checkpoint".
     responsible_event_loop().register_environment_settings_object({}, *this);
@@ -135,11 +131,6 @@ JS::Object& EnvironmentSettingsObject::global_object()
 {
     // An environment settings object's Realm then has a [[GlobalObject]] field, which contains the environment settings object's global object.
     return realm().global_object();
-}
-
-UniversalGlobalScopeMixin& EnvironmentSettingsObject::universal_global_scope()
-{
-    return *m_universal_global_scope;
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#responsible-event-loop
@@ -332,8 +323,8 @@ bool is_scripting_disabled(EnvironmentSettingsObject const& settings)
 // https://html.spec.whatwg.org/multipage/webappapis.html#module-type-allowed
 bool module_type_allowed(EnvironmentSettingsObject const&, Utf16View module_type)
 {
-    // 1. If moduleType is not "javascript-or-wasm", "css", or "json", then return false.
-    if (module_type != "javascript-or-wasm"sv && module_type != "css"sv && module_type != "json"sv)
+    // 1. If moduleType is not "javascript-or-wasm", "css", "json", or "text", then return false.
+    if (module_type != "javascript-or-wasm"sv && module_type != "css"sv && module_type != "json"sv && module_type != "text"sv)
         return false;
 
     // FIXME: 2. If moduleType is "css" and the CSSStyleSheet interface is not exposed in settings's realm, then return false.
@@ -655,8 +646,10 @@ bool is_secure_context(Environment const& environment)
             return false;
         }
 
-        // FIXME: 3. If global is a WorkletGlobalScope, then return true.
+        // 3. If global is a WorkletGlobalScope, then return true.
         // NOTE: Worklets can only be created in secure contexts.
+        if (Bindings::impl_from<WorkletGlobalScope>(&global))
+            return true;
     }
 
     // 2. If the result of Is url potentially trustworthy? given environment's top-level creation URL is "Potentially Trustworthy", then return true.

@@ -148,11 +148,11 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
 
     // AD-HOC: Record the mutations performed by the command action on the editing history, so the user can undo them.
     //         end_recording() is a no-op if the guard below already ended the recording.
+    bool is_cut_or_paste = user_input_type == UIEvents::InputTypes::deleteByCut || user_input_type == UIEvents::InputTypes::insertFromPaste;
     if (affected_editing_host) {
         auto category = Editing::UndoStep::Category::Other;
         // INTEROP: Cut and paste are standalone undo units in Chromium: they never coalesce with typing or deletion
         //          runs, so they categorize as Other even though they run the delete and insertText commands.
-        bool is_cut_or_paste = user_input_type == UIEvents::InputTypes::deleteByCut || user_input_type == UIEvents::InputTypes::insertFromPaste;
         if (!is_cut_or_paste) {
             if (command_definition.command.is_one_of(Editing::CommandNames::insertText, Editing::CommandNames::insertLineBreak, Editing::CommandNames::insertParagraph))
                 category = Editing::UndoStep::Category::Insertion;
@@ -169,7 +169,10 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
     };
 
     // 5. Take the action for command, passing value to the instructions as an argument.
-    auto command_result = command_definition.action(*this, value);
+    auto command_result = [&] {
+        TemporaryChange running_action { m_running_editing_command_action, true };
+        return command_definition.action(*this, value);
+    }();
 
     // INTEROP: Chromium removes the trailing placeholder line break after pasting into an existing text node. The
     //          execCommand draft only removes it when insertion creates a new text node. Perform this while the paste
@@ -192,8 +195,11 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
 
     // NB: Canonicalize the caret the command produced before the ending selection is recorded, but only if the
     //     command actually performed an edit; Chromium leaves the caret alone otherwise.
+    // INTEROP: A user cut or paste counts as an edit whenever its command ran: Chromium fires the input event and
+    //          settles the caret even when the pasted fragment reduces to nothing but transport markers.
     bool tree_was_modified = dom_tree_version() != old_dom_tree_version
-        || character_data_version() != old_character_data_version;
+        || character_data_version() != old_character_data_version
+        || (is_cut_or_paste && command_result);
     if (affected_editing_host && m_selection && tree_was_modified)
         Editing::canonicalize_collapsed_selection_for_editing(*m_selection);
 
@@ -218,8 +224,13 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
 
         // AD-HOC: For insertText, we do what other browsers do and set data to value. A paste carries null data even
         //         though it runs the insertText command.
-        if (event_init.input_type == UIEvents::InputTypes::insertText)
+        if (event_init.input_type == UIEvents::InputTypes::insertText || event_init.input_type == UIEvents::InputTypes::insertCompositionText)
             event_init.data = Utf16String::from_utf16(value);
+
+        // https://w3c.github.io/uievents/#dom-inputevent-iscomposing
+        // true if the input event occurs as part of a composition session; that is, after a compositionstart event and
+        // before the corresponding compositionend event.
+        event_init.is_composing = is_input_method_composing();
 
         auto event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, event_init, {}, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this)));
         event->set_is_trusted(true);

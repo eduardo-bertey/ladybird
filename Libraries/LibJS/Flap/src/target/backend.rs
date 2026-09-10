@@ -27,6 +27,12 @@ use super::registers::PhysicalRegister;
 use crate::CompileError;
 use crate::low_ir::Label;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelperCallKind {
+    Try,
+    SlowPath,
+}
+
 pub(crate) trait Backend: Sync {
     fn branch_float(
         &self,
@@ -68,7 +74,12 @@ pub(crate) trait Backend: Sync {
 
     fn extract_tag(&self, emit: &mut Emit<'_>, destination: PhysicalRegister, source: PhysicalRegister);
 
-    fn unbox_object(&self, emit: &mut Emit<'_>, destination: PhysicalRegister, source: PhysicalRegister);
+    fn unbox_object(
+        &self,
+        emit: &mut Emit<'_>,
+        destination: PhysicalRegister,
+        source: PhysicalRegister,
+    ) -> Result<(), CompileError>;
 
     fn float_operation(
         &self,
@@ -88,9 +99,9 @@ pub(crate) trait Backend: Sync {
         failure: &Label,
     );
 
-    fn helper_call(&self, emit: &mut Emit<'_>, function: crate::low_ir::Relocation);
+    fn helper_call(&self, emit: &mut Emit<'_>, function: crate::low_ir::Relocation, argument_count: usize);
 
-    fn interpreter_call(&self, emit: &mut Emit<'_>, function: crate::low_ir::Relocation);
+    fn interpreter_call(&self, emit: &mut Emit<'_>, function: crate::low_ir::Relocation) -> Result<(), CompileError>;
 
     fn raw_native_call(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]);
 
@@ -263,7 +274,7 @@ pub(crate) trait Backend: Sync {
         operands: &[AllocatedOperand],
     );
 
-    fn finalize_divide(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]);
+    fn finalize_divide(&self, emit: &mut Emit<'_>, width: IntegerWidth, operands: &[AllocatedOperand]);
 }
 
 pub(crate) struct X86_64Backend;

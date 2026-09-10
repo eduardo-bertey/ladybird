@@ -6,108 +6,38 @@
 
 #pragma once
 
-#include <AK/NonnullOwnPtr.h>
 #include <AK/RefCounted.h>
-#include <LibWeb/CSS/BooleanExpression.h>
-#include <LibWeb/CSS/FeatureQuery.h>
-#include <LibWeb/CSS/Parser/ComponentValue.h>
-#include <LibWeb/CSS/PropertyNameAndID.h>
+#include <LibWeb/CSS/HypotheticalElement.h>
+#include <LibWeb/CSS/Query.h>
+#include <LibWeb/CSS/RustQueryHandle.h>
 
 namespace Web::CSS {
 
-enum class SizeFeatureID : u8 {
-    AspectRatio,
-    BlockSize,
-    Height,
-    InlineSize,
-    Orientation,
-    Width,
-};
+struct ContainerQueryFeatureRequirements {
+    bool requires_width_container : 1 { false };
+    bool requires_height_container : 1 { false };
+    bool requires_inline_size_container : 1 { false };
+    bool requires_block_size_container : 1 { false };
+    bool requires_style_container : 1 { false };
+    bool requires_scroll_state_container : 1 { false };
+    bool has_unknown_or_unsupported_feature : 1 { false };
 
-// https://drafts.csswg.org/css-conditional-5/#size-container
-class SizeFeature final : public FeatureQuery<SizeFeature, SizeFeatureID> {
-public:
-    using Base = FeatureQuery<SizeFeature, SizeFeatureID>;
-
-    virtual MatchResult evaluate(BooleanExpressionEvaluationContext const&) const override;
-    virtual void collect_container_query_feature_requirements(ContainerQueryFeatureRequirements&) const override;
-    virtual void dump(StringBuilder&, int indent_levels = 0) const override;
-
-    static StringView serialize_feature_id(SizeFeatureID);
-    static bool keyword_is_falsey(SizeFeatureID, Keyword);
-
-private:
-    friend Base;
-
-    SizeFeature(Type type, SizeFeatureID id, Variant<Empty, FeatureValue, Range> value = {})
-        : Base(type, id, move(value))
+    bool contains_size_feature() const
     {
-    }
-};
-
-// https://drafts.csswg.org/css-conditional-5/#style-container
-class StyleQueryFunction final : public BooleanExpression {
-public:
-    static NonnullOwnPtr<StyleQueryFunction> create(NonnullOwnPtr<BooleanExpression>&&);
-    virtual ~StyleQueryFunction() override = default;
-
-    virtual MatchResult evaluate(BooleanExpressionEvaluationContext const&) const override;
-    virtual void collect_container_query_feature_requirements(ContainerQueryFeatureRequirements&) const override;
-    virtual void serialize_to(Utf16StringBuilder&) const override;
-    virtual void dump(StringBuilder&, int indent_levels = 0) const override;
-
-private:
-    explicit StyleQueryFunction(NonnullOwnPtr<BooleanExpression>&&);
-
-    NonnullOwnPtr<BooleanExpression> m_query;
-};
-
-// https://drafts.csswg.org/css-conditional-5/#typedef-style-feature
-class StyleFeature final : public BooleanExpression {
-public:
-    using StyleRangeValue = Variant<PropertyNameAndID, Vector<Parser::ComponentValue>>;
-
-    static NonnullOwnPtr<StyleFeature> create_boolean(PropertyNameAndID);
-    static NonnullOwnPtr<StyleFeature> create_plain(PropertyNameAndID, Vector<Parser::ComponentValue> value, Optional<String> original_value_text = {});
-    static NonnullOwnPtr<StyleFeature> create_range(StyleRangeValue left, FeatureComparison comparison, StyleRangeValue right);
-    static NonnullOwnPtr<StyleFeature> create_range(StyleRangeValue left, FeatureComparison left_comparison, StyleRangeValue middle, FeatureComparison right_comparison, StyleRangeValue right);
-
-    virtual MatchResult evaluate(BooleanExpressionEvaluationContext const&) const override;
-    virtual void collect_container_query_feature_requirements(ContainerQueryFeatureRequirements&) const override;
-    virtual void serialize_to(Utf16StringBuilder&) const override;
-    virtual void dump(StringBuilder&, int indent_levels = 0) const override;
-
-    struct StyleFeaturePlain {
-        PropertyNameAndID property;
-        Optional<Vector<Parser::ComponentValue>> value;
-        Optional<String> original_value_text;
-    };
-
-    struct StyleRange {
-        StyleRangeValue left;
-        FeatureComparison left_comparison;
-        StyleRangeValue middle;
-        Optional<FeatureComparison> right_comparison {};
-        Optional<StyleRangeValue> right {};
-    };
-
-private:
-    using Feature = Variant<StyleFeaturePlain, StyleRange>;
-
-    explicit StyleFeature(Feature feature)
-        : m_feature(move(feature))
-    {
+        return requires_width_container
+            || requires_height_container
+            || requires_inline_size_container
+            || requires_block_size_container;
     }
 
-    Feature m_feature;
+    bool contains_style_feature() const { return requires_style_container; }
 };
 
 // https://drafts.csswg.org/css-conditional-5/#container-rule
 class WEB_API ContainerQuery final : public RefCounted<ContainerQuery> {
 public:
-    static NonnullRefPtr<ContainerQuery> create(NonnullOwnPtr<BooleanExpression>&&);
+    static NonnullRefPtr<ContainerQuery> create(RustQueryHandle);
 
-    bool matches() const { return m_matches; }
     bool contains_size_feature() const { return m_feature_requirements.contains_size_feature(); }
     bool contains_style_feature() const { return m_feature_requirements.contains_style_feature(); }
     MatchResult evaluate(DOM::AbstractElement const&, Optional<Utf16FlyString> const& container_name) const;
@@ -116,16 +46,40 @@ public:
     void dump(StringBuilder&, int indent_levels = 0) const;
 
 private:
-    explicit ContainerQuery(NonnullOwnPtr<BooleanExpression>&&);
+    explicit ContainerQuery(RustQueryHandle);
 
-    NonnullOwnPtr<BooleanExpression> m_condition;
+    RustQueryHandle m_rust_query_handle;
     ContainerQueryFeatureRequirements m_feature_requirements;
-    bool m_matches { false };
 };
 
-Optional<SizeFeatureID> size_feature_id_from_string(Utf16View);
-StringView string_from_size_feature_id(SizeFeatureID);
-bool size_feature_type_is_range(SizeFeatureID);
+// Document-thread bindings for an immutable Rust container-condition list.
+class WEB_API ContainerConditions final : public RefCounted<ContainerConditions> {
+public:
+    struct Condition {
+        Optional<Utf16FlyString> container_name;
+        RefPtr<ContainerQuery> container_query;
+    };
+
+    static NonnullRefPtr<ContainerConditions> create(Parser::ValueParserFFI::ContainerConditionsData const*);
+    ~ContainerConditions();
+    Parser::ValueParserFFI::ContainerConditionsData const* handle() const { return m_data; }
+
+    Vector<Condition> const& entries() const;
+    bool matches(DOM::AbstractElement const&) const;
+    bool contains_size_feature() const;
+    bool contains_style_feature() const;
+    void mark_element_style_dependencies(DOM::AbstractElement&) const;
+
+private:
+    explicit ContainerConditions(Parser::ValueParserFFI::ContainerConditionsData const*);
+    Parser::ValueParserFFI::ContainerConditionsData const* m_data;
+    mutable Optional<Vector<Condition>> m_entries;
+};
+
 bool container_name_matches(DOM::Element const&, Optional<Utf16FlyString> const& container_name);
+bool evaluate_native_container_condition(Parser::ValueParserFFI::FfiQueryHandle const*, Utf16View name, DOM::AbstractElement const&);
+MatchResult evaluate_style_query(RustQueryHandle const&, AbstractOrHypotheticalElement);
+void prepare_for_style_query_evaluation();
+bool style_query_cycle_detected();
 
 }

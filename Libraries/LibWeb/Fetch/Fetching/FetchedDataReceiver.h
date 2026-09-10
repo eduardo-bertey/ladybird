@@ -8,6 +8,7 @@
 #pragma once
 
 #include <AK/ByteBuffer.h>
+#include <AK/WeakPtr.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibGC/CellAllocator.h>
 #include <LibHTTP/Forward.h>
@@ -22,10 +23,12 @@ class FetchedDataReceiver final : public JS::Cell {
     GC_DECLARE_ALLOCATOR(FetchedDataReceiver);
 
 public:
+    explicit FetchedDataReceiver(GC::Ref<Streams::ReadableStream>);
     virtual ~FetchedDataReceiver() override;
 
     void set_response(GC::Ref<Fetch::Infrastructure::Response const> response) { m_response = response; }
     void set_body(GC::Ref<Fetch::Infrastructure::Body> body);
+    void set_network_request(RefPtr<Requests::Request> const& request) { m_network_request = request; }
 
     enum class NetworkState {
         Ongoing,
@@ -36,14 +39,16 @@ public:
     void set_cached_response_body(Core::ImmutableBytes);
 
 private:
-    FetchedDataReceiver(GC::Ref<Infrastructure::FetchParams const>, GC::Ref<Streams::ReadableStream>, RefPtr<HTTP::MemoryCache>);
+    FetchedDataReceiver(GC::Ptr<Infrastructure::FetchParams const>, GC::Ref<Streams::ReadableStream>, RefPtr<HTTP::MemoryCache>);
 
     virtual void visit_edges(Visitor& visitor) override;
 
+    void queue_delivery_task(JS::Realm&);
+    void deliver_pending_bytes(JS::Realm&);
     void enqueue_into_stream(JS::Realm&, ReadonlyBytes);
     void close_stream(JS::Realm&);
 
-    GC::Ref<Infrastructure::FetchParams const> m_fetch_params;
+    GC::Ptr<Infrastructure::FetchParams const> m_fetch_params;
     GC::Ptr<Fetch::Infrastructure::Response const> m_response;
     GC::Ptr<Fetch::Infrastructure::Body> m_body;
 
@@ -61,6 +66,13 @@ private:
     bool m_cache_body_replaces_network_buffer { false };
 
     bool m_network_complete { false };
+
+    // Bytes read off the network but not yet handed to the stream. They are delivered by a queued networking task
+    // so that consumers see them interleaved with other tasks, and reading pauses while too many pile up.
+    WeakPtr<Requests::Request> m_network_request;
+    ByteBuffer m_pending_bytes;
+    bool m_delivery_task_queued { false };
+    bool m_paused_network_delivery { false };
 };
 
 }

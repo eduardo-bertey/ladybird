@@ -12,6 +12,7 @@
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/Object.h>
 #include <LibJS/Runtime/Realm.h>
+#include <LibJS/Runtime/Symbol.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibTest/TestCase.h>
 #include <LibWeb/Bindings/HostDefined.h>
@@ -143,8 +144,7 @@ public:
     using PlatformObject::set_value_of_new_indexed_property;
 
     TestWrapperObject(JS::Realm& realm, GC::Ref<Web::Bindings::Wrappable> impl)
-        : PlatformObject(realm)
-        , m_impl(impl)
+        : PlatformObject(realm, impl)
     {
         m_legacy_platform_object_flags = LegacyPlatformObjectFlags {};
         m_legacy_platform_object_flags->supports_indexed_properties = true;
@@ -153,23 +153,20 @@ public:
 
     virtual Web::WebIDL::ExceptionOr<void> set_value_of_named_property(JS::Realm& realm, Utf16FlyString const&, JS::Value) override
     {
-        static_cast<TestWrappable&>(*m_impl).record_setter_realm(realm);
+        static_cast<TestWrappable&>(*wrappable_impl()).record_setter_realm(realm);
         return {};
     }
 
     virtual Web::WebIDL::ExceptionOr<void> set_value_of_new_indexed_property(JS::Realm& realm, u32, JS::Value) override
     {
-        static_cast<TestWrappable&>(*m_impl).record_setter_realm(realm);
+        static_cast<TestWrappable&>(*wrappable_impl()).record_setter_realm(realm);
         return {};
     }
 
 protected:
-    virtual Web::Bindings::Wrappable* wrappable_impl() override { return m_impl.ptr(); }
-    virtual Web::Bindings::Wrappable const* wrappable_impl() const override { return m_impl.ptr(); }
-
     virtual Optional<JS::Value> item_value(Web::Bindings::WrapperWorld& wrapper_world, JS::Realm& realm, size_t index) const override
     {
-        auto const& impl = static_cast<TestWrappable const&>(*m_impl);
+        auto const& impl = static_cast<TestWrappable const&>(*wrappable_impl());
         if (index != 0 || !impl.indexed_value())
             return {};
         return Web::Bindings::wrap(wrapper_world, realm, GC::Ref { *impl.indexed_value() }).ptr();
@@ -177,20 +174,11 @@ protected:
 
     virtual JS::Value named_item_value(Web::Bindings::WrapperWorld& wrapper_world, JS::Realm& realm, Utf16FlyString const& name) const override
     {
-        auto const& impl = static_cast<TestWrappable const&>(*m_impl);
+        auto const& impl = static_cast<TestWrappable const&>(*wrappable_impl());
         if (name != "child"_utf16_fly_string || !impl.named_value())
             return JS::js_undefined();
         return Web::Bindings::wrap(wrapper_world, realm, GC::Ref { *impl.named_value() }).ptr();
     }
-
-private:
-    virtual void visit_edges(JS::Cell::Visitor& visitor) override
-    {
-        Base::visit_edges(visitor);
-        visitor.visit(m_impl);
-    }
-
-    GC::Ref<Web::Bindings::Wrappable> m_impl;
 };
 
 #define EXPECT_NOT_CONSTRUCTIBLE_FROM_WRAPPABLE(Target)              \
@@ -332,6 +320,23 @@ TEST_CASE(main_world_uses_inline_wrapper_cache)
 
     wrapper_world->clear_wrapper(*wrappable, *wrapper);
     EXPECT(!cached_wrapper_for(realm.realm(), *wrappable));
+}
+
+TEST_CASE(legacy_platform_object_hides_engine_private_properties)
+{
+    auto vm = JS::VM::create();
+    TestRealm realm { *vm };
+    auto wrappable = realm.realm().create<TestWrappable>(realm.realm());
+    auto wrapper = realm.realm().create<TestWrapperObject>(realm.realm(), wrappable);
+    auto public_symbol = JS::Symbol::create(*vm, "public"_utf16);
+
+    wrapper->define_direct_property(public_symbol, JS::js_undefined(), {});
+    wrapper->set_engine_private_property(JS::Symbol::create_private(*vm), JS::js_undefined());
+
+    auto keys = MUST(wrapper->internal_own_property_keys());
+    EXPECT_EQ(keys.size(), 1u);
+    EXPECT(keys[0].is_symbol());
+    EXPECT(&keys[0].as_symbol() == public_symbol.ptr());
 }
 
 TEST_CASE(wrap_uses_main_world_inline_cache)
@@ -986,7 +991,7 @@ TEST_CASE(relevant_global_main_world_wrapper_ignores_preferred_realm)
     client->m_page = page.ptr();
 
     auto traversable = Web::HTML::LocalTraversableNavigable::create_a_new_top_level_traversable(page, nullptr, {});
-    page->set_top_level_traversable(traversable);
+    page->set_local_root_navigable(traversable);
     auto window = GC::Ref { *traversable->active_document()->window() };
 
     auto preferred_execution_context = MUST(JS::Realm::initialize_host_defined_realm(vm, nullptr, nullptr));
@@ -1025,7 +1030,7 @@ TEST_CASE(resize_observer_releases_activity_root_when_registration_document_is_c
         auto page = Web::Page::create(client);
         client->m_page = page.ptr();
         auto traversable = Web::HTML::LocalTraversableNavigable::create_a_new_top_level_traversable(page, nullptr, {});
-        page->set_top_level_traversable(traversable);
+        page->set_local_root_navigable(traversable);
         return GC::Ref { *traversable->active_document() };
     };
 

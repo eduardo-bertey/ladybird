@@ -5,8 +5,9 @@
  */
 
 #include <LibGC/Heap.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/Layout/SVGGeometryBox.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/SVG/SVGGeometryElement.h>
 
 namespace Web::SVG {
@@ -22,9 +23,9 @@ void SVGGeometryElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_path_length);
 }
 
-RefPtr<Layout::Node> SVGGeometryElement::create_layout_node(NonnullRefPtr<CSS::ComputedValues const> style)
+Layout::Node* SVGGeometryElement::create_layout_node(CSS::LayoutStyle style)
 {
-    return make_ref_counted<Layout::SVGGeometryBox>(document(), *this, style);
+    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGGeometryBox);
 }
 
 // https://w3c.github.io/svgwg/svg2-draft/types.html#__svg__SVGGeometryElement__getTotalLength
@@ -39,13 +40,14 @@ WebIDL::ExceptionOr<float> SVGGeometryElement::get_total_length()
     auto viewport_size = viewport_size_for_percentage_resolution();
 
     // NB: Update style for the element so that the correct computed values are used to generate the path - this is done
-    //     separately from the layout update above since it may have been skipped if the element was display: none or
-    //     disconnected.
+    //     separately from the layout update above since it may have been skipped if the element was display: none.
     document().update_style_for_element(*this);
 
-    VERIFY(computed_values());
+    if (auto computed_values = computed_style())
+        return get_path({ viewport_size.width(), viewport_size.height() }, *computed_values).length();
 
-    return get_path({ viewport_size.width(), viewport_size.height() }).length();
+    auto transient_values = document().style_computer().materialize_style_record({ *this });
+    return get_path({ viewport_size.width(), viewport_size.height() }, *transient_values).length();
 }
 
 GC::Ref<Geometry::DOMPoint> SVGGeometryElement::get_point_at_length(float distance)

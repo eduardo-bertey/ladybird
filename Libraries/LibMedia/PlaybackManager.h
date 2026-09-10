@@ -55,12 +55,10 @@ public:
     static NonnullOwnPtr<PlaybackManager> create();
     ~PlaybackManager();
 
-    static DecoderErrorOr<NonnullRefPtr<Demuxer>> create_demuxer_for_stream(NonnullRefPtr<MediaStream> const&);
-
     void set_audio_output_disabled(bool disabled) { m_audio_output_disabled = disabled; }
 
     AK::Duration duration() const { return m_duration; }
-    void set_duration(AK::Duration duration) { m_duration = duration; }
+    void set_duration(AK::Duration);
     AK::Duration current_time() const;
 
     Optional<AK::UnixDateTime> start_time_realtime() const { return m_start_time_realtime; }
@@ -73,7 +71,7 @@ public:
     VideoSinkHandle reserve_video_sink_handle(Track const&);
     void disable_video_sink_by_handle(VideoSinkHandle);
     static void set_video_sink_ticking(VideoSinkHandle, bool);
-    void detach_lost_video_sink(VideoSinkHandle);
+    void detach_video_sink(VideoSinkHandle);
     void set_video_resize_handler(VideoSinkHandle, Function<void(Gfx::Size<u32>)>);
 
     void enable_an_audio_track(Track const&);
@@ -114,7 +112,7 @@ public:
     static ErrorOr<RemoteVideoEdge> create_video_edge(VideoSinkHandle, RemoteVideoSink::Delegates);
     static void attach_video_edge(VideoSinkHandle, NonnullRefPtr<RemoteVideoSink> const&);
     static RefPtr<VideoFrame> current_presented_frame(VideoSinkHandle);
-    static void release_video_edge(VideoSinkHandle);
+    static void release_video_edge(VideoSinkHandle, VideoSink const& released_sink);
 
 private:
     struct VideoTrackData {
@@ -158,6 +156,7 @@ private:
     PipelineStatus combined_pipeline_status() const;
     void check_for_duration_change(AK::Duration);
     void dispatch_error(DecoderError&&);
+    void dispatch_buffered_ranges_change();
 
     template<typename Self>
     decltype(auto) get_video_data_for_track(this Self&& self, Track const& track)

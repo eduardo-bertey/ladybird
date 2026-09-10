@@ -256,7 +256,8 @@ static void install_compiled_fault_handlers()
     s_installed = true;
     struct sigaction action {};
     action.sa_sigaction = compiled_fault_signal_handler;
-    action.sa_flags = SA_SIGINFO;
+    // Preserve alternate-stack crash handling when forwarding non-Wasm faults.
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&action.sa_mask);
     sigaction(SIGSEGV, &action, &s_old_sigsegv);
     sigaction(SIGBUS, &action, &s_old_sigbus);
@@ -421,7 +422,9 @@ void BytecodeInterpreter::interpret(Configuration& configuration)
     bool const may_run_native = native_entry != 0 || expression.compiled_instructions.has_tier_up_checkpoints;
     CompiledFaultRecoveryContext compiled_fault_recovery;
     bool did_install_compiled_fault_recovery = false;
-    if (may_run_native && !s_compiled_fault_recovery) {
+    if (may_run_native) {
+        // A host function can reenter Wasm with a different configuration (and therefore a different memory).
+        // Keep the innermost configuration active so its compiled faults are classified and recovered correctly.
         install_compiled_fault_handlers();
         compiled_fault_recovery.interpreter = this;
         compiled_fault_recovery.configuration = &configuration;

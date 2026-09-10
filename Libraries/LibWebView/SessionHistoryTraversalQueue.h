@@ -33,6 +33,7 @@ public:
         // Present for synchronous navigation steps, empty for plain algorithm steps.
         Optional<Web::HTML::CrossProcessId> target_navigable;
         SessionHistoryTraversalSteps steps;
+        u64 sequence_number { 0 };
     };
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#tn-append-session-history-traversal-steps
@@ -43,6 +44,11 @@ public:
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#sync-navigations-jump-queue
     Optional<Item> take_first_synchronous_navigation_steps_not_targeting(HashTable<Web::HTML::CrossProcessId> const& excluded_navigables);
+    Optional<Item> take_first_synchronous_navigation_steps_not_targeting(HashTable<Web::HTML::CrossProcessId> const& excluded_navigables, u64 maximum_sequence_number);
+
+    u64 last_enqueued_sequence_number() const { return m_last_enqueued_sequence_number; }
+
+    bool current_item_is_synchronous_navigation_steps() const { return m_current_item_is_synchronous_navigation_steps; }
 
     bool is_empty() const { return m_algorithm_set.is_empty(); }
 
@@ -52,8 +58,10 @@ private:
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-traversal-parallel-queue-algorithm-set
     Vector<Item> m_algorithm_set;
+    u64 m_last_enqueued_sequence_number { 0 };
 
     bool m_processing_scheduled { false };
+    bool m_current_item_is_synchronous_navigation_steps { false };
     RefPtr<Core::Promise<Empty>> m_running_steps;
 };
 

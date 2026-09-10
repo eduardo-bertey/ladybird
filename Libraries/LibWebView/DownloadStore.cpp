@@ -71,26 +71,32 @@ static Optional<Vector<DownloadSegmentRecord>> deserialize_segments(StringView s
 
 ErrorOr<Database::MigrationOutcome> DownloadStore::migrate_schema(Database::Database& database, Database::MigrationMode mode)
 {
-    Array<Database::Migration, 2> migrations { {
-        { .version = DOWNLOAD_SCHEMA_BASELINE_VERSION, .sql = R"#(
-            CREATE TABLE IF NOT EXISTS Downloads (
-                id INTEGER PRIMARY KEY,
-                url TEXT NOT NULL,
-                display_url TEXT NOT NULL,
-                destination TEXT NOT NULL,
-                temporary_destination TEXT NOT NULL,
-                total_size INTEGER NOT NULL,
-                etag TEXT NOT NULL,
-                last_modified TEXT NOT NULL,
-                segments TEXT NOT NULL,
-                created_time INTEGER NOT NULL,
-                updated_time INTEGER NOT NULL
-            );
-        )#"sv },
-        { .version = DOWNLOAD_SCHEMA_RESTARTABILITY_VERSION, .sql = R"#(
-            ALTER TABLE Downloads ADD COLUMN can_restart_from_zero INTEGER NOT NULL DEFAULT 0;
-        )#"sv },
-    } };
+    auto migrations = to_array<Database::Migration>({
+        {
+            .version = DOWNLOAD_SCHEMA_BASELINE_VERSION,
+            .sql = R"#(
+                CREATE TABLE IF NOT EXISTS Downloads (
+                    id INTEGER PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    display_url TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    temporary_destination TEXT NOT NULL,
+                    total_size INTEGER NOT NULL,
+                    etag TEXT NOT NULL,
+                    last_modified TEXT NOT NULL,
+                    segments TEXT NOT NULL,
+                    created_time INTEGER NOT NULL,
+                    updated_time INTEGER NOT NULL
+                );
+            )#"sv,
+        },
+        {
+            .version = DOWNLOAD_SCHEMA_RESTARTABILITY_VERSION,
+            .sql = R"#(
+                ALTER TABLE Downloads ADD COLUMN can_restart_from_zero INTEGER NOT NULL DEFAULT 0;
+            )#"sv,
+        },
+    });
 
     return database.migrate("Downloads"sv, migrations, mode);
 }
@@ -164,6 +170,8 @@ void DownloadStore::save_download(DownloadRecord const& download, UnixDateTime u
 {
     if (!m_database)
         return;
+    if (download.id < 0 || download.total_size < 0)
+        return;
 
     m_database->execute_statement(
         m_statements.upsert_download,
@@ -177,12 +185,12 @@ void DownloadStore::save_download(DownloadRecord const& download, UnixDateTime u
         download.etag.value_or(String {}),
         download.last_modified.value_or(String {}),
         serialize_segments(download.segments),
-        static_cast<u64>(download.can_restart_from_zero ? 1 : 0),
+        download.can_restart_from_zero,
         download.created_time,
         updated_at);
 }
 
-void DownloadStore::remove_download(u64 id)
+void DownloadStore::remove_download(i64 id)
 {
     if (!m_database)
         return;
@@ -199,43 +207,53 @@ Vector<DownloadRecord> DownloadStore::resumable_downloads()
 
     m_database->execute_statement(
         m_statements.list_downloads,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
+            auto id = m_database->result_i64_checked(statement_id, 0);
+            auto total_size = m_database->result_i64_checked(statement_id, 5);
+            if (id.is_error() || total_size.is_error() || id.value() < 0 || total_size.value() < 0)
+                return {};
+
             auto segments = deserialize_segments(m_database->result_column<String>(statement_id, 8));
             if (!segments.has_value())
-                return;
+                return {};
 
             auto etag = m_database->result_column<String>(statement_id, 6);
             auto last_modified = m_database->result_column<String>(statement_id, 7);
 
             downloads.append(DownloadRecord {
-                .id = m_database->result_column<u64>(statement_id, 0),
+                .id = id.value(),
                 .url = m_database->result_column<String>(statement_id, 1),
                 .display_url = m_database->result_column<String>(statement_id, 2),
                 .destination = m_database->result_column<String>(statement_id, 3),
                 .temporary_destination = m_database->result_column<String>(statement_id, 4),
-                .total_size = m_database->result_column<u64>(statement_id, 5),
+                .total_size = total_size.value(),
                 .etag = etag.is_empty() ? Optional<String> {} : Optional<String> { move(etag) },
                 .last_modified = last_modified.is_empty() ? Optional<String> {} : Optional<String> { move(last_modified) },
                 .segments = segments.release_value(),
                 .created_time = m_database->result_column<UnixDateTime>(statement_id, 10),
-                .can_restart_from_zero = m_database->result_column<u64>(statement_id, 9) != 0,
+                .can_restart_from_zero = m_database->result_column<bool>(statement_id, 9),
             });
+
+            return {};
         });
 
     return downloads;
 }
 
-u64 DownloadStore::maximum_download_id()
+i64 DownloadStore::maximum_download_id()
 {
     if (!m_database)
         return 0;
 
-    u64 maximum_id = 0;
+    i64 maximum_id = 0;
 
     m_database->execute_statement(
         m_statements.maximum_download_id,
-        [&](auto statement_id) {
-            maximum_id = m_database->result_column<u64>(statement_id, 0);
+        [&](auto statement_id) -> ErrorOr<void> {
+            auto id = m_database->result_i64_checked(statement_id, 0);
+            if (!id.is_error() && id.value() >= 0)
+                maximum_id = id.value();
+            return {};
         });
 
     return maximum_id;

@@ -40,6 +40,12 @@ static auto& intrinsic_accessor_map()
     return *intrinsics;
 }
 
+static auto& unimplemented_property_map()
+{
+    static NeverDestroyed<GC::WeakHashMap<GC::Ptr<Object const>, HashTable<Utf16FlyString>>> unimplemented_properties;
+    return *unimplemented_properties;
+}
+
 // Heap-allocated property storage layout:
 //   [u32 capacity] [u32 padding] [Value 0] [Value 1] ...
 // The accessors below are the only code that depends on this allocation layout.
@@ -144,6 +150,7 @@ GC::Ref<Object> Object::create_with_premade_shape(Shape& shape)
 
 Object::Object(GlobalObjectTag, Realm& realm, MayInterfereWithIndexedPropertyAccess may_interfere_with_indexed_property_access)
 {
+    set_global_object_flag();
     if (may_interfere_with_indexed_property_access == MayInterfereWithIndexedPropertyAccess::Yes)
         set_may_interfere_with_indexed_property_access();
     // This is the global object
@@ -190,6 +197,8 @@ Object::~Object()
     free_indexed_elements();
     if (has_intrinsic_accessors())
         intrinsic_accessor_map().remove(this);
+    if (has_unimplemented_properties())
+        unimplemented_property_map().remove(this);
     if (!named_storage_is_inline())
         HeapValueStorage::deallocate(m_named_properties.data());
 }
@@ -203,6 +212,11 @@ void Object::unsafe_set_shape(Shape& shape)
 {
     m_shape = shape;
     ensure_named_storage_capacity(shape.property_count());
+}
+
+void Object::invalidate_property_lookup_caches()
+{
+    set_shape(m_shape->create_dictionary_transition());
 }
 
 // 7.2 Testing and Comparison Operations, https://tc39.es/ecma262/#sec-testing-and-comparison-operations
@@ -224,7 +238,7 @@ ThrowCompletionOr<Value> Object::get(PropertyKey const& property_key) const
 }
 
 // 7.3.2 Get ( O, P ), https://tc39.es/ecma262/#sec-get-o-p
-ThrowCompletionOr<Value> Object::get(PropertyKey const& property_key, Bytecode::PropertyLookupCache& cache) const
+ThrowCompletionOr<Value> Object::get(PropertyKey const& property_key, Bytecode::StaticPropertyLookupCache& cache) const
 {
     // 1. Return ? O.[[Get]](P, O).
     return TRY(Value(this).get(vm(), property_key, cache));
@@ -573,6 +587,46 @@ ThrowCompletionOr<void> Object::copy_data_properties(VM& vm, Value source, HashT
 
     // 2. Let from be ! ToObject(source).
     auto from = MUST(source.to_object(vm));
+
+    // OPTIMIZATION: An empty ordinary object can reuse the shape of a compatible ordinary source
+    //               and copy its property storage directly. This is equivalent to defining each
+    //               property because all source properties already have the default attributes.
+    if (from.ptr() != this
+        && excluded_keys.is_empty()
+        && excluded_values.is_empty()
+        && &shape() == vm.current_realm()->intrinsics().new_object_shape().ptr()
+        && indexed_storage_kind() == IndexedStorageKind::None
+        && extensible()
+        && eligible_for_own_property_enumeration_fast_path()
+        && !has_intrinsic_accessors()
+        && !may_interfere_with_indexed_property_access()
+        && !requires_slow_add_own_property()
+        && from->indexed_storage_kind() == IndexedStorageKind::None
+        && from->eligible_for_own_property_enumeration_fast_path()
+        && !from->has_intrinsic_accessors()
+        && !from->may_interfere_with_indexed_property_access()
+        && !from->requires_slow_add_own_property()
+        && !from->shape().is_dictionary()
+        && !from->shape().is_prototype_shape()
+        && &from->shape().realm() == vm.current_realm()
+        && from->shape().prototype() == shape().prototype()) {
+        bool has_only_default_data_properties = true;
+        from->shape().for_each_property_in_insertion_order([&](auto const&, auto const& metadata) {
+            if (metadata.attributes != default_attributes || from->get_direct(metadata.offset).is_accessor()) {
+                has_only_default_data_properties = false;
+                return IterationDecision::Break;
+            }
+            return IterationDecision::Continue;
+        });
+
+        if (has_only_default_data_properties) {
+            unsafe_set_shape(from->shape());
+            from->shape().for_each_property_in_insertion_order([&](auto const&, auto const& metadata) {
+                put_direct(metadata.offset, from->get_direct(metadata.offset));
+            });
+            return {};
+        }
+    }
 
     // OPTIMIZATION: For ordinary objects we can iterate the shape directly and read values by storage
     //               offset, avoiding repeated property lookups through DescriptorArray::find.
@@ -961,21 +1015,18 @@ ThrowCompletionOr<Optional<PropertyDescriptor>> Object::internal_get_own_propert
 {
     // 1. If O does not have an own property with key P, return undefined.
     auto maybe_storage_entry = storage_get(property_key);
-    if (!maybe_storage_entry.has_value())
+    if (!maybe_storage_entry.has_value()) {
+        // AD-HOC: Report accesses to unimplemented IDL properties without making them observable to JavaScript.
+        if (is_unimplemented_property(property_key) && vm().on_unimplemented_property_access)
+            vm().on_unimplemented_property_access(*this, property_key);
         return Optional<PropertyDescriptor> {};
+    }
 
     // 2. Let D be a newly created Property Descriptor with no fields.
     PropertyDescriptor descriptor;
 
     // 3. Let X be O's own property whose key is P.
     auto [value, attributes, property_offset] = *maybe_storage_entry;
-
-    // AD-HOC: Properties with the [[Unimplemented]] attribute are used for reporting unimplemented IDL interfaces.
-    if (attributes.is_unimplemented()) {
-        if (vm().on_unimplemented_property_access)
-            vm().on_unimplemented_property_access(*this, property_key);
-        descriptor.unimplemented = true;
-    }
 
     // 4. If X is a data property, then
     if (!value.is_accessor()) {
@@ -1064,24 +1115,33 @@ ThrowCompletionOr<Value> Object::internal_get(PropertyKey const& property_key, V
         auto* parent = TRY(internal_get_prototype_of());
 
         // b. If parent is null, return undefined.
-        if (!parent)
+        if (!parent) {
+            if (cacheable_metadata && cacheable_metadata->property_absence_is_cacheable)
+                cacheable_metadata->type = CacheableGetPropertyMetadata::Type::GetMissingProperty;
             return js_undefined();
+        }
 
         // c. Return ? parent.[[Get]](P, Receiver).
         // AD-HOC: Avoid a native stack overflow when walking a pathologically-deep prototype chain.
         if (vm.did_reach_stack_space_limit()) [[unlikely]]
             return vm.throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
+        if (cacheable_metadata && !parent->is_cacheable_for_property_absence())
+            cacheable_metadata->property_absence_is_cacheable = false;
+        // NB: An object whose own lookup can start answering for a name at any time cannot vouch for a
+        //     result found further up the prototype chain.
+        if (cacheable_metadata && !is_cacheable_for_inherited_property())
+            cacheable_metadata = nullptr;
         return parent->internal_get(property_key, receiver, cacheable_metadata, PropertyLookupPhase::PrototypeChain);
     }
 
-    auto update_inline_cache = [&] {
+    auto update_inline_cache = [&](u32 property_offset) {
         // Non-standard: If the caller has requested cacheable metadata and the property is an own property, fill it in.
-        if (!cacheable_metadata || !descriptor->property_offset.has_value())
+        if (!cacheable_metadata)
             return;
         if (phase == PropertyLookupPhase::OwnProperty) {
             *cacheable_metadata = CacheableGetPropertyMetadata {
                 .type = CacheableGetPropertyMetadata::Type::GetOwnProperty,
-                .property_offset = descriptor->property_offset.value(),
+                .property_offset = property_offset,
                 .prototype = nullptr,
             };
         } else if (phase == PropertyLookupPhase::PrototypeChain) {
@@ -1089,7 +1149,7 @@ ThrowCompletionOr<Value> Object::internal_get(PropertyKey const& property_key, V
             VERIFY(shape().prototype_chain_validity()->is_valid());
             *cacheable_metadata = CacheableGetPropertyMetadata {
                 .type = CacheableGetPropertyMetadata::Type::GetPropertyInPrototypeChain,
-                .property_offset = descriptor->property_offset.value(),
+                .property_offset = property_offset,
                 .prototype = this,
             };
         }
@@ -1097,7 +1157,8 @@ ThrowCompletionOr<Value> Object::internal_get(PropertyKey const& property_key, V
 
     // 3. If IsDataDescriptor(desc) is true, return desc.[[Value]].
     if (descriptor->is_data_descriptor()) {
-        update_inline_cache();
+        if (descriptor->property_offset.has_value())
+            update_inline_cache(*descriptor->property_offset);
         return *descriptor->value;
     }
 
@@ -1111,10 +1172,39 @@ ThrowCompletionOr<Value> Object::internal_get(PropertyKey const& property_key, V
     if (!getter)
         return js_undefined();
 
-    update_inline_cache();
+    GC::Ptr<Accessor> accessor;
+    bool receiver_uses_holder_cache = false;
+    if (descriptor->property_offset.has_value()) {
+        auto value = get_direct(*descriptor->property_offset);
+        if (value.is_accessor()) {
+            accessor = &value.as_accessor();
+            receiver_uses_holder_cache = receiver.is_object()
+                && (&receiver.as_object() == this || receiver.as_object().prototype() == this);
+            if (auto* cached_value_key = accessor->cached_value_key(); cached_value_key && receiver_uses_holder_cache) {
+                if (auto cached_value = get_engine_private_property(GC::Ref { *cached_value_key }); cached_value.has_value()) {
+                    VERIFY(cached_value->property_offset.has_value());
+                    update_inline_cache(*cached_value->property_offset);
+                    return cached_value->value;
+                }
+            }
+        }
+
+        update_inline_cache(*descriptor->property_offset);
+    }
 
     // 7. Return ? Call(getter, Receiver).
-    return TRY(call(vm, *getter, receiver));
+    auto result = TRY(call(vm, *getter, receiver));
+
+    if (accessor && receiver_uses_holder_cache) {
+        if (auto* cached_value_key = accessor->cached_value_key()) {
+            auto property = storage_get(property_key);
+            if (property.has_value() && property->value.is_accessor() && &property->value.as_accessor() == accessor.ptr()) {
+                const_cast<Object*>(this)->set_engine_private_property(GC::Ref { *cached_value_key }, result);
+            }
+        }
+    }
+
+    return result;
 }
 
 // 10.1.9 [[Set]] ( P, V, Receiver ), https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-set-p-v-receiver
@@ -1315,7 +1405,7 @@ ThrowCompletionOr<GC::RootVector<Value>> Object::internal_own_property_keys() co
 
     // 4. For each own property key P of O such that Type(P) is Symbol, in ascending chronological order of property creation, do
     shape().for_each_property_in_insertion_order([&](auto const& property_key, auto const&) {
-        if (property_key.is_symbol()) {
+        if (property_key.is_symbol() && !property_key.is_private()) {
             // a. Add P as the last element of keys.
             keys.append(property_key.to_value(vm));
         }
@@ -1510,6 +1600,65 @@ void Object::define_direct_accessor(PropertyKey const& property_key, GC::Ptr<Fun
         if (setter)
             accessor->set_setter(setter);
     }
+}
+
+void Object::define_unimplemented_property(Utf16FlyString const& property_name)
+{
+    m_flags |= Flag::HasUnimplementedProperties;
+    unimplemented_property_map().ensure(this).set(property_name);
+}
+
+bool Object::is_unimplemented_property(PropertyKey const& property_key) const
+{
+    if (!has_unimplemented_properties() || !property_key.is_string())
+        return false;
+
+    auto properties = unimplemented_property_map().get(this);
+    return properties.has_value() && properties->contains(property_key.as_string());
+}
+
+Optional<ValueAndAttributes> Object::get_engine_private_property(GC::Ref<Symbol> key) const
+{
+    VERIFY(key->is_private());
+    return storage_get(PropertyKey { key });
+}
+
+void Object::set_engine_private_property(GC::Ref<Symbol> key, Value value)
+{
+    VERIFY(key->is_private());
+    (void)storage_set(PropertyKey { key }, { value, {} });
+}
+
+void Object::delete_engine_private_property(GC::Ref<Symbol> key)
+{
+    VERIFY(key->is_private());
+    auto property_key = PropertyKey { key };
+    if (storage_has(property_key))
+        storage_delete(property_key);
+}
+
+void Object::define_direct_cached_accessor(PropertyKey const& property_key, GC::Ptr<FunctionObject> getter, GC::Ptr<FunctionObject> setter, PropertyAttributes attributes)
+{
+    clear_cached_accessor_value(property_key);
+    define_direct_accessor(property_key, getter, setter, attributes);
+
+    auto property = storage_get(property_key);
+    VERIFY(property.has_value());
+    VERIFY(property->value.is_accessor());
+    auto& accessor = property->value.as_accessor();
+    if (!accessor.cached_value_key())
+        accessor.set_cached_value_key(Symbol::create_private(vm()));
+}
+
+void Object::clear_cached_accessor_value(PropertyKey const& property_key)
+{
+    auto property = storage_get(property_key);
+    if (!property.has_value() || !property->value.is_accessor())
+        return;
+    auto* cached_value_key = property->value.as_accessor().cached_value_key();
+    if (!cached_value_key)
+        return;
+    delete_engine_private_property(GC::Ref { *cached_value_key });
 }
 
 void Object::define_intrinsic_accessor(PropertyKey const& property_key, PropertyAttributes attributes, IntrinsicAccessor accessor)
@@ -1888,6 +2037,18 @@ void Object::transition_to_dictionary()
     m_indexed_storage_kind = IndexedStorageKind::Dictionary;
 }
 
+NEVER_INLINE COLD void Object::transition_to_packed()
+{
+    auto* dictionary = indexed_dictionary();
+    auto* elements = allocate_indexed_elements(m_indexed_array_like_size);
+    for (auto const& entry : dictionary->sparse_elements())
+        elements[entry.key] = entry.value.value;
+
+    delete dictionary;
+    m_indexed_elements = elements;
+    m_indexed_storage_kind = IndexedStorageKind::Packed;
+}
+
 Optional<ValueAndAttributes> Object::indexed_get(u32 index) const
 {
     switch (m_indexed_storage_kind) {
@@ -1911,6 +2072,21 @@ Optional<ValueAndAttributes> Object::indexed_get(u32 index) const
     VERIFY_NOT_REACHED();
 }
 
+NEVER_INLINE COLD void Object::indexed_put_into_dictionary(u32 index, Value value, PropertyAttributes attributes)
+{
+    auto* dictionary = indexed_dictionary();
+    auto had_missing_entries = dictionary->size() < dictionary->array_like_size();
+    dictionary->put(index, value, attributes);
+    m_indexed_array_like_size = dictionary->array_like_size();
+    if (!had_missing_entries || dictionary->size() < dictionary->array_like_size())
+        return;
+    for (auto const& entry : dictionary->sparse_elements()) {
+        if (entry.value.attributes != default_attributes || entry.value.value.is_special_empty_value())
+            return;
+    }
+    transition_to_packed();
+}
+
 void Object::indexed_put(u32 index, Value value, PropertyAttributes attributes)
 {
     bool const storing_hole = value.is_special_empty_value();
@@ -1919,8 +2095,7 @@ void Object::indexed_put(u32 index, Value value, PropertyAttributes attributes)
         materialized_elements = min(m_indexed_array_like_size, indexed_elements_capacity());
 
     if (m_indexed_storage_kind == IndexedStorageKind::Dictionary) {
-        indexed_dictionary()->put(index, value, attributes);
-        m_indexed_array_like_size = indexed_dictionary()->array_like_size();
+        indexed_put_into_dictionary(index, value, attributes);
         return;
     }
 
@@ -2074,6 +2249,26 @@ void Object::indexed_append(Value value, PropertyAttributes attributes)
     indexed_put(m_indexed_array_like_size, value, attributes);
 }
 
+void Object::indexed_append(ReadonlySpan<Value> values)
+{
+    VERIFY(m_indexed_storage_kind <= IndexedStorageKind::Packed);
+    VERIFY(values.size() <= NumericLimits<u32>::max() - m_indexed_array_like_size);
+
+    if (values.is_empty())
+        return;
+
+    auto old_size = m_indexed_array_like_size;
+    auto values_size = static_cast<u32>(values.size());
+    auto new_size = old_size + values_size;
+    ensure_indexed_elements(new_size);
+
+    for (u32 i = 0; i < values_size; ++i)
+        m_indexed_elements[old_size + i] = values[i];
+
+    m_indexed_storage_kind = IndexedStorageKind::Packed;
+    m_indexed_array_like_size = new_size;
+}
+
 ValueAndAttributes Object::indexed_take_first()
 {
     if (m_indexed_storage_kind == IndexedStorageKind::Dictionary) {
@@ -2176,7 +2371,7 @@ Vector<u32> Object::indexed_indices() const
     VERIFY_NOT_REACHED();
 }
 
-void Object::set_indexed_property_elements(Vector<Value>&& values)
+void Object::set_indexed_property_elements(ReadonlySpan<Value> values)
 {
     free_indexed_elements();
 

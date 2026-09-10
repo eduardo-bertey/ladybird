@@ -18,11 +18,11 @@
 #include <LibGC/Ptr.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/CSS/CascadeOrigin.h>
+#include <LibWeb/CSS/ContainerQuery.h>
 #include <LibWeb/CSS/CounterStyle.h>
-#include <LibWeb/CSS/InvalidationSet.h>
+#include <LibWeb/CSS/RustDeclarationBlock.h>
+#include <LibWeb/CSS/RustRule.h>
 #include <LibWeb/CSS/Selector.h>
-#include <LibWeb/CSS/SelectorInsights.h>
-#include <LibWeb/CSS/StyleInvalidationData.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/Forward.h>
 
@@ -30,106 +30,39 @@ namespace Web::CSS {
 
 class StyleScope;
 
-struct MatchingRule {
-    GC::Ptr<CSSRule const> rule; // Either CSSStyleRule or CSSNestedDeclarations
-    GC::Ptr<CSSStyleSheet const> sheet;
-    GC::Ptr<CSSContainerRule const> container_rule;
-    GC::Ptr<CSSRule const> scope_rule; // Either CSSScopeRule or CSSImportRule
-    Optional<Utf16FlyString> element_namespace_filter;
-    Selector const& selector;
-    size_t selector_index { 0 };
-    size_t style_sheet_index { 0 };
-    size_t rule_index { 0 };
-
-    u32 specificity { 0 };
-    u32 multi_bucket_rule_index { 0 };
-    CascadeOrigin cascade_origin;
-    bool contains_pseudo_element { false };
-    bool slotted { false };
-    bool contains_part_pseudo_element { false };
-
-    // Helpers to deal with the fact that `rule` might be a CSSStyleRule or a CSSNestedDeclarations
-    CSSStyleProperties const& declaration() const;
-    SelectorList const& absolutized_selectors() const;
-    Utf16FlyString const& qualified_layer_name() const;
-
-    void visit_edges(GC::Cell::Visitor&) const;
+// What a StyleEngine rule identity has to be turned back into before it can decide anything: the
+// declaration it carries and where that declaration sits in the cascade.
+struct StyleEngineRuleTarget {
+    u64 rule_identity;
+    u32 declaration_version;
+    RustDeclarationBlockSnapshot declaration;
+    RefPtr<StyleSheetState const> source_style_sheet;
+    bool has_container_conditions { false };
+    Utf16FlyString qualified_layer_name;
+    CascadeOrigin cascade_origin { CascadeOrigin::Author };
 };
 
-enum class SubjectPseudoClassBuckets {
-    No,
-    Yes,
+struct CachedFunctionRule {
+    RustCompiledFunction rule;
+    Utf16FlyString qualified_layer_name;
+    CascadeOrigin cascade_origin { CascadeOrigin::Author };
 };
 
-enum class AncestorHashBuckets {
-    No,
-    Yes,
-};
-
-struct RuleCache {
-    HashMap<Utf16FlyString, Vector<MatchingRule>> rules_by_id;
-    HashMap<Utf16FlyString, Vector<MatchingRule>> rules_by_class;
-    HashMap<Utf16FlyString, Vector<MatchingRule>> rules_by_tag_name;
-    HashMap<Utf16FlyString, Vector<MatchingRule>> rules_by_attribute_name;
-    Array<Vector<MatchingRule>, to_underlying(PseudoClass::__Count)> rules_by_subject_pseudo_class;
-    HashMap<u32, Vector<MatchingRule>> rules_by_ancestor_hash;
-    Vector<MatchingRule> root_rules;
-    Vector<MatchingRule> slotted_rules;
-    Vector<MatchingRule> part_rules;
-    Vector<MatchingRule> other_rules;
-
-    struct PseudoElementRules {
-        HashMap<Utf16FlyString, Vector<MatchingRule>> rules_by_id;
-        HashMap<Utf16FlyString, Vector<MatchingRule>> rules_by_class;
-        HashMap<Utf16FlyString, Vector<MatchingRule>> rules_by_tag_name;
-        HashMap<Utf16FlyString, Vector<MatchingRule>> rules_by_attribute_name;
-        Array<Vector<MatchingRule>, to_underlying(PseudoClass::__Count)> rules_by_subject_pseudo_class;
-        HashMap<u32, Vector<MatchingRule>> rules_by_ancestor_hash;
-        Vector<MatchingRule> root_rules;
-        Vector<MatchingRule> other_rules;
-    };
-    Array<PseudoElementRules, to_underlying(CSS::PseudoElement::KnownPseudoElementCount)> rules_by_pseudo_element;
-    u64 pseudo_element_rules_mask { 0 };
-
-    HashMap<Utf16FlyString, NonnullRefPtr<Animations::KeyframeEffect::KeyFrameSet>> rules_by_animation_keyframes;
-
-    u32 next_multi_bucket_rule_index { 0 };
-
-    void add_rule(MatchingRule const&, Optional<PseudoElement>, bool contains_root_pseudo_class, SubjectPseudoClassBuckets, AncestorHashBuckets);
-    void for_each_matching_rules(DOM::AbstractElement, Function<bool(u32)> const& may_contain_ancestor_hash, Function<IterationDecision(Vector<MatchingRule> const&)> callback) const;
-    void for_each_matching_pseudo_element_rules(DOM::AbstractElement, Function<bool(u32)> const& may_contain_ancestor_hash, Function<IterationDecision(Vector<MatchingRule> const&)> callback) const;
-
-    void visit_edges(GC::Cell::Visitor&);
-};
-
-struct RuleCaches {
-    RuleCache main;
-    HashMap<Utf16FlyString, NonnullOwnPtr<RuleCache>> by_layer;
-
-    void visit_edges(GC::Cell::Visitor&);
-};
-
+// What one style scope holds that is about the program rather than about any element: the keyframes
+// each `@keyframes` name resolves to, the visible `@function` rules, and whether a size container query
+// is in play. Which rules match and how cascade layers are ordered are StyleEngine's answers and are
+// not filed here.
 struct StyleRuleCache {
-    StyleRuleCache();
-
-    Vector<Utf16FlyString> qualified_layer_names_in_order;
-    SelectorInsights selector_insights;
-    Array<OwnPtr<RuleCache>, to_underlying(PseudoClass::__Count)> pseudo_class_rule_cache;
-    RuleCaches author_rule_cache;
-    RuleCaches user_rule_cache;
-    RuleCaches user_agent_rule_cache;
+    HashMap<Utf16FlyString, NonnullRefPtr<Animations::KeyframeEffect::KeyFrameSet>> rules_by_animation_keyframes;
+    HashMap<Utf16FlyString, Vector<CachedFunctionRule>> function_rules_by_name;
     bool has_size_container_queries { false };
-
-    void visit_edges(GC::Cell::Visitor&);
 };
 
 struct StyleCache : public RefCounted<StyleCache> {
     static NonnullRefPtr<StyleCache> create();
 
     OwnPtr<StyleRuleCache> rule_cache;
-    OwnPtr<StyleInvalidationData> style_invalidation_data;
-
-    void visit_edges(GC::Cell::Visitor&);
+    u64 rule_cache_generation { 0 };
 };
 
 // Shared style caches for shadow-root scopes whose active stylesheets are the same ordered set of constructed
@@ -140,13 +73,13 @@ struct StyleCache : public RefCounted<StyleCache> {
 // lifetime.
 class SheetSetStyleCacheRegistry {
 public:
-    NonnullRefPtr<StyleCache> ensure_style_cache_for_sheet_set(Vector<GC::Ref<CSSStyleSheet>> const& sheets);
+    NonnullRefPtr<StyleCache> ensure_style_cache_for_sheet_set(Vector<NonnullRefPtr<StyleSheetState>> const& sheets);
 
     void visit_edges(GC::Cell::Visitor&);
 
 private:
     struct Entry {
-        Vector<GC::Ref<CSSStyleSheet>> sheets;
+        Vector<NonnullRefPtr<StyleSheetState>> sheets;
         Vector<u64> sheet_generations;
         NonnullRefPtr<StyleCache> style_cache;
     };
@@ -156,87 +89,66 @@ private:
     HashMap<u32, Vector<Entry>> m_entries_by_hash;
 };
 
-// A pure insertion cannot change interaction pseudo-class matching (:hover, :focus, etc): freshly inserted nodes
-// never carry such state, and inserting a node cannot flip it on existing elements. Removals and moves can relocate
-// interaction state, so they stay conservative.
-enum class HasMutationKind : u8 {
-    Insertion,
-    Other,
-};
-
-struct PendingHasInvalidationMutationFeatures {
-    bool is_conservative { false };
-    bool may_affect_sibling_relationships { false };
-    bool may_affect_pseudo_classes { false };
-    bool may_affect_interaction_pseudo_classes { false };
-    HashTable<Utf16FlyString> tag_names;
-    HashTable<Utf16FlyString> ids;
-    HashTable<Utf16FlyString> class_names;
-    HashTable<Utf16FlyString> attribute_names;
-    HashTable<PseudoClass> pseudo_classes;
-};
-
 class StyleScope {
 public:
     explicit StyleScope(GC::Ref<DOM::Node>);
+    ~StyleScope();
 
     DOM::Node& node() const { return m_node; }
     DOM::Document& document() const;
 
-    RuleCaches const& author_rule_cache() const { return rule_cache().author_rule_cache; }
-    RuleCaches const& user_rule_cache() const { return rule_cache().user_rule_cache; }
-    RuleCaches const& user_agent_rule_cache() const { return rule_cache().user_agent_rule_cache; }
+    Vector<NonnullRefPtr<StyleSheetState>> const& style_sheets() const { return m_style_sheets; }
+
+    enum class StyleEngineUpdate : u8 {
+        Record,
+        Defer,
+    };
+    void add_a_css_style_sheet(StyleSheetState&, StyleEngineUpdate = StyleEngineUpdate::Record);
+    void remove_a_css_style_sheet(StyleSheetState&, StyleEngineUpdate = StyleEngineUpdate::Record);
+    void move_sheet(StyleSheetState&, StyleScope& destination);
+    enum class Alternate : u8 {
+        No,
+        Yes,
+    };
+    enum class OriginClean : u8 {
+        No,
+        Yes,
+    };
+    NonnullRefPtr<StyleSheetState> create_a_css_style_sheet(Utf16View css_text, DOM::Element* owner_node, Utf16View media, Utf16String title, Alternate, OriginClean, Optional<::URL::URL> location, StyleSheetState* parent_style_sheet, StyleSheetImport* owner_import, StyleEngineUpdate = StyleEngineUpdate::Record);
+    void initialize_a_css_style_sheet(StyleSheetState&, DOM::Element* owner_node, Utf16View media, Utf16String title, Alternate, OriginClean, StyleSheetState* parent_style_sheet, StyleSheetImport* owner_import, StyleEngineUpdate = StyleEngineUpdate::Record);
 
     [[nodiscard]] StyleRuleCache const& rule_cache() const;
-    [[nodiscard]] StyleInvalidationData const& style_invalidation_data() const;
     [[nodiscard]] bool has_valid_rule_cache() const { return m_style_cache && m_style_cache->rule_cache; }
-    [[nodiscard]] bool has_valid_style_invalidation_data() const { return m_style_cache && m_style_cache->style_invalidation_data; }
     void invalidate_style_cache();
+    void publish_cascade_layer_order(StyleSheetState* pending_attachment = nullptr);
     void invalidate_user_style_sheet();
 
-    [[nodiscard]] RuleCache const& get_pseudo_class_rule_cache(PseudoClass) const;
-
-    void for_each_stylesheet(CascadeOrigin, Function<void(CSS::CSSStyleSheet&)> const&) const;
-    static WEB_API void for_each_user_agent_stylesheet(bool include_quirks_mode_stylesheet, Function<void(CSS::CSSStyleSheet&, StyleSheetIdentifier const&)> const&);
-    static Optional<StyleSheetIdentifier> user_agent_style_sheet_identifier(CSS::CSSStyleSheet const&);
+    void for_each_stylesheet(CascadeOrigin, Function<void(CSS::StyleSheetState&)> const&) const;
+    static WEB_API void for_each_user_agent_stylesheet(bool include_quirks_mode_stylesheet, bool include_mathml_and_svg_stylesheets, Function<void(CSS::StyleSheetState&, StyleSheetIdentifier const&)> const&);
+    static Optional<StyleSheetIdentifier> user_agent_style_sheet_identifier(CSS::StyleSheetState const&);
     void build_user_style_sheet_if_needed();
 
     void make_rule_cache_for_cascade_origin(CascadeOrigin, StyleRuleCache&);
-    void build_style_invalidation_data_for_cascade_origin(CascadeOrigin, StyleInvalidationData&);
 
     void build_rule_cache();
     void build_rule_cache_if_needed() const;
-    void build_style_invalidation_data();
-    void build_style_invalidation_data_if_needed() const;
     void populate_rule_cache(StyleRuleCache&);
-    void populate_style_invalidation_data(StyleInvalidationData&);
 
-    static void collect_selector_insights(Selector const&, SelectorInsights&);
+    [[nodiscard]] TreeScopeID style_engine_tree_scope() const;
 
-    void build_qualified_layer_names_cache(StyleRuleCache&);
-
-    [[nodiscard]] bool may_have_has_selectors() const;
-    [[nodiscard]] bool may_have_user_has_selectors() const;
-    [[nodiscard]] bool may_have_user_pseudo_class_selectors(PseudoClass) const;
-    [[nodiscard]] bool may_have_has_selectors_with_relative_selector_that_has_sibling_combinator() const;
-
-    void for_each_active_css_style_sheet(Function<void(CSS::CSSStyleSheet&)> const& callback) const;
+    void for_each_active_css_style_sheet(Function<void(CSS::StyleSheetState&)> const& callback) const;
 
     void invalidate_counter_style_cache();
     void build_counter_style_cache();
+    u64 counter_style_environment_identity() const;
     RefPtr<CSS::CounterStyle const> get_registered_counter_style(Utf16FlyString const& name) const;
 
     struct FunctionDefinitionAndScope {
-        GC::Ref<CSSFunctionRule const> function;
+        RustCompiledFunction function;
         StyleScope const& scope;
     };
     Optional<FunctionDefinitionAndScope> get_function_definition(Utf16FlyString const& name) const;
-
-    void schedule_ancestors_style_invalidation_due_to_presence_of_has(GC::Ref<DOM::Node>);
-    void record_pending_has_invalidation_mutation_features(GC::Ref<DOM::Node>, GC::Ref<DOM::Node>, bool includes_descendants, HasMutationKind);
-    void record_pending_has_invalidation_mutation_features(GC::Ref<DOM::Node>, Vector<CSS::InvalidationSet::Property> const&);
-    void did_schedule_pending_has_invalidation(size_t previous_size);
-    void node_was_adopted_from(DOM::Document& old_document);
+    void for_each_visible_function_definition(Function<void(FunctionDefinitionAndScope const&)> const&) const;
 
     template<typename T>
     Optional<T> dereference_global_tree_scoped_reference(Function<Optional<T>(StyleScope const&)> const& callback) const;
@@ -248,15 +160,28 @@ public:
 
     RefPtr<StyleCache> m_style_cache;
 
-    GC::Ptr<CSSStyleSheet> m_user_style_sheet;
-
-    OrderedHashMap<GC::Ref<DOM::Node>, PendingHasInvalidationMutationFeatures> m_pending_has_invalidations;
+    RefPtr<StyleSheetState> m_user_style_sheet;
 
     bool m_needs_counter_style_cache_update : 1 { true };
     bool m_is_doing_counter_style_cache_update : 1 { false };
+    bool m_has_published_named_layer_order : 1 { false };
+    u64 m_published_layer_order_generation { 0 };
+    u64 m_counter_style_environment_identity { 0 };
     HashMap<Utf16FlyString, NonnullRefPtr<CSS::CounterStyle const>> m_registered_counter_styles;
 
     GC::Ref<DOM::Node> m_node;
+
+private:
+    void add_sheet(StyleSheetState&, StyleEngineUpdate);
+    void remove_sheet(StyleSheetState&, StyleEngineUpdate);
+    void insert_sheet_in_tree_order(StyleSheetState&);
+    StyleSheetState* following_sheet(StyleSheetState&);
+
+    Vector<NonnullRefPtr<StyleSheetState>> m_style_sheets;
+    // https://www.w3.org/TR/cssom/#preferred-css-style-sheet-set-name
+    Utf16String m_preferred_css_style_sheet_set_name;
+    // https://www.w3.org/TR/cssom/#last-css-style-sheet-set-name
+    Optional<Utf16String> m_last_css_style_sheet_set_name;
 };
 
 }

@@ -136,6 +136,7 @@ pub(crate) enum FloatConversion {
     FloatToDouble,
     DoubleToFloat,
     DoubleToSigned32Truncate,
+    DoubleToSigned64Truncate,
     JavaScriptToSigned32,
 }
 
@@ -331,13 +332,14 @@ define_machine_opcodes! {
         match conversion {
             FloatConversion::Signed64ToDouble | FloatConversion::Signed32ToDouble => operands_match(operands, &[FR, R]),
             FloatConversion::FloatToDouble | FloatConversion::DoubleToFloat => operands_match(operands, &[FR, FR]),
-            FloatConversion::DoubleToSigned32Truncate | FloatConversion::JavaScriptToSigned32 => operands_match(operands, &[R, FR]),
+            FloatConversion::DoubleToSigned32Truncate | FloatConversion::DoubleToSigned64Truncate | FloatConversion::JavaScriptToSigned32 => operands_match(operands, &[R, FR]),
         }
     } printing match conversion {
         FloatConversion::Signed64ToDouble => simple!("scvtf"; native(0), native(1)),
         FloatConversion::Signed32ToDouble => simple!("scvtf"; native(0), word(1)),
         FloatConversion::FloatToDouble => simple!("fcvt"; native(0), single(1)),
         FloatConversion::DoubleToFloat => simple!("fcvt"; single(0), native(1)),
+        FloatConversion::DoubleToSigned64Truncate => simple!("fcvtzs"; native(0), native(1)),
         FloatConversion::DoubleToSigned32Truncate => simple!("fcvtzs"; word(0), native(1)),
         FloatConversion::JavaScriptToSigned32 => simple!("fjcvtzs"; word(0), native(1)),
     };
@@ -397,6 +399,8 @@ define_machine_opcodes! {
     [BitClear64Immediate] => Self::BitClear64Immediate => [[R, I]] encoding {
         immediate(1).is_some_and(|value| is_logical_immediate(IntegerWidth::U64, value as u64))
     } printing simple!("bic"; native(0), native(0), SimpleOperand::HashImmediate(1, true));
+    [SignedDivide64] => Self::SignedDivide64 => [[R, R, R]] printing simple!("sdiv"; native(0), native(1), native(2));
+    [MultiplySubtract64] => Self::MultiplySubtract64 => [[R, R, R, R]] printing simple!("msub"; native(0), native(1), native(2), native(3));
     [SignedDivide32] => Self::SignedDivide32 => [[R, R, R]] printing simple!("sdiv"; word(0), word(1), word(2));
     [MultiplySubtract32] => Self::MultiplySubtract32 => [[R, R, R, R]] printing simple!("msub"; word(0), word(1), word(2), word(3));
 }
@@ -631,9 +635,9 @@ impl Opcode {
                 FloatingPointOperation::Convert(IntrinsicFloatConversion::Int32ToFloat64) => {
                     Self::FloatConversion(FloatConversion::Signed32ToDouble)
                 }
-                FloatingPointOperation::Convert(IntrinsicFloatConversion::Uint32ToFloat64) => {
-                    Self::FloatConversion(FloatConversion::Signed64ToDouble)
-                }
+                FloatingPointOperation::Convert(
+                    IntrinsicFloatConversion::Uint32ToFloat64 | IntrinsicFloatConversion::Int64ToFloat64,
+                ) => Self::FloatConversion(FloatConversion::Signed64ToDouble),
                 FloatingPointOperation::Convert(IntrinsicFloatConversion::Float32ToFloat64) => {
                     Self::FloatConversion(FloatConversion::FloatToDouble)
                 }
@@ -641,7 +645,9 @@ impl Opcode {
                     Self::FloatConversion(FloatConversion::DoubleToFloat)
                 }
                 FloatingPointOperation::Convert(
-                    IntrinsicFloatConversion::Float64ToInt32 | IntrinsicFloatConversion::JavaScriptToInt32,
+                    IntrinsicFloatConversion::Float64ToInt32
+                    | IntrinsicFloatConversion::Float64ToInt64
+                    | IntrinsicFloatConversion::JavaScriptToInt32,
                 )
                 | FloatingPointOperation::CanonicalizeNan => Self::Pseudo,
             },
@@ -773,10 +779,7 @@ pub(crate) fn generate(program: &Program, options: &CompileOptions) -> String {
                 "//",
                 |out, _| emit_handler_alignment(out, object_format),
                 emit_instruction,
-                |out| {
-                    w!(out, ".Lexit_veneer:");
-                    w!(out, "    b .Lexit");
-                },
+                |_| {},
             )
         },
         |out| generate_exit_point(out, object_format),
@@ -821,7 +824,7 @@ fn generate_entry_point(out: &mut String, program: &Program, fmt: ObjectFormat) 
     // Pinned: x19(dispatch), x20(vm), x21(ip), x26(pb), x27(values), x28(exec_ctx)
     // x21 = ip (instruction pointer = pb + pc), the primary dispatch register.
     // x25 is only used when DSL code writes to pc directly (rare).
-    // x22 = INT32_TAG, x23 = BOOLEAN_TAG, x24 = NAN_BASE_TAG (pinned constants).
+    // x22 = INT32_TAG, x23 = BOOLEAN_TAG, x24 = heap region base.
     // d8 is pinned to hold CANON_NAN_BITS (callee-saved FP register).
     let frame_size = frame_size_for_format(fmt);
     w!(out, "    stp x29, x30, [sp, #-{frame_size}]!");
@@ -852,10 +855,12 @@ fn generate_entry_point(out: &mut String, program: &Program, fmt: ObjectFormat) 
     let runtime = runtime(program);
     let interp_ctx = runtime[KnownLayoutConstant::VmRunningExecutionContext];
     let canon_nan = runtime[KnownLayoutConstant::CanonicalNanBits];
+    let heap_region_base = runtime[KnownLayoutConstant::VmHeapRegionBase];
     w!(out, "    mov x26, x0              // pb = bytecode base");
     w!(out, "    mov x27, x2              // values = values array");
     // Store VM* in x20 (callee-saved) for C++ calls, pin exec_ctx in x28
     w!(out, "    mov x20, x3              // vm = VM*");
+    emit_ldr64(out, "x24", "x3", heap_region_base);
     emit_ldr64(out, "x28", "x3", interp_ctx);
     w!(out, "    // x28 = exec_ctx");
     let vm_breakpoint_controller = runtime[KnownLayoutConstant::VmBreakpointController];
@@ -874,13 +879,11 @@ fn generate_entry_point(out: &mut String, program: &Program, fmt: ObjectFormat) 
     // Pin frequently-compared tag constants in callee-saved registers.
     let int32_tag = runtime[KnownLayoutConstant::Int32Tag];
     let boolean_tag = runtime[KnownLayoutConstant::BooleanTag];
-    let nan_base_tag = runtime[KnownLayoutConstant::NanBaseTag];
     emit_mov_imm(out, registers::X22, int32_tag);
     w!(out, "    // x22 = INT32_TAG");
     emit_mov_imm(out, registers::X23, boolean_tag);
     w!(out, "    // x23 = BOOLEAN_TAG");
-    emit_mov_imm(out, registers::X24, nan_base_tag);
-    w!(out, "    // x24 = NAN_BASE_TAG");
+    w!(out, "    // x24 = heap region base");
 
     // Dispatch to first instruction (x21 = pb + entry_point)
     w!(out, "    add x21, x26, w1, uxtw   // x21 = pb + entry_point");
@@ -1157,6 +1160,31 @@ fn shift_mnemonic(operation: ShiftOperation) -> &'static str {
 fn emit_instruction(out: &mut String, insn: &MachineInstruction, handler: &Handler) {
     let opcode = insn.opcode.aarch64();
     debug_assert!(!opcode.is_pseudo());
+    // Cold blocks follow all hot handlers and may exceed the test-bit branch's
+    // +/-32 KiB reach. Use a local inverted test followed by a full-range branch.
+    let bit_branch = match opcode {
+        Opcode::TestBitAndBranch { width, condition } => Some((width, condition, insn.immediate(1), 2)),
+        Opcode::BranchOnBit31(condition) => Some((
+            IntegerWidth::U32,
+            condition.select(TestCondition::Set, TestCondition::Clear),
+            31,
+            1,
+        )),
+        _ => None,
+    };
+    if let Some((width, condition, bit, target_index)) = bit_branch {
+        let target = &insn.operands[target_index];
+        if handler.cold_instructions.iter().any(|instruction| {
+            instruction.opcode.aarch64() == Opcode::Label && instruction.operands.first() == Some(target)
+        }) {
+            let register = insn.physical_register(0).integer_name(width);
+            let inverse = condition.select("tbz", "tbnz");
+            w!(out, "    {inverse} {register}, #{bit}, 1f");
+            w!(out, "    b {}", super::emitter::resolve_label(target, handler));
+            w!(out, "1:");
+            return;
+        }
+    }
     if emit_simple_instruction(out, insn, opcode.simple_instruction(), |operand| match operand {
         Operand::Label(_) => super::emitter::resolve_label(operand, handler),
         Operand::Address(address) => match opcode {
@@ -1180,10 +1208,9 @@ fn emit_instruction(out: &mut String, insn: &MachineInstruction, handler: &Handl
 }
 
 fn emit_branch_bit_set_to_exit(out: &mut String, register: PhysicalRegister, bit: u8) {
-    // A test-bit branch only has a +/-32 KiB range, while the shared exit point
-    // follows all interpreter handlers. Branch to the veneer between the hot
-    // and cold regions, which can reach the exit using a wider-range branch.
-    w!(out, "    tbnz {register}, #{bit}, .Lexit_veneer");
+    w!(out, "    tbz {register}, #{bit}, 1f");
+    w!(out, "    b .Lexit");
+    w!(out, "1:");
 }
 
 #[cfg(test)]
@@ -1227,6 +1254,8 @@ mod tests {
                 &crate::frontend::layout::LayoutConstants::from_values([
                     ("VM_RUNNING_EXECUTION_CONTEXT".into(), 8),
                     ("VM_BREAKPOINT_CONTROLLER".into(), 16),
+                    ("SLOW_PATH_CONTINUATION_BIT".into(), 32),
+                    ("VM_HEAP_REGION_BASE".into(), 24),
                     ("CANON_NAN_BITS".into(), 0x7ff8_0000_0000_0000u64 as i64),
                     ("INT32_TAG".into(), 0xfffau64 as i64),
                     ("BOOLEAN_TAG".into(), 0xfffbu64 as i64),
@@ -1297,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn bit_test_exit_branch_uses_the_shared_veneer() {
+    fn bit_test_exit_branch_uses_a_full_range_branch() {
         let program = machine_coff_program(Vec::new());
         let handler = &program.functions[0];
         let instruction = MachineInstruction {
@@ -1308,17 +1337,14 @@ mod tests {
 
         emit_instruction(&mut out, &instruction, handler);
 
-        assert_eq!(out, "    tbnz x0, #63, .Lexit_veneer\n");
+        assert_eq!(out, "    tbz x0, #63, 1f\n    b .Lexit\n1:\n");
     }
 
     #[test]
-    fn emits_one_exit_veneer_between_hot_and_cold_handlers() {
+    fn exit_branches_do_not_depend_on_a_shared_veneer() {
         let output = generate(&coff_program(Vec::new()));
 
-        assert_eq!(output.matches(".Lexit_veneer:").count(), 1);
-        assert!(output.contains("    tbnz x0, #63, .Lexit_veneer"));
-        assert!(output.contains(".Lexit_veneer:\n    b .Lexit\n"));
-        assert!(output.find(".Lexit_veneer:") < output.find("// Cold handler paths"));
+        assert!(output.contains("    tbz x0, #63, 1f\n    b .Lexit\n1:\n"));
     }
 
     #[test]

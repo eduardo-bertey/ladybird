@@ -404,6 +404,8 @@ public:
         return Object::internal_get(property_key, receiver, cacheable_metadata, phase);
     }
 
+    virtual bool is_cacheable_for_property_absence() const override { return false; }
+
     // 10.4.5.6 [[Set]] ( P, V, Receiver ), https://tc39.es/ecma262/#sec-integer-indexed-exotic-objects-set-p-v-receiver
     virtual ThrowCompletionOr<bool> internal_set(PropertyKey const& property_key, Value value, Value receiver, CacheableSetPropertyMetadata*, PropertyLookupPhase) override
     {
@@ -498,7 +500,7 @@ public:
 
         // 5. For each own property key P of O such that P is a Symbol, in ascending chronological order of property creation, do
         shape().for_each_property_in_insertion_order([&](auto const& property_key, auto const&) {
-            if (property_key.is_symbol()) {
+            if (property_key.is_symbol() && !property_key.is_private()) {
                 // a. Append P to keys.
                 keys.append(property_key.to_value(vm));
             }

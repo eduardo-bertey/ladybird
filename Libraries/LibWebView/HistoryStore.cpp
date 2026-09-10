@@ -25,6 +25,7 @@ static constexpr i32 HISTORY_DATABASE_BUSY_TIMEOUT_MS = 250;
 static constexpr u32 HISTORY_SCHEMA_BASELINE_VERSION = 1u;
 static constexpr u32 HISTORY_SCHEMA_RANKING_SIGNALS_VERSION = 2u;
 static constexpr u32 HISTORY_SCHEMA_OMNIBOX_ENGAGEMENTS_VERSION = 3u;
+static constexpr u32 HISTORY_SCHEMA_FAVICON_STORE_VERSION = 4u;
 
 static Optional<StringView> url_without_scheme(StringView url)
 {
@@ -141,48 +142,64 @@ static void sort_matching_entries(Vector<HistoryEntry const*>& matches, StringVi
 
 ErrorOr<Database::MigrationOutcome> HistoryStore::migrate_schema(Database::Database& database, Database::MigrationMode mode)
 {
-    Array<Database::Migration, 3> migrations { {
-        { .version = HISTORY_SCHEMA_BASELINE_VERSION, .sql = R"#(
-            CREATE TABLE IF NOT EXISTS History (
-                url TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                favicon TEXT,
-                visit_count INTEGER NOT NULL,
-                last_visited_time INTEGER NOT NULL
-            );
+    auto migrations = to_array<Database::Migration>({
+        {
+            .version = HISTORY_SCHEMA_BASELINE_VERSION,
+            .sql = R"#(
+                CREATE TABLE IF NOT EXISTS History (
+                    url TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    favicon TEXT,
+                    visit_count INTEGER NOT NULL,
+                    last_visited_time INTEGER NOT NULL
+                );
 
-            CREATE INDEX IF NOT EXISTS HistoryLastVisitedTimeIndex
-            ON History(last_visited_time DESC);
-        )#"sv },
-        { .version = HISTORY_SCHEMA_RANKING_SIGNALS_VERSION, .sql = R"#(
-            ALTER TABLE History ADD COLUMN direct_visit_count INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE History ADD COLUMN last_qualifying_visit_time INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE History ADD COLUMN last_direct_visit_time INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE History ADD COLUMN decayed_visit_score REAL NOT NULL DEFAULT 0;
-            ALTER TABLE History ADD COLUMN decayed_direct_score REAL NOT NULL DEFAULT 0;
-            ALTER TABLE History ADD COLUMN score_updated_at INTEGER NOT NULL DEFAULT 0;
+                CREATE INDEX IF NOT EXISTS HistoryLastVisitedTimeIndex
+                ON History(last_visited_time DESC);
+            )#"sv,
+        },
+        {
+            .version = HISTORY_SCHEMA_RANKING_SIGNALS_VERSION,
+            .sql = R"#(
+                ALTER TABLE History ADD COLUMN direct_visit_count INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE History ADD COLUMN last_qualifying_visit_time INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE History ADD COLUMN last_direct_visit_time INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE History ADD COLUMN decayed_visit_score REAL NOT NULL DEFAULT 0;
+                ALTER TABLE History ADD COLUMN decayed_direct_score REAL NOT NULL DEFAULT 0;
+                ALTER TABLE History ADD COLUMN score_updated_at INTEGER NOT NULL DEFAULT 0;
 
-            UPDATE History
-            SET last_qualifying_visit_time = last_visited_time,
-                decayed_visit_score = MIN(CAST(visit_count AS REAL), 8.0),
-                score_updated_at = last_visited_time;
-        )#"sv },
-        { .version = HISTORY_SCHEMA_OMNIBOX_ENGAGEMENTS_VERSION, .sql = R"#(
-            CREATE TABLE OmniboxEngagements (
-                normalized_input TEXT NOT NULL,
-                destination_kind INTEGER NOT NULL,
-                destination_key TEXT NOT NULL,
-                destination TEXT NOT NULL,
-                explicit_use_count INTEGER NOT NULL,
-                default_use_count INTEGER NOT NULL,
-                last_used_time INTEGER NOT NULL,
-                PRIMARY KEY (normalized_input, destination_kind, destination_key)
-            );
+                UPDATE History
+                SET last_qualifying_visit_time = last_visited_time,
+                    decayed_visit_score = MIN(CAST(visit_count AS REAL), 8.0),
+                    score_updated_at = last_visited_time;
+            )#"sv,
+        },
+        {
+            .version = HISTORY_SCHEMA_OMNIBOX_ENGAGEMENTS_VERSION,
+            .sql = R"#(
+                CREATE TABLE OmniboxEngagements (
+                    normalized_input TEXT NOT NULL,
+                    destination_kind INTEGER NOT NULL,
+                    destination_key TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    explicit_use_count INTEGER NOT NULL,
+                    default_use_count INTEGER NOT NULL,
+                    last_used_time INTEGER NOT NULL,
+                    PRIMARY KEY (normalized_input, destination_kind, destination_key)
+                );
 
-            CREATE INDEX OmniboxEngagementsByInput
-            ON OmniboxEngagements(destination_kind, normalized_input);
-        )#"sv },
-    } };
+                CREATE INDEX OmniboxEngagementsByInput
+                ON OmniboxEngagements(destination_kind, normalized_input);
+            )#"sv,
+        },
+        {
+            .version = HISTORY_SCHEMA_FAVICON_STORE_VERSION,
+            .sql = R"#(
+                ALTER TABLE History DROP COLUMN favicon;
+                ALTER TABLE History ADD COLUMN favicon_hash TEXT;
+            )#"sv,
+        },
+    });
 
     return database.migrate("History"sv, migrations, mode);
 }
@@ -233,44 +250,45 @@ ErrorOr<NonnullOwnPtr<HistoryStore>> HistoryStore::create(Database::Database& da
     )#"sv));
     statements.update_favicon = TRY(database.prepare_statement(R"#(
         UPDATE History
-        SET favicon = ?
+        SET favicon_hash = ?
         WHERE url = ?;
     )#"sv));
     statements.get_entry = TRY(database.prepare_statement(R"#(
         SELECT
-            title,
-            visit_count,
-            last_visited_time,
-            COALESCE(favicon, ''),
-            direct_visit_count,
-            last_qualifying_visit_time,
-            last_direct_visit_time,
-            decayed_visit_score,
-            decayed_direct_score,
-            score_updated_at
-        FROM History
-        WHERE url = ?;
+            h.title,
+            h.visit_count,
+            h.last_visited_time,
+            f.png_data,
+            h.direct_visit_count,
+            h.last_qualifying_visit_time,
+            h.last_direct_visit_time,
+            h.decayed_visit_score,
+            h.decayed_direct_score,
+            h.score_updated_at
+        FROM History AS h
+        LEFT JOIN Favicons AS f ON f.hash = h.favicon_hash
+        WHERE h.url = ?;
     )#"sv));
     statements.search_entries = TRY(database.prepare_statement(R"#(
         SELECT
-            url,
-            title,
-            visit_count,
-            last_visited_time,
-            COALESCE(favicon, ''),
-            direct_visit_count,
-            last_qualifying_visit_time,
-            last_direct_visit_time,
-            decayed_visit_score,
-            decayed_direct_score,
-            score_updated_at
+            h.url,
+            h.title,
+            h.visit_count,
+            h.last_visited_time,
+            f.png_data,
+            h.direct_visit_count,
+            h.last_qualifying_visit_time,
+            h.last_direct_visit_time,
+            h.decayed_visit_score,
+            h.decayed_direct_score,
+            h.score_updated_at
         FROM (
             SELECT
                 url,
                 title,
                 visit_count,
                 last_visited_time,
-                COALESCE(favicon, '') AS favicon,
+                favicon_hash,
                 direct_visit_count,
                 last_qualifying_visit_time,
                 last_direct_visit_time,
@@ -278,86 +296,131 @@ ErrorOr<NonnullOwnPtr<HistoryStore>> HistoryStore::create(Database::Database& da
                 decayed_direct_score,
                 score_updated_at,
                 CASE
-                    WHEN LOWER(CASE
-                        WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
-                        ELSE url
-                    END) LIKE 'www.%'
-                    THEN SUBSTR(CASE
-                        WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
-                        ELSE url
-                    END, 5)
-                    ELSE CASE
-                        WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
-                        ELSE url
-                    END
-                END AS searchable_url
-            FROM History
-        )
-        WHERE ((?1 != '' AND LOWER(searchable_url) LIKE LOWER(?1) || '%')
-            OR (?2 != '' AND INSTR(LOWER(searchable_url), LOWER(?2)) > 0)
-            OR (?3 != '' AND INSTR(LOWER(title), LOWER(?3)) > 0))
+                    WHEN ?1 != '' AND LOWER(searchable_url) = LOWER(?1) THEN 0
+                    WHEN ?1 != '' AND LOWER(searchable_url) LIKE LOWER(?1) || '%' THEN 1
+                    WHEN ?3 != '' AND LOWER(title) LIKE LOWER(?3) || '%' THEN 2
+                    ELSE 3
+                END AS match_rank
+            FROM (
+                SELECT
+                    url,
+                    title,
+                    visit_count,
+                    last_visited_time,
+                    favicon_hash,
+                    direct_visit_count,
+                    last_qualifying_visit_time,
+                    last_direct_visit_time,
+                    decayed_visit_score,
+                    decayed_direct_score,
+                    score_updated_at,
+                    CASE
+                        WHEN LOWER(CASE
+                            WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
+                            ELSE url
+                        END) LIKE 'www.%'
+                        THEN SUBSTR(CASE
+                            WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
+                            ELSE url
+                        END, 5)
+                        ELSE CASE
+                            WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
+                            ELSE url
+                        END
+                    END AS searchable_url
+                FROM History
+            )
+            WHERE ((?1 != '' AND LOWER(searchable_url) LIKE LOWER(?1) || '%')
+                OR (?2 != '' AND INSTR(LOWER(searchable_url), LOWER(?2)) > 0)
+                OR (?3 != '' AND INSTR(LOWER(title), LOWER(?3)) > 0))
+            ORDER BY
+                match_rank,
+                direct_visit_count DESC,
+                decayed_direct_score DESC,
+                decayed_visit_score DESC,
+                visit_count DESC,
+                last_visited_time DESC,
+                url ASC
+            LIMIT ?4
+        ) AS h
+        LEFT JOIN Favicons AS f ON f.hash = h.favicon_hash
         ORDER BY
-            CASE
-                WHEN ?1 != '' AND LOWER(searchable_url) = LOWER(?1) THEN 0
-                WHEN ?1 != '' AND LOWER(searchable_url) LIKE LOWER(?1) || '%' THEN 1
-                WHEN ?3 != '' AND LOWER(title) LIKE LOWER(?3) || '%' THEN 2
-                ELSE 3
-            END,
-            direct_visit_count DESC,
-            decayed_direct_score DESC,
-            decayed_visit_score DESC,
-            visit_count DESC,
-            last_visited_time DESC,
-            url ASC
-        LIMIT ?4;
+            h.match_rank,
+            h.direct_visit_count DESC,
+            h.decayed_direct_score DESC,
+            h.decayed_visit_score DESC,
+            h.visit_count DESC,
+            h.last_visited_time DESC,
+            h.url ASC;
     )#"sv));
     statements.list_entries = TRY(database.prepare_statement(R"#(
         SELECT
-            url,
-            title,
-            visit_count,
-            last_visited_time,
-            favicon,
-            direct_visit_count,
-            last_qualifying_visit_time,
-            last_direct_visit_time,
-            decayed_visit_score,
-            decayed_direct_score,
-            score_updated_at
+            h.url,
+            h.title,
+            h.visit_count,
+            h.last_visited_time,
+            f.png_data,
+            h.direct_visit_count,
+            h.last_qualifying_visit_time,
+            h.last_direct_visit_time,
+            h.decayed_visit_score,
+            h.decayed_direct_score,
+            h.score_updated_at
         FROM (
             SELECT
                 url,
                 title,
                 visit_count,
                 last_visited_time,
-                COALESCE(favicon, '') AS favicon,
+                favicon_hash,
                 direct_visit_count,
                 last_qualifying_visit_time,
                 last_direct_visit_time,
                 decayed_visit_score,
                 decayed_direct_score,
-                score_updated_at,
-                CASE
-                    WHEN LOWER(CASE
-                        WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
-                        ELSE url
-                    END) LIKE 'www.%'
-                    THEN SUBSTR(CASE
-                        WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
-                        ELSE url
-                    END, 5)
-                    ELSE CASE
-                        WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
-                        ELSE url
-                    END
-                END AS searchable_url
-            FROM History
-        )
-        WHERE ((?1 = '' AND ?2 = '')
-            OR (?1 != '' AND INSTR(LOWER(title), LOWER(?1)) > 0)
-            OR (?2 != '' AND INSTR(LOWER(searchable_url), LOWER(?2)) > 0))
-        ORDER BY last_visited_time DESC, url ASC
-        LIMIT ?3 OFFSET ?4;
+                score_updated_at
+            FROM (
+                SELECT
+                    url,
+                    title,
+                    visit_count,
+                    last_visited_time,
+                    favicon_hash,
+                    direct_visit_count,
+                    last_qualifying_visit_time,
+                    last_direct_visit_time,
+                    decayed_visit_score,
+                    decayed_direct_score,
+                    score_updated_at,
+                    CASE
+                        WHEN LOWER(CASE
+                            WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
+                            ELSE url
+                        END) LIKE 'www.%'
+                        THEN SUBSTR(CASE
+                            WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
+                            ELSE url
+                        END, 5)
+                        ELSE CASE
+                            WHEN INSTR(url, '://') > 0 THEN SUBSTR(url, INSTR(url, '://') + 3)
+                            ELSE url
+                        END
+                    END AS searchable_url
+                FROM History
+            )
+            WHERE ((?1 = '' AND ?2 = '')
+                OR (?1 != '' AND INSTR(LOWER(title), LOWER(?1)) > 0)
+                OR (?2 != '' AND INSTR(LOWER(searchable_url), LOWER(?2)) > 0))
+            ORDER BY last_visited_time DESC, url ASC
+            LIMIT ?3 OFFSET ?4
+        ) AS h
+        LEFT JOIN Favicons AS f ON f.hash = h.favicon_hash
+        ORDER BY h.last_visited_time DESC, h.url ASC;
+    )#"sv));
+    statements.referenced_favicon_hashes = TRY(database.prepare_statement(R"#(
+        SELECT DISTINCT favicon_hash
+        FROM History
+        WHERE favicon_hash IS NOT NULL;
     )#"sv));
     statements.delete_entry = TRY(database.prepare_statement("DELETE FROM History WHERE url = ?;"sv));
     statements.delete_entries_accessed_since = TRY(database.prepare_statement("DELETE FROM History WHERE last_visited_time >= ?;"sv));
@@ -413,17 +476,15 @@ ErrorOr<NonnullOwnPtr<HistoryStore>> HistoryStore::create(Database::Database& da
     return adopt_own(*new HistoryStore { adopt_own<StorageImpl>(*new PersistedStorage { database, move(statements) }) });
 }
 
-NonnullOwnPtr<HistoryStore> HistoryStore::create()
+NonnullOwnPtr<HistoryStore> HistoryStore::create(Optional<FaviconStore&> favicon_store)
 {
     dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Opening transient history store");
-
-    return adopt_own(*new HistoryStore { adopt_own<StorageImpl>(*new TransientStorage {}) });
+    return adopt_own(*new HistoryStore { adopt_own<StorageImpl>(*new TransientStorage { favicon_store }) });
 }
 
 NonnullOwnPtr<HistoryStore> HistoryStore::create_disabled()
 {
     dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Opening disabled history store");
-
     return adopt_own(*new HistoryStore { adopt_own<StorageImpl>(*new TransientStorage {}), true });
 }
 
@@ -480,7 +541,7 @@ static HistoryEntry entry_after_visit(Optional<HistoryEntry> existing_entry, Str
     auto entry = existing_entry.value_or(HistoryEntry {
         .url = url,
         .title = {},
-        .favicon_base64_png = {},
+        .favicon_png = {},
         .last_visited_time = visited_at,
         .last_qualifying_visit_time = {},
         .last_direct_visit_time = {},
@@ -489,7 +550,7 @@ static HistoryEntry entry_after_visit(Optional<HistoryEntry> existing_entry, Str
 
     if (title.has_value() && !title->is_empty())
         entry.title = title;
-    VERIFY(entry.visit_count != NumericLimits<u64>::max());
+    VERIFY(entry.visit_count != NumericLimits<i64>::max());
     ++entry.visit_count;
     entry.last_visited_time = max(entry.last_visited_time, visited_at);
 
@@ -498,7 +559,7 @@ static HistoryEntry entry_after_visit(Optional<HistoryEntry> existing_entry, Str
         entry.last_qualifying_visit_time = max(entry.last_qualifying_visit_time, visited_at);
 
         if (transition == HistoryVisitTransition::Omnibox) {
-            VERIFY(entry.direct_visit_count != NumericLimits<u64>::max());
+            VERIFY(entry.direct_visit_count != NumericLimits<i64>::max());
             ++entry.direct_visit_count;
             entry.decayed_direct_score = score_after_event(entry.decayed_direct_score, entry.score_updated_at, visited_at, 60.0);
             entry.last_direct_visit_time = max(entry.last_direct_visit_time, visited_at);
@@ -550,9 +611,9 @@ void HistoryStore::update_title(URL::URL const& url, String const& title)
     m_storage->update_title(*normalized_url, title);
 }
 
-void HistoryStore::update_favicon(URL::URL const& url, String const& favicon_base64_png)
+void HistoryStore::update_favicon(URL::URL const& url, String const& favicon_hash)
 {
-    if (favicon_base64_png.is_empty()) {
+    if (favicon_hash.is_empty()) {
         dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Ignoring empty history favicon update for {}", url);
         return;
     }
@@ -561,59 +622,12 @@ void HistoryStore::update_favicon(URL::URL const& url, String const& favicon_bas
     if (!normalized_url.has_value())
         return;
 
-    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Updating history favicon in {} store: url='{}' bytes={}",
+    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Updating history favicon in {} store: url='{}' favicon_hash='{}'",
         m_storage->name(),
         *normalized_url,
-        favicon_base64_png.bytes().size());
+        favicon_hash);
 
-    m_storage->update_favicon(*normalized_url, favicon_base64_png);
-}
-
-void HistoryStore::record_closed_tab(URL::URL const& url, UnixDateTime closed_at)
-{
-    m_recently_closed_entries.empend(RecentlyClosedEntry {
-        .urls = { url },
-        .was_window = false,
-        .active_tab_index = 0,
-        .closed_time = closed_at,
-    });
-}
-
-void HistoryStore::record_closed_window(Vector<URL::URL> urls, size_t active_tab_index, UnixDateTime closed_at)
-{
-    if (urls.is_empty())
-        return;
-
-    m_recently_closed_entries.empend(RecentlyClosedEntry {
-        .urls = move(urls),
-        .was_window = true,
-        .active_tab_index = 0,
-        .closed_time = closed_at,
-    });
-
-    auto& entry = m_recently_closed_entries.last();
-    entry.active_tab_index = active_tab_index < entry.urls.size() ? active_tab_index : entry.urls.size() - 1;
-}
-
-bool HistoryStore::has_recently_closed_entries() const
-{
-    return !m_recently_closed_entries.is_empty();
-}
-
-Optional<RecentlyClosedEntry const&> HistoryStore::most_recently_closed_entry() const
-{
-    if (m_recently_closed_entries.is_empty())
-        return {};
-
-    return m_recently_closed_entries.last();
-}
-
-Optional<RecentlyClosedEntry> HistoryStore::pop_most_recently_closed_entry()
-{
-    if (m_recently_closed_entries.is_empty())
-        return {};
-
-    return m_recently_closed_entries.take_last();
+    m_storage->update_favicon(*normalized_url, favicon_hash);
 }
 
 Optional<HistoryEntry> HistoryStore::entry_for_url(URL::URL const& url)
@@ -633,7 +647,7 @@ Optional<HistoryEntry> HistoryStore::entry_for_url(URL::URL const& url)
             entry->title.has_value() ? entry->title->bytes_as_string_view() : "<none>"sv,
             entry->visit_count,
             entry->last_visited_time.seconds_since_epoch(),
-            entry->favicon_base64_png.has_value());
+            entry->favicon_png.has_value());
     } else {
         dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] No history entry found for '{}'", *normalized_url);
     }
@@ -688,6 +702,11 @@ Vector<HistoryEntry> HistoryStore::list_entries(StringView query, size_t offset,
         log_history_entries(entries));
 
     return entries;
+}
+
+Vector<String> HistoryStore::referenced_favicon_hashes()
+{
+    return m_storage->referenced_favicon_hashes();
 }
 
 void HistoryStore::record_omnibox_engagement(OmniboxEngagement const& engagement, UnixDateTime used_at)
@@ -775,9 +794,6 @@ void HistoryStore::remove_entries_accessed_since(UnixDateTime since)
         m_storage->name(),
         since.seconds_since_epoch());
     m_storage->remove_entries_accessed_since(since);
-    m_recently_closed_entries.remove_all_matching([&](auto const& entry) {
-        return entry.closed_time >= since;
-    });
 }
 
 void HistoryStore::TransientStorage::record_visit(String const& url, Optional<String> const& title, UnixDateTime visited_at, HistoryVisitTransition transition)
@@ -797,13 +813,16 @@ void HistoryStore::TransientStorage::update_title(String const& url, String cons
     entry->value.title = move(title);
 }
 
-void HistoryStore::TransientStorage::update_favicon(String const& url, String const& favicon_base64_png)
+void HistoryStore::TransientStorage::update_favicon(String const& url, String const& favicon_hash)
 {
+    if (!m_favicon_store.has_value())
+        return;
+
     auto entry = m_entries.find(url);
     if (entry == m_entries.end())
         return;
 
-    entry->value.favicon_base64_png = move(favicon_base64_png);
+    entry->value.favicon_png = m_favicon_store->favicon_png(favicon_hash);
 }
 
 Optional<HistoryEntry> HistoryStore::TransientStorage::entry_for_url(String const& url)
@@ -896,10 +915,10 @@ void HistoryStore::TransientStorage::record_omnibox_engagement(OmniboxEngagement
     });
     if (existing != m_omnibox_engagements.end()) {
         if (engagement.was_explicit) {
-            VERIFY(existing->explicit_use_count != NumericLimits<u64>::max());
+            VERIFY(existing->explicit_use_count != NumericLimits<i64>::max());
             ++existing->explicit_use_count;
         } else {
-            VERIFY(existing->default_use_count != NumericLimits<u64>::max());
+            VERIFY(existing->default_use_count != NumericLimits<i64>::max());
             ++existing->default_use_count;
         }
         existing->destination = move(destination);
@@ -1011,12 +1030,12 @@ void HistoryStore::PersistedStorage::update_title(String const& url, String cons
         url);
 }
 
-void HistoryStore::PersistedStorage::update_favicon(String const& url, String const& favicon_base64_png)
+void HistoryStore::PersistedStorage::update_favicon(String const& url, String const& favicon_hash)
 {
     m_database.execute_statement(
         m_statements.update_favicon,
         {},
-        favicon_base64_png,
+        favicon_hash,
         url);
 }
 
@@ -1026,16 +1045,20 @@ Optional<HistoryEntry> HistoryStore::PersistedStorage::entry_for_url(String cons
 
     m_database.execute_statement(
         m_statements.get_entry,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
             auto title = m_database.result_column<String>(statement_id, 0);
-            auto favicon = m_database.result_column<String>(statement_id, 3);
+            auto visit_count = m_database.result_column<i64>(statement_id, 1);
+            auto favicon_png = m_database.result_column<ByteBuffer>(statement_id, 3);
+            auto direct_visit_count = m_database.result_column<i64>(statement_id, 4);
+            if (visit_count < 0 || direct_visit_count < 0)
+                return {};
 
             entry = HistoryEntry {
                 .url = url,
                 .title = title.is_empty() ? Optional<String> {} : Optional<String> { move(title) },
-                .favicon_base64_png = favicon.is_empty() ? Optional<String> {} : Optional<String> { move(favicon) },
-                .visit_count = m_database.result_column<u64>(statement_id, 1),
-                .direct_visit_count = m_database.result_column<u64>(statement_id, 4),
+                .favicon_png = favicon_png.is_empty() ? OptionalNone {} : Optional<ByteBuffer> { move(favicon_png) },
+                .visit_count = visit_count,
+                .direct_visit_count = direct_visit_count,
                 .last_visited_time = m_database.result_column<UnixDateTime>(statement_id, 2),
                 .last_qualifying_visit_time = m_database.result_column<UnixDateTime>(statement_id, 5),
                 .last_direct_visit_time = m_database.result_column<UnixDateTime>(statement_id, 6),
@@ -1043,6 +1066,7 @@ Optional<HistoryEntry> HistoryStore::PersistedStorage::entry_for_url(String cons
                 .decayed_direct_score = m_database.result_column<double>(statement_id, 8),
                 .score_updated_at = m_database.result_column<UnixDateTime>(statement_id, 9),
             };
+            return {};
         },
         url);
 
@@ -1059,16 +1083,20 @@ Vector<HistoryEntry> HistoryStore::PersistedStorage::autocomplete_entries(String
 
     auto outcome = m_database.execute_interruptible_statement(
         m_statements.search_entries,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
             auto title = m_database.result_column<String>(statement_id, 1);
-            auto favicon = m_database.result_column<String>(statement_id, 4);
+            auto visit_count = m_database.result_column<i64>(statement_id, 2);
+            auto favicon_png = m_database.result_column<ByteBuffer>(statement_id, 4);
+            auto direct_visit_count = m_database.result_column<i64>(statement_id, 5);
+            if (visit_count < 0 || direct_visit_count < 0)
+                return {};
 
             entries.append(HistoryEntry {
                 .url = m_database.result_column<String>(statement_id, 0),
                 .title = title.is_empty() ? Optional<String> {} : Optional<String> { move(title) },
-                .favicon_base64_png = favicon.is_empty() ? Optional<String> {} : Optional<String> { move(favicon) },
-                .visit_count = m_database.result_column<u64>(statement_id, 2),
-                .direct_visit_count = m_database.result_column<u64>(statement_id, 5),
+                .favicon_png = favicon_png.is_empty() ? OptionalNone {} : Optional<ByteBuffer> { move(favicon_png) },
+                .visit_count = visit_count,
+                .direct_visit_count = direct_visit_count,
                 .last_visited_time = m_database.result_column<UnixDateTime>(statement_id, 3),
                 .last_qualifying_visit_time = m_database.result_column<UnixDateTime>(statement_id, 6),
                 .last_direct_visit_time = m_database.result_column<UnixDateTime>(statement_id, 7),
@@ -1076,6 +1104,7 @@ Vector<HistoryEntry> HistoryStore::PersistedStorage::autocomplete_entries(String
                 .decayed_direct_score = m_database.result_column<double>(statement_id, 9),
                 .score_updated_at = m_database.result_column<UnixDateTime>(statement_id, 10),
             });
+            return {};
         },
         url_query_string,
         url_contains_query_string,
@@ -1097,16 +1126,20 @@ Vector<HistoryEntry> HistoryStore::PersistedStorage::list_entries(StringView tit
 
     m_database.execute_statement(
         m_statements.list_entries,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
             auto title = m_database.result_column<String>(statement_id, 1);
-            auto favicon = m_database.result_column<String>(statement_id, 4);
+            auto visit_count = m_database.result_column<i64>(statement_id, 2);
+            auto favicon_png = m_database.result_column<ByteBuffer>(statement_id, 4);
+            auto direct_visit_count = m_database.result_column<i64>(statement_id, 5);
+            if (visit_count < 0 || direct_visit_count < 0)
+                return {};
 
             entries.append(HistoryEntry {
                 .url = m_database.result_column<String>(statement_id, 0),
                 .title = title.is_empty() ? Optional<String> {} : Optional<String> { move(title) },
-                .favicon_base64_png = favicon.is_empty() ? Optional<String> {} : Optional<String> { move(favicon) },
-                .visit_count = m_database.result_column<u64>(statement_id, 2),
-                .direct_visit_count = m_database.result_column<u64>(statement_id, 5),
+                .favicon_png = favicon_png.is_empty() ? OptionalNone {} : Optional<ByteBuffer> { move(favicon_png) },
+                .visit_count = visit_count,
+                .direct_visit_count = direct_visit_count,
                 .last_visited_time = m_database.result_column<UnixDateTime>(statement_id, 3),
                 .last_qualifying_visit_time = m_database.result_column<UnixDateTime>(statement_id, 6),
                 .last_direct_visit_time = m_database.result_column<UnixDateTime>(statement_id, 7),
@@ -1114,6 +1147,7 @@ Vector<HistoryEntry> HistoryStore::PersistedStorage::list_entries(StringView tit
                 .decayed_direct_score = m_database.result_column<double>(statement_id, 9),
                 .score_updated_at = m_database.result_column<UnixDateTime>(statement_id, 10),
             });
+            return {};
         },
         title_query_string,
         url_query_string,
@@ -1121,6 +1155,19 @@ Vector<HistoryEntry> HistoryStore::PersistedStorage::list_entries(StringView tit
         static_cast<i64>(offset));
 
     return entries;
+}
+
+Vector<String> HistoryStore::PersistedStorage::referenced_favicon_hashes()
+{
+    Vector<String> hashes;
+    m_database.execute_statement(
+        m_statements.referenced_favicon_hashes,
+        [&](auto statement_id) -> ErrorOr<void> {
+            if (auto hash = m_database.result_column<String>(statement_id, 0); !hash.is_empty())
+                hashes.append(move(hash));
+            return {};
+        });
+    return hashes;
 }
 
 void HistoryStore::PersistedStorage::record_omnibox_engagement(OmniboxEngagement const& engagement, UnixDateTime used_at)
@@ -1147,15 +1194,21 @@ Vector<StoredOmniboxEngagement> HistoryStore::PersistedStorage::omnibox_engageme
     Vector<StoredOmniboxEngagement> results;
     auto outcome = m_database.execute_interruptible_statement(
         m_statements.search_omnibox_engagements,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
+            auto explicit_use_count = m_database.result_column<i64>(statement_id, 3);
+            auto default_use_count = m_database.result_column<i64>(statement_id, 4);
+            if (explicit_use_count < 0 || default_use_count < 0)
+                return {};
+
             results.append({
                 .normalized_input = m_database.result_column<String>(statement_id, 0),
                 .destination_kind = static_cast<OmniboxDestinationKind>(m_database.result_column<u8>(statement_id, 1)),
                 .destination = m_database.result_column<String>(statement_id, 2),
-                .explicit_use_count = m_database.result_column<u64>(statement_id, 3),
-                .default_use_count = m_database.result_column<u64>(statement_id, 4),
+                .explicit_use_count = explicit_use_count,
+                .default_use_count = default_use_count,
                 .last_used_time = m_database.result_column<UnixDateTime>(statement_id, 5),
             });
+            return {};
         },
         MUST(String::from_utf8(normalized_url_input)),
         MUST(String::from_utf8(normalized_search_input)),
@@ -1178,10 +1231,11 @@ void HistoryStore::PersistedStorage::remove_entries_for_same_site(StringView sit
 
     m_database.execute_statement(
         m_statements.all_urls,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
             auto url = m_database.result_column<String>(statement_id, 0);
             if (history_entry_matches_site_key(url.bytes_as_string_view(), site_key))
                 urls_to_remove.append(move(url));
+            return {};
         });
 
     for (auto const& url : urls_to_remove)

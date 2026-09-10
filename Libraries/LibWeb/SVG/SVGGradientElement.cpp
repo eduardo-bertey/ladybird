@@ -5,9 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/Painting/PaintStyle.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/FragmentIdentifier.h>
 #include <LibWeb/SVG/SVGGradientElement.h>
@@ -25,11 +23,11 @@ void SVGGradientElement::attribute_changed(Utf16FlyString const& name, Optional<
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == AttributeNames::gradientUnits) {
-        m_gradient_units = AttributeParser::parse_units(value.value_or({}));
+        m_gradient_units = parse_units(value.value_or({}));
     } else if (name == AttributeNames::spreadMethod) {
-        m_spread_method = AttributeParser::parse_spread_method(value.value_or({}));
+        m_spread_method = parse_spread_method(value.value_or({}));
     } else if (name == AttributeNames::gradientTransform) {
-        if (auto transform_list = AttributeParser::parse_transform(value.value_or({})); transform_list.has_value()) {
+        if (auto transform_list = parse_transform(value.value_or({})); transform_list.has_value()) {
             m_gradient_transform = transform_from_transform_list(*transform_list);
         } else {
             m_gradient_transform = {};
@@ -69,7 +67,9 @@ SpreadMethod SVGGradientElement::spread_method_impl(GC::RootHashTable<SVGGradien
 
 Gfx::InterpolationColorSpace SVGGradientElement::color_space() const
 {
-    return CSS::to_interpolation_color_space(computed_values()->color_interpolation());
+    auto style = computed_style();
+    VERIFY(style);
+    return CSS::to_interpolation_color_space(style->color_interpolation());
 }
 
 Optional<Gfx::AffineTransform> SVGGradientElement::gradient_transform() const
@@ -88,19 +88,7 @@ Optional<Gfx::AffineTransform> SVGGradientElement::gradient_transform_impl(GC::R
 }
 
 // The gradient transform, appropriately scaled and combined with the paint transform.
-Gfx::AffineTransform SVGGradientElement::gradient_paint_transform(SVGPaintContext const& paint_context) const
-{
-    auto gradient_paint_transform = Gfx::AffineTransform {};
-    gradient_paint_transform.set_translation(-paint_context.paint_transform.map(paint_context.path_bounding_box).location())
-        .multiply(paint_context.paint_transform);
-
-    if (auto transform = gradient_transform(); transform.has_value())
-        gradient_paint_transform.multiply(transform.value());
-
-    return gradient_paint_transform;
-}
-
-void SVGGradientElement::add_color_stops(Painting::GradientPaintStyle& paint_style) const
+void SVGGradientElement::push_color_stops(void* sink) const
 {
     auto largest_offset = 0.0f;
     for_each_color_stop([&](auto& stop) {
@@ -116,8 +104,19 @@ void SVGGradientElement::add_color_stops(Painting::GradientPaintStyle& paint_sty
         stop_offset = AK::max(stop_offset, largest_offset);
         largest_offset = stop_offset;
 
-        paint_style.add_color_stop(stop_offset, stop.stop_color().with_opacity(stop.stop_opacity()));
+        Layout::RustFFI::layout_arena_paint_push_color_stop(sink, stop.stop_color().with_opacity(stop.stop_opacity()), stop_offset);
     });
+}
+
+Layout::RustFFI::FfiSvgGradientDescription SVGGradientElement::base_paint_server_description(Layout::RustFFI::FfiSvgGradientKind kind) const
+{
+    Layout::RustFFI::FfiSvgGradientDescription description {};
+    description.kind = kind;
+    description.units_are_object_bounding_box = gradient_units() == GradientUnits::ObjectBoundingBox;
+    description.spread_method = static_cast<Layout::RustFFI::FfiSvgGradientSpreadMethod>(to_underlying(spread_method()));
+    description.color_space = color_space();
+    description.gradient_transform = gradient_transform();
+    return description;
 }
 
 GC::Ptr<SVGGradientElement const> SVGGradientElement::linked_gradient(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const

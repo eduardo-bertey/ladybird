@@ -7,11 +7,11 @@
 #include <Compositor/ConnectionFromClient.h>
 #include <Compositor/Sandbox.h>
 #include <LibCore/ArgsParser.h>
+#include <LibCore/CrashHandler.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontDatabase.h>
-#include <LibGfx/Font/PathFontProvider.h>
 #include <LibGfx/SkiaBackendContext.h>
 #include <LibIPC/SingleServer.h>
 #include <LibMain/Main.h>
@@ -30,7 +30,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     bool disable_async_scrolling = false;
     bool disable_sandbox = false;
 
+    int crash_report_fd = -1;
     Core::ArgsParser args_parser;
+    args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
     args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
     args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
     args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
@@ -41,6 +43,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
     args_parser.parse(arguments);
 
+    if (crash_report_fd >= 0) {
+        if (auto result = Core::CrashHandler::initialize(crash_report_fd); result.is_error())
+            warnln("Could not install crash report handler: {}", result.error());
+    }
+
     if (wait_for_debugger)
         Core::Process::wait_for_debugger_and_break();
 
@@ -48,14 +55,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         Gfx::force_hinting_for_testing(Gfx::FontHintingStyle::Normal);
 
     WebView::platform_init();
-    auto& font_provider = static_cast<Gfx::PathFontProvider&>(Gfx::FontDatabase::the().install_system_font_provider(make<Gfx::PathFontProvider>()));
-    if (force_fontconfig) {
-        font_provider.set_name_but_fixme_should_create_custom_system_font_provider("FontConfig"_string);
+    if (force_fontconfig)
         Gfx::FontDatabase::the().set_force_freetype_rasterization(true);
-    }
-    for (auto const& path : TRY(Gfx::FontDatabase::font_directories()))
-        font_provider.load_all_fonts_from_uri(TRY(String::formatted("file://{}", path)));
-    font_provider.load_all_fonts_from_uri("resource://fonts"sv);
 
     if (!force_cpu_painting)
         Gfx::SkiaBackendContext::initialize_gpu_backend();

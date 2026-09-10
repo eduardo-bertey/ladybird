@@ -209,6 +209,8 @@ pub struct LocalVariable {
     pub name: Utf16String,
     pub is_lexically_declared: bool,
     pub is_initialized_during_declaration_instantiation: bool,
+    pub is_mutable: bool,
+    pub scope_range: Option<crate::ast::SourceRange>,
 }
 
 /// The bytecode generator.
@@ -280,6 +282,7 @@ pub struct Generator {
     pub this_value_needs_environment_resolution: bool,
     pub enclosing_function_kind: FunctionKind,
     pub local_variables: Vec<LocalVariable>,
+    pub argument_variable_names: Vec<Utf16String>,
     pub initialized_locals: Vec<bool>,
     pub initialized_arguments: Vec<bool>,
 
@@ -318,6 +321,7 @@ pub struct Generator {
     // --- Unwind context ---
     // When set, newly created basic blocks inherit this handler index.
     pub current_unwind_handler: Option<Label>,
+    pub catch_handler_labels: HashSet<u32>,
 
     // --- AnnexB function names ---
     // Names approved for AnnexB.3.3 hoisting by the scope collector.
@@ -444,6 +448,7 @@ impl Generator {
             this_value_needs_environment_resolution: true,
             enclosing_function_kind: FunctionKind::Normal,
             local_variables: Vec::new(),
+            argument_variable_names: Vec::new(),
             initialized_locals: Vec::new(),
             initialized_arguments: Vec::new(),
             pending_lhs_name: None,
@@ -477,6 +482,7 @@ impl Generator {
             class_blueprints: Vec::new(),
             length_identifier: None,
             current_unwind_handler: None,
+            catch_handler_labels: HashSet::new(),
             annexb_function_names: HashSet::new(),
             builtin_abstract_operations_enabled: false,
             vm_ptr: std::ptr::null_mut(),
@@ -1665,27 +1671,27 @@ impl Generator {
     /// 4. Encode to bytes and build source map + exception handlers
     pub fn assemble(&mut self) -> AssembledBytecode {
         let saved_environment = Operand::register(Register::SAVED_LEXICAL_ENVIRONMENT);
-        let synthetic_load_block = self.basic_blocks.iter().position(|block| {
+        let synthetic_load = self.basic_blocks.iter().enumerate().find_map(|(block_index, block)| {
+            let (instruction_index, (instruction, _, _)) = block
+                .instructions
+                .iter()
+                .enumerate()
+                .find(|(_, (instruction, _, _))| !matches!(instruction, Instruction::Enter))?;
             matches!(
-                block.instructions.first(),
-                Some((
-                    Instruction::GetLexicalEnvironment {
-                        dst,
-                    },
-                    _,
-                    _
-                )) if *dst == saved_environment
+                instruction,
+                Instruction::GetLexicalEnvironment { dst } if *dst == saved_environment
             )
+            .then_some((block_index, instruction_index))
         });
 
-        if let Some(load_block_index) = synthetic_load_block {
+        if let Some((load_block_index, load_instruction_index)) = synthetic_load {
             let saved_environment_is_used = self.basic_blocks.iter().enumerate().any(|(block_index, block)| {
                 block
                     .instructions
                     .iter()
                     .enumerate()
                     .any(|(instruction_index, (instruction, _, _))| {
-                        if block_index == load_block_index && instruction_index == 0 {
+                        if block_index == load_block_index && instruction_index == load_instruction_index {
                             return false;
                         }
                         let mut instruction = instruction.clone();
@@ -1700,7 +1706,9 @@ impl Generator {
             });
 
             if !saved_environment_is_used {
-                self.basic_blocks[load_block_index].instructions.remove(0);
+                self.basic_blocks[load_block_index]
+                    .instructions
+                    .remove(load_instruction_index);
             }
         }
 
@@ -1721,29 +1729,7 @@ impl Generator {
         for block in &mut self.basic_blocks {
             remove_redundant_movs(&mut block.instructions);
 
-            let mut index = 0;
-            while index < block.instructions.len() {
-                let instructions = block.instructions[index..]
-                    .iter()
-                    .map(|(instruction, _, _)| instruction);
-                let Some((specialized, component_count)) =
-                    specialize_instruction_sequence(instructions, &self.constants)
-                else {
-                    index += 1;
-                    continue;
-                };
-                let strict = block.instructions[index].2;
-                if block.instructions[index..index + component_count]
-                    .iter()
-                    .any(|(_, _, component_strict)| *component_strict != strict)
-                {
-                    index += 1;
-                    continue;
-                }
-                block.instructions[index].0 = specialized;
-                block.instructions.drain(index + 1..index + component_count);
-                index += 1;
-            }
+            specialize_instructions(&mut block.instructions, &self.constants);
         }
 
         let number_of_registers = self.next_register;
@@ -2021,6 +2007,7 @@ impl Generator {
                     start_offset: u32_from_usize(block_start),
                     end_offset: u32_from_usize(bytecode.len()),
                     handler_offset: u32_from_usize(block_offsets[handler_label.basic_block_index()]),
+                    catches_exception: self.catch_handler_labels.contains(&handler_label.0),
                 });
             }
         }
@@ -2031,6 +2018,7 @@ impl Generator {
             if let Some(last) = merged_handlers.last_mut()
                 && last.end_offset == handler.start_offset
                 && last.handler_offset == handler.handler_offset
+                && last.catches_exception == handler.catches_exception
             {
                 last.end_offset = handler.end_offset;
                 continue;
@@ -2069,6 +2057,7 @@ pub struct ExceptionHandler {
     pub start_offset: u32,
     pub end_offset: u32,
     pub handler_offset: u32,
+    pub catches_exception: bool,
 }
 
 /// A typed constant value stored in the constant pool.
@@ -2126,6 +2115,32 @@ pub fn choose_dst(generator: &mut Generator, preferred_dst: Option<&ScopedOperan
         Some(dst) => dst.clone(),
         None => generator.allocate_register(),
     }
+}
+
+fn specialize_instructions(instructions: &mut Vec<(Instruction, SourceMapEntry, bool)>, constants: &[ConstantValue]) {
+    let mut read_index = 0;
+    let mut write_index = 0;
+    while read_index < instructions.len() {
+        let mut consumed = 1;
+        if let Some((specialized, component_count)) = specialize_instruction_sequence(
+            instructions[read_index..].iter().map(|(instruction, _, _)| instruction),
+            constants,
+        ) {
+            let strict = instructions[read_index].2;
+            if instructions[read_index..read_index + component_count]
+                .iter()
+                .all(|(_, _, component_strict)| *component_strict == strict)
+            {
+                instructions[read_index].0 = specialized;
+                consumed = component_count;
+            }
+        }
+        // Compact once instead of shifting the entire tail after each fused sequence.
+        instructions.swap(write_index, read_index);
+        write_index += 1;
+        read_index += consumed;
+    }
+    instructions.truncate(write_index);
 }
 
 fn remove_redundant_movs(instructions: &mut Vec<(Instruction, SourceMapEntry, bool)>) {
@@ -2187,6 +2202,67 @@ mod tests {
 
     fn register(index: u32) -> Operand {
         Operand::register(Register(index))
+    }
+
+    #[test]
+    fn compacts_fused_sequences_with_their_original_source_locations() {
+        let mut instructions: Vec<_> = (0..3000)
+            .map(|index| {
+                let mut instruction = mov(register(index), Operand::constant(0));
+                instruction.1.line = index;
+                instruction
+            })
+            .collect();
+        specialize_instructions(&mut instructions, &[ConstantValue::Undefined]);
+        assert_eq!(instructions.len(), 1000);
+        for (index, (instruction, source, strict)) in instructions.iter().enumerate() {
+            assert!(matches!(instruction, Instruction::MovUndefined3 { .. }));
+            assert_eq!(source.line, index as u32 * 3);
+            assert!(!strict);
+        }
+    }
+
+    #[test]
+    fn preserves_strict_mode_boundaries_when_compacting_fused_sequences() {
+        let mut instructions: Vec<_> = (0..7)
+            .map(|index| {
+                let mut instruction = mov(register(index), Operand::constant(0));
+                instruction.1.line = index;
+                instruction.2 = index >= 3;
+                instruction
+            })
+            .collect();
+        specialize_instructions(&mut instructions, &[ConstantValue::Undefined]);
+        assert_eq!(instructions.len(), 3);
+        assert!(matches!(instructions[0].0, Instruction::MovUndefined3 { .. }));
+        assert!(matches!(instructions[1].0, Instruction::MovUndefined3 { .. }));
+        assert!(matches!(instructions[2].0, Instruction::MovSrcUndefined { .. }));
+        assert_eq!(
+            instructions
+                .iter()
+                .map(|(_, source, strict)| (source.line, *strict))
+                .collect::<Vec<_>>(),
+            vec![(0, false), (3, true), (6, true)]
+        );
+    }
+
+    #[test]
+    fn does_not_fuse_a_sequence_that_crosses_strict_mode_boundaries() {
+        let mut instructions = vec![
+            mov(register(0), Operand::constant(0)),
+            mov(register(1), Operand::constant(0)),
+            mov(register(2), Operand::constant(0)),
+        ];
+        instructions[1].2 = true;
+        specialize_instructions(&mut instructions, &[ConstantValue::Undefined]);
+        assert_eq!(instructions.len(), 3);
+        assert!(matches!(instructions[0].0, Instruction::Mov { .. }));
+        assert!(matches!(instructions[1].0, Instruction::Mov { .. }));
+        assert!(matches!(instructions[2].0, Instruction::MovSrcUndefined { .. }));
+        assert_eq!(
+            instructions.iter().map(|(_, _, strict)| *strict).collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
     }
 
     #[test]

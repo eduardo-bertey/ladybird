@@ -7,7 +7,6 @@ on:
 env:
   LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
   CCACHE_DIR: ${{ github.workspace }}/.ccache
-  VCPKG_ROOT: ${{ github.workspace }}/Build/vcpkg
 
 jobs:
   web-benchmarks:
@@ -22,7 +21,7 @@ jobs:
         os_name: ['Linux']
         arch: ['x86_64']
         runner_labels: ['["ubuntu-24.04-internal", "web-benchmarks", "self-hosted"]']
-        container: [&ci_container '{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.07.29"}']
+        container: ['{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.08.28"}']
 
         include:
           - os_name: 'macOS'
@@ -67,6 +66,7 @@ jobs:
           os: ${{ matrix.os_name }}
           arch: ${{ matrix.arch }}
           toolchain: 'Clang'
+          build_preset: 'Distribution'
 
       - name: 'Restore Caches'
         uses: ./.github/actions/cache-restore
@@ -102,9 +102,7 @@ jobs:
 
       - name: 'Build'
         working-directory: ${{ github.workspace }}/Build
-        run: |
-          cmake --build .
-          cmake --install . --strip --prefix "${GITHUB_WORKSPACE}/Install"
+        run: cmake --build . --target ladybird
 
       - name: 'Save Caches'
         uses: ./.github/actions/cache-save
@@ -124,9 +122,9 @@ jobs:
           python3 -m pip install -r requirements.txt
 
           if [ "${{ matrix.os_name }}" = "macOS" ]; then
-            executable="${GITHUB_WORKSPACE}/Install/bundle/Ladybird.app/Contents/MacOS/Ladybird"
+            executable="${GITHUB_WORKSPACE}/Build/bin/Ladybird.app/Contents/MacOS/Ladybird"
           else
-            executable="${GITHUB_WORKSPACE}/Install/bin/Ladybird"
+            executable="${GITHUB_WORKSPACE}/Build/bin/Ladybird"
           fi
 
           ./run.py --iterations=5 --executable="${executable}"

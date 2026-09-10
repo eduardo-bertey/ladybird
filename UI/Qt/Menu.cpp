@@ -217,8 +217,8 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_B));
         break;
     case WebView::ActionID::BookmarkItem:
-        if (auto icon = action.base64_png_icon(); icon.has_value())
-            qaction.setIcon(icon_from_base64_png(*icon, MENU_ICON_SIZE));
+        if (auto icon = action.png_icon(); icon.has_value())
+            qaction.setIcon(icon_from_png(icon->bytes(), MENU_ICON_SIZE));
         else
             qaction.setIcon(create_chrome_icon(ChromeIcon::Globe, palette));
         break;
@@ -319,12 +319,12 @@ static QAction* create_session_history_traversal_menu_action(QMenu& menu, WebCon
 
     auto* action = new QAction(qstring_from_ak_string(item.title), &menu);
     action->setToolTip(qstring_from_ak_string(item.url));
-    if (item.favicon_base64_png.has_value())
-        action->setIcon(icon_from_base64_png(*item.favicon_base64_png, MENU_ICON_SIZE));
+    if (item.favicon_png.has_value())
+        action->setIcon(icon_from_png(item.favicon_png->bytes(), MENU_ICON_SIZE));
     else
         action->setIcon(create_chrome_icon(ChromeIcon::Globe, menu.palette()));
-    QObject::connect(action, &QAction::triggered, &view, [&view, delta = item.delta] {
-        (void)view.traverse_the_history_by_delta(delta);
+    QObject::connect(action, &QAction::triggered, &view, [&view, step = item.step] {
+        view.traverse_the_history_to_step(step);
     });
     return action;
 }
@@ -391,15 +391,15 @@ static QAction* create_recent_history_menu_action(QMenu& menu, WebContentView& v
     auto title = entry.title.has_value() && !entry.title->is_empty() ? *entry.title : entry.url;
     auto* action = new QAction(qstring_from_ak_string(title), &menu);
     action->setToolTip(qstring_from_ak_string(entry.url));
-    if (entry.favicon_base64_png.has_value())
-        action->setIcon(icon_from_base64_png(*entry.favicon_base64_png, MENU_ICON_SIZE));
+    if (entry.favicon_png.has_value())
+        action->setIcon(icon_from_png(entry.favicon_png->bytes(), MENU_ICON_SIZE));
     else
         action->setIcon(create_chrome_icon(ChromeIcon::Globe, menu.palette()));
 
     auto url = URL::Parser::basic_parse(entry.url);
     if (url.has_value()) {
         QObject::connect(action, &QAction::triggered, &view, [&view, url = url.release_value()] {
-            view.load(url);
+            view.load_from_user_input(url);
         });
     } else {
         action->setEnabled(false);

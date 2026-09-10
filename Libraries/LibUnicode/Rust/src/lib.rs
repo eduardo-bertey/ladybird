@@ -5,8 +5,12 @@
  */
 
 #[cfg(feature = "allocator")]
+/// cbindgen:ignore
 #[path = "../../../RustAllocator.rs"]
 mod rust_allocator;
+
+#[path = "../../../RustPanic.rs"]
+mod rust_panic;
 
 pub mod calendar;
 pub mod character_types;

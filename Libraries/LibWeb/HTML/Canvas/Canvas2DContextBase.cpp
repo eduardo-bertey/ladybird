@@ -24,6 +24,7 @@
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/ValueInlines.h>
 #include <LibWeb/Bindings/DOMRectReadOnly.h>
+#include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/FilterStyleValue.h>
@@ -46,10 +47,12 @@
 #include <LibWeb/HTML/Path2D.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/TextMetrics.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Layout/ImageProvider.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/Canvas2DCommandStream.h>
+#include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/SVG/SVGImageElement.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
@@ -84,6 +87,8 @@ void Canvas2DContextBase::visit_edges(Cell::Visitor& visitor)
 size_t Canvas2DContextBase::external_memory_size() const
 {
     auto size = Base::external_memory_size();
+    if (m_cached_readback)
+        size = JS::saturating_add_external_memory_size(size, m_cached_readback->size_in_bytes());
     if (!has_backing_storage())
         return size;
 
@@ -267,6 +272,7 @@ WebIDL::ExceptionOr<void> Canvas2DContextBase::draw_image_internal(CanvasImageSo
 
 void Canvas2DContextBase::did_draw(Gfx::FloatRect const&)
 {
+    m_cached_readback = nullptr;
     // FIXME: Make use of the rect to reduce the invalidated area when possible.
     did_draw_hook();
 }
@@ -310,8 +316,19 @@ RefPtr<Gfx::Bitmap> Canvas2DContextBase::read_pixels(Gfx::IntRect const& rect)
 {
     if (!has_backing_storage())
         return nullptr;
+
+    // OPTIMIZATION: A remote readback requires a synchronous compositor IPC.
+    // Reuse the snapshot while no drawing command has changed its pixels.
+    if (m_cached_readback && m_cached_readback_rect == rect)
+        return m_cached_readback;
+
     m_transport->flush_shared_stream();
-    return m_transport->read_back_pixels(rect);
+    auto pixels = m_transport->read_back_pixels(rect);
+    if (pixels) {
+        m_cached_readback = pixels;
+        m_cached_readback_rect = rect;
+    }
+    return pixels;
 }
 
 void Canvas2DContextBase::set_size(Gfx::IntSize const& size)
@@ -341,6 +358,7 @@ void Canvas2DContextBase::notify_backing_storage_lost()
 {
     if (!has_backing_storage())
         return;
+    m_cached_readback = nullptr;
 
     // When the user agent detects that the backing storage associated with a canvas context has been lost, then it
     // must queue a global task on the DOM manipulation task source given canvas's relevant global object to run
@@ -396,6 +414,7 @@ void Canvas2DContextBase::ensure_backing_storage()
 
 void Canvas2DContextBase::discard_backing_storage()
 {
+    m_cached_readback = nullptr;
     if (m_transport) {
         // Flush the shared stream before destroying the context: it may still
         // hold commands targeting this canvas, and DrawCanvas commands from
@@ -608,14 +627,15 @@ void Canvas2DContextBase::stroke(Path2D const& path)
     stroke_internal(path.path().clone());
 }
 
-static Gfx::WindingRule parse_fill_rule(Utf16FlyString const& fill_rule)
+static constexpr Gfx::WindingRule bindings_to_gfx_fill_rule(Bindings::CanvasFillRule fill_rule)
 {
-    if (fill_rule == u"evenodd"sv)
-        return Gfx::WindingRule::EvenOdd;
-    if (fill_rule == u"nonzero"sv)
+    switch (fill_rule) {
+    case Bindings::CanvasFillRule::Nonzero:
         return Gfx::WindingRule::Nonzero;
-    dbgln("Unrecognized fillRule for CRC2D.fill() - this problem goes away once we pass an enum instead of a string");
-    return Gfx::WindingRule::Nonzero;
+    case Bindings::CanvasFillRule::Evenodd:
+        return Gfx::WindingRule::EvenOdd;
+    }
+    VERIFY_NOT_REACHED();
 }
 
 void Canvas2DContextBase::fill_internal(Gfx::Path path, Gfx::WindingRule winding_rule)
@@ -644,14 +664,14 @@ void Canvas2DContextBase::fill_internal(Gfx::Path path, Gfx::WindingRule winding
     did_draw(bounding_box);
 }
 
-void Canvas2DContextBase::fill(Utf16FlyString const& fill_rule)
+void Canvas2DContextBase::fill(Bindings::CanvasFillRule fill_rule)
 {
-    fill_internal(path().clone(), parse_fill_rule(fill_rule));
+    fill_internal(path().clone(), bindings_to_gfx_fill_rule(fill_rule));
 }
 
-void Canvas2DContextBase::fill(Path2D& path, Utf16FlyString const& fill_rule)
+void Canvas2DContextBase::fill(Path2D& path, Bindings::CanvasFillRule fill_rule)
 {
-    fill_internal(path.path().clone(), parse_fill_rule(fill_rule));
+    fill_internal(path.path().clone(), bindings_to_gfx_fill_rule(fill_rule));
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-createimagedata
@@ -951,7 +971,20 @@ RefPtr<Gfx::FontCascadeList const> Canvas2DContextBase::font_cascade_list()
         set_font(u"10px sans-serif"sv);
     }
 
-    // Get current loaded font
+    auto* document = canvas_element().visit(
+        [](GC::Ref<HTMLCanvasElement> canvas) -> DOM::Document* { return &canvas->document(); },
+        [](GC::Ref<OffscreenCanvas> canvas) -> DOM::Document* {
+            if (auto* window = window_from_global_object(canvas->relevant_global_object()))
+                return &window->associated_document();
+            return nullptr;
+        });
+    // NB: Drawing states, including saved states, retain their cascades across font loads and font-display
+    //     transitions. Refresh them lazily so cached invisible fallback glyphs and metrics cannot outlive
+    //     the font environment that selected them.
+    if (document && drawing_state().font_environment_generation != document->font_computer().environment_generation()) {
+        auto font = drawing_state().font_style_value->to_utf16_string(CSS::SerializationMode::ResolvedValue);
+        set_font(font);
+    }
     return drawing_state().current_font_cascade_list;
 }
 
@@ -1027,22 +1060,22 @@ void Canvas2DContextBase::clip_internal(Gfx::Path& path, Gfx::WindingRule windin
     canvas_command_list->append(Gfx::CanvasCommands::ClipPath { .path = path.clone(), .winding_rule = winding_rule });
 }
 
-void Canvas2DContextBase::clip(Utf16FlyString const& fill_rule)
+void Canvas2DContextBase::clip(Bindings::CanvasFillRule fill_rule)
 {
-    clip_internal(path(), parse_fill_rule(fill_rule));
+    clip_internal(path(), bindings_to_gfx_fill_rule(fill_rule));
 }
 
-void Canvas2DContextBase::clip(Path2D& path, Utf16FlyString const& fill_rule)
+void Canvas2DContextBase::clip(Path2D& path, Bindings::CanvasFillRule fill_rule)
 {
-    clip_internal(path.path(), parse_fill_rule(fill_rule));
+    clip_internal(path.path(), bindings_to_gfx_fill_rule(fill_rule));
 }
 
-static bool is_point_in_path_internal(Gfx::Path path, Gfx::AffineTransform const& transform, double x, double y, Utf16FlyString const& fill_rule)
+static bool is_point_in_path_internal(Gfx::Path path, Gfx::AffineTransform const& transform, double x, double y, Bindings::CanvasFillRule fill_rule)
 {
     auto point = Gfx::FloatPoint(x, y);
     if (auto inverse_transform = transform.inverse(); inverse_transform.has_value())
         point = inverse_transform->map(point);
-    return path.contains(point, parse_fill_rule(fill_rule));
+    return path.contains(point, bindings_to_gfx_fill_rule(fill_rule));
 }
 
 static bool image_provider_is_usable_for_canvas(Layout::ImageProvider const& image_provider)
@@ -1056,12 +1089,12 @@ static bool image_provider_is_usable_for_canvas(Layout::ImageProvider const& ima
         && *intrinsic_width > 0 && *intrinsic_height > 0;
 }
 
-bool Canvas2DContextBase::is_point_in_path(double x, double y, Utf16FlyString const& fill_rule)
+bool Canvas2DContextBase::is_point_in_path(double x, double y, Bindings::CanvasFillRule fill_rule)
 {
     return is_point_in_path_internal(path(), drawing_state().transform, x, y, fill_rule);
 }
 
-bool Canvas2DContextBase::is_point_in_path(Path2D const& path, double x, double y, Utf16FlyString const& fill_rule)
+bool Canvas2DContextBase::is_point_in_path(Path2D const& path, double x, double y, Bindings::CanvasFillRule fill_rule)
 {
     return is_point_in_path_internal(path.path(), drawing_state().transform, x, y, fill_rule);
 }
@@ -1425,18 +1458,19 @@ void Canvas2DContextBase::set_filter(Utf16View filter)
         return;
     }
 
-    auto parser = CSS::Parser::Parser::create(CSS::Parser::ParsingParams { CSS::Parser::SpecialContext::CanvasContextGenericValue }, filter);
+    CSS::Parser::Parser parser { CSS::Parser::ParsingParams { CSS::Parser::SpecialContext::CanvasContextGenericValue } };
 
     // 2. Let parsedValue be the result of parsing the given values as a <filter-value-list>.
     //    If any property-independent style sheet syntax like 'inherit' or 'initial' is present,
     //    then this parsing must return failure.
-    auto style_value = parser.parse_as_css_value(CSS::PropertyID::Filter);
+    auto style_value = parser.parse_as_css_value(filter, CSS::PropertyID::Filter);
 
     if (style_value && style_value->is_value_list()) {
         auto absolutized_style_value = style_value->absolutized(computation_context_for_drawing_state());
         auto filter_value_list = absolutized_style_value->as_value_list().values();
 
         // 4. Set this's current filter to the given value.
+        Vector<Layout::RustFFI::FfiFilterFunction> functions;
         for (auto& item : filter_value_list) {
             if (item->is_url()) {
                 // FIXME: Resolve the SVG filter
@@ -1445,57 +1479,41 @@ void Canvas2DContextBase::set_filter(Utf16View filter)
             }
 
             auto const& filter_value = item->as_filter();
+            Layout::RustFFI::FfiFilterFunction function {};
             switch (filter_value.kind()) {
             case CSS::FilterStyleValue::Kind::Blur: {
                 auto const& blur_filter = static_cast<CSS::BlurFilterStyleValue const&>(filter_value);
-                float radius = blur_filter.resolved_radius();
-                auto new_filter = Gfx::Filter::blur(radius, radius);
-
-                drawing_state().filter = drawing_state().filter.has_value()
-                    ? Gfx::Filter::compose(new_filter, *drawing_state().filter)
-                    : new_filter;
+                function.kind = Layout::RustFFI::FfiFilterFunctionKind::Blur;
+                function.amount = blur_filter.resolved_radius();
                 break;
             }
             case CSS::FilterStyleValue::Kind::Color: {
                 auto const& color = static_cast<CSS::ColorFilterStyleValue const&>(filter_value);
-                float amount = color.resolved_amount();
-                auto new_filter = Gfx::Filter::color(color.operation(), amount);
-
-                drawing_state().filter = drawing_state().filter.has_value()
-                    ? Gfx::Filter::compose(new_filter, *drawing_state().filter)
-                    : new_filter;
+                function.kind = Layout::RustFFI::FfiFilterFunctionKind::Color;
+                function.color_operation = color.operation();
+                function.amount = color.resolved_amount();
                 break;
             }
             case CSS::FilterStyleValue::Kind::HueRotate: {
                 auto const& hue_rotate = static_cast<CSS::HueRotateFilterStyleValue const&>(filter_value);
-                float angle = hue_rotate.angle_degrees();
-                auto new_filter = Gfx::Filter::hue_rotate(angle);
-
-                drawing_state().filter = drawing_state().filter.has_value()
-                    ? Gfx::Filter::compose(new_filter, *drawing_state().filter)
-                    : new_filter;
+                function.kind = Layout::RustFFI::FfiFilterFunctionKind::HueRotate;
+                function.amount = hue_rotate.angle_degrees();
                 break;
             }
             case CSS::FilterStyleValue::Kind::DropShadow: {
                 auto const& drop_shadow = static_cast<CSS::DropShadowFilterStyleValue const&>(filter_value);
-                float offset_x = static_cast<float>(CSS::Length::from_style_value(drop_shadow.offset_x(), {}).absolute_length_to_px());
-                float offset_y = static_cast<float>(CSS::Length::from_style_value(drop_shadow.offset_y(), {}).absolute_length_to_px());
-
-                float radius = 0.0f;
-                if (drop_shadow.radius()) {
-                    radius = static_cast<float>(CSS::Length::from_style_value(*drop_shadow.radius(), {}).absolute_length_to_px());
-                };
-
-                auto color = resolve_drop_shadow_color(drop_shadow);
-                auto new_filter = Gfx::Filter::drop_shadow(offset_x, offset_y, radius, color);
-
-                drawing_state().filter = drawing_state().filter.has_value()
-                    ? Gfx::Filter::compose(new_filter, *drawing_state().filter)
-                    : new_filter;
+                function.kind = Layout::RustFFI::FfiFilterFunctionKind::DropShadow;
+                function.offset_x = static_cast<float>(CSS::Length::from_style_value(drop_shadow.offset_x(), {}).absolute_length_to_px());
+                function.offset_y = static_cast<float>(CSS::Length::from_style_value(drop_shadow.offset_y(), {}).absolute_length_to_px());
+                if (drop_shadow.radius())
+                    function.amount = static_cast<float>(CSS::Length::from_style_value(*drop_shadow.radius(), {}).absolute_length_to_px());
+                function.color = resolve_drop_shadow_color(drop_shadow);
                 break;
             }
             }
+            functions.append(function);
         }
+        drawing_state().filter = Painting::filter_from_functions(functions);
 
         drawing_state().filter_string = Utf16String::from_utf16(filter);
     }

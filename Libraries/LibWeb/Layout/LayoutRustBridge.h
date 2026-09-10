@@ -6,16 +6,19 @@
 
 #pragma once
 
+#include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Variant.h>
+#include <AK/Vector.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/PercentageOr.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
 #include <LibWeb/Layout/TreeBuilderRustFFI.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 
 namespace Web::CSS {
 
@@ -33,25 +36,15 @@ public:
     ~LayoutRustBridge();
 
     void run_root_layout(Box& viewport, CSSPixels viewport_inline_size, CSSPixels viewport_block_size, bool should_collect_devtools_layout_data);
-    void compute_subtree_layout(Box&, Painting::Paintable& paintable_to_replace);
-    void replay_saved_abspos_layout(Box&, Painting::Paintable& paintable_to_replace);
+    void compute_subtree_layout(Box&);
+    void replay_saved_abspos_layout(Box&);
 
 private:
     [[nodiscard]] RustFFI::FfiLayoutFcCallbacks formatting_context_callbacks();
     [[nodiscard]] RustFFI::FfiCommitSink commit_sink();
 
-    struct LineCommitContext;
     Box const* m_commit_root { nullptr };
-    OwnPtr<LineCommitContext> m_line_commit_context;
-    RefPtr<Painting::Paintable> m_replaced_paintable;
-    RefPtr<Painting::Paintable> m_commit_parent_paintable;
-    RefPtr<Painting::Paintable> m_commit_insert_before_paintable;
 };
-
-[[nodiscard]] Optional<RustFFI::FfiFormattingContextType> formatting_context_type_created_by_box(Box const&);
-[[nodiscard]] StringView formatting_context_type_name(RustFFI::FfiFormattingContextType);
-[[nodiscard]] bool box_inset_properties_contain_anchor_functions(Box const&);
-[[nodiscard]] bool can_replay_saved_abspos_layout_inputs_after_style_change(Box const&);
 
 // True while a synchronous Rust layout pass (including its commit) is on the
 // stack. Computed values must never be replaced in that window: the pass
@@ -59,12 +52,21 @@ private:
 // invalidate under it.
 [[nodiscard]] WEB_API bool layout_pass_currently_running();
 
+inline RustFFI::FfiSvgNumberPercentage to_ffi_number_percentage(SVG::NumberPercentage value)
+{
+    return { .value = value.value(), .is_percentage = value.is_percentage() };
 }
 
-// Per-code-point classification lookups for the Rust text chunker. The
+}
+
+// Per-code-point classification lookups for native text processing. The
 // line-break-class groupings implement the css-text-4 word-break policies.
 extern "C" WEB_API u8 ladybird_layout_text_type_for_code_point(u32);
 extern "C" WEB_API bool ladybird_layout_code_point_has_break_all_line_break_class(u32);
 extern "C" WEB_API bool ladybird_layout_code_point_has_keep_all_line_break_class(u32);
 extern "C" WEB_API bool ladybird_layout_code_point_has_combining_mark_line_break_class(u32);
 extern "C" WEB_API bool ladybird_layout_code_point_has_emoji_property(u32);
+extern "C" WEB_API Web::Layout::RustFFI::FfiCodePointCategoryFacts ladybird_layout_code_point_category_facts(u32);
+
+extern "C" WEB_API void ladybird_layout_node_shell_destroy(void*);
+extern "C" WEB_API void ladybird_layout_node_rebind_dom_node(void* dom_node, void* shell);

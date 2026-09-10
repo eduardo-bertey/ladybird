@@ -22,8 +22,8 @@ extern "C" {
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/ImageData.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/HTML/UniversalGlobalScope.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebGL/EventNames.h>
 #include <LibWeb/WebGL/Extensions/ANGLEInstancedArrays.h>
@@ -136,7 +136,7 @@ Optional<Vector<Utf16String>> WebGLRenderingContextBase::get_supported_extension
         bool supported = !available_extension_info.only_for_webgl_version.has_value()
             || context().webgl_version() == available_extension_info.only_for_webgl_version;
 
-        if (!available_extension_info.factory && !available_extension_info.creates_empty_object && !HTML::UniversalGlobalScopeMixin::expose_experimental_interfaces()) {
+        if (!available_extension_info.factory && !available_extension_info.creates_empty_object && !HTML::WindowOrWorkerGlobalScopeMixin::expose_experimental_interfaces()) {
             supported = false;
         }
 
@@ -230,6 +230,15 @@ bool WebGLRenderingContextBase::extension_enabled(StringView extension) const
 ReadonlySpan<WebIDL::UnsignedLong> WebGLRenderingContextBase::enabled_compressed_texture_formats() const
 {
     return m_enabled_compressed_texture_formats;
+}
+
+ErrorOr<ReadonlyBytes> WebGLRenderingContextBase::texture_data_for_2d_upload(ReadonlyBytes bytes, GLsizei width, GLsizei height, GLenum format, GLenum type) const
+{
+    if (!is_valid_2d_pixel_unpack_state(width, m_unpack_state))
+        return Error::from_errno(EINVAL);
+    if (auto size = required_2d_texture_data_size(width, height, format, type, m_unpack_state); size.has_value() && *size <= bytes.size())
+        return bytes.slice(0, *size);
+    return bytes;
 }
 
 Optional<WebGLRenderingContextBase::TexImageSourceFrame> WebGLRenderingContextBase::read_texture_image_source(TexImageSource const& source, WebIDL::UnsignedLong format, WebIDL::UnsignedLong type)
@@ -375,6 +384,7 @@ void WebGLRenderingContextBase::restore_context_after_compositor_reconnect()
 void WebGLRenderingContextBase::reset_context_state_after_loss()
 {
     ++m_context_generation;
+    m_unpack_state = {};
     m_unpack_flip_y = false;
     m_unpack_premultiply_alpha = false;
     m_unpack_colorspace_conversion = BROWSER_DEFAULT_WEBGL;

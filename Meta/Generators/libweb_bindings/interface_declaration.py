@@ -26,7 +26,6 @@ from Generators.libweb_bindings.overload_resolution import operation_callback_na
 from Generators.libweb_bindings.wrappers import interface_needs_wrapper
 from Generators.libweb_bindings.wrappers import wrapper_base_class_name
 from Generators.libweb_bindings.wrappers import wrapper_class_name
-from Generators.libweb_bindings.wrappers import wrapper_needs_wrappable_impl
 from Utils.webidl_parser import Interface
 
 
@@ -116,15 +115,6 @@ public:
     void initialize_location_object(JS::Realm&);
 """
             )
-        if wrapper_needs_wrappable_impl(context, interface):
-            out.write(
-                """protected:
-    virtual Wrappable* wrappable_impl() override;
-    virtual Wrappable const* wrappable_impl() const override;
-
-public:
-"""
-            )
         if interface.name == "DOMException":
             out.write(
                 """    virtual JS::ErrorData* error_data() override;
@@ -141,6 +131,7 @@ public:
     virtual JS::ThrowCompletionOr<bool> internal_is_extensible() const override;
     virtual JS::ThrowCompletionOr<bool> internal_prevent_extensions() override;
     virtual JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> internal_get_own_property(JS::PropertyKey const&) const override;
+    virtual bool is_cacheable_for_property_absence() const override { return false; }
     virtual JS::ThrowCompletionOr<bool> internal_define_own_property(JS::PropertyKey const&, JS::PropertyDescriptor&, Optional<JS::PropertyDescriptor>* precomputed_get_own_property = nullptr) override;
     virtual JS::ThrowCompletionOr<JS::Value> internal_get(JS::PropertyKey const&, JS::Value receiver, JS::CacheableGetPropertyMetadata*, PropertyLookupPhase) const override;
     virtual JS::ThrowCompletionOr<bool> internal_set(JS::PropertyKey const&, JS::Value, JS::Value receiver, JS::CacheableSetPropertyMetadata*, PropertyLookupPhase) override;
@@ -155,19 +146,15 @@ public:
         out.write(f"    {impl_type}& impl();\n")
         out.write(f"    {impl_type} const& impl() const;\n")
 
-        if wrapper_needs_wrappable_impl(context, interface) or interface_has_cross_origin_property_descriptor_map(
-            interface
-        ):
-            out.write("\nprotected:\n")
+        if interface_has_cross_origin_property_descriptor_map(interface):
             out.write("    virtual void visit_edges(JS::Cell::Visitor&) override;\n")
 
-        out.write("\nprivate:\n")
-        if wrapper_needs_wrappable_impl(context, interface):
-            out.write(f"    GC::Ref<{impl_type}> m_impl;\n")
-        if interface_is_location_object(interface):
-            out.write("\n    Vector<JS::Value> m_default_properties;\n")
-        if interface_has_cross_origin_property_descriptor_map(interface):
-            out.write("    HTML::CrossOriginPropertyDescriptorMap m_cross_origin_property_descriptor_map;\n")
+        if interface_is_location_object(interface) or interface_has_cross_origin_property_descriptor_map(interface):
+            out.write("\nprivate:\n")
+            if interface_is_location_object(interface):
+                out.write("    Vector<JS::Value> m_default_properties;\n")
+            if interface_has_cross_origin_property_descriptor_map(interface):
+                out.write("    HTML::CrossOriginPropertyDescriptorMap m_cross_origin_property_descriptor_map;\n")
         out.write("};\n\n")
 
     out.write(

@@ -11,11 +11,18 @@
 #include <Compositor/CompositorControlClientEndpoint.h>
 #include <Compositor/CompositorControlServerEndpoint.h>
 #include <Compositor/CompositorState.h>
+#include <Compositor/FontClient.h>
 #include <Compositor/Forward.h>
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListResourceStorage.h>
+
+namespace Gfx {
+
+class SharedFontProvider;
+
+}
 
 namespace Compositor {
 
@@ -36,14 +43,18 @@ private:
     virtual void did_present_frame(Web::Compositor::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id) override;
 
     virtual Messages::CompositorControlServer::InitTransportResponse init_transport(int peer_pid) override;
+    virtual void set_font_service_transport(IPC::TransportHandle) override;
+    virtual void set_font_catalog(IPC::File, u64 size, u64 generation) override;
     virtual Messages::CompositorControlServer::ConnectWebContentResponse connect_web_content() override;
     virtual void create_context(Web::Compositor::CompositorContextId, Optional<u64> page_id, i32 web_content_connection_id) override;
     virtual void viewport_size_updated(Web::Compositor::CompositorContextId, Gfx::IntSize, Web::Compositor::WindowResizingInProgress) override;
+    virtual void set_paused_debugger_overlay(Web::Compositor::CompositorContextId, bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<u8> hovered_action) override;
     virtual void set_display_metadata(Web::Compositor::CompositorContextId, Optional<u64>, double) override;
+    virtual void set_context_visibility(Web::Compositor::CompositorContextId, Web::Compositor::ContextVisibility) override;
     virtual Messages::CompositorControlServer::HandleMouseEventResponse handle_mouse_event(Web::Compositor::CompositorContextId, Web::MouseEvent) override;
     virtual Messages::CompositorControlServer::DispatchMouseEventToWebContentResponse dispatch_mouse_event_to_web_content(Web::Compositor::CompositorContextId, Web::MouseEvent) override;
     virtual Messages::CompositorControlServer::HandlePinchEventResponse handle_pinch_event(Web::Compositor::CompositorContextId, Web::PinchEvent) override;
-    virtual Messages::CompositorControlServer::AsyncScrollByResponse async_scroll_by(Web::Compositor::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels) override;
+    virtual Messages::CompositorControlServer::AsyncScrollByResponse async_scroll_by(Web::Compositor::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels, Web::Compositor::SnapContainerHandling) override;
     virtual void presented_bitmap_ready_to_paint(Web::Compositor::CompositorContextId, i32 bitmap_id) override;
     virtual void set_client_gpu_presentation_capability(bool supported, u64 adapter_luid) override;
     virtual void crash() override;
@@ -52,6 +63,8 @@ private:
 
     HashMap<i32, NonnullRefPtr<ConnectionFromWebContent>> m_web_content_connections;
     NonnullRefPtr<CompositorState> m_compositor_state;
+    Gfx::SharedFontProvider* m_font_provider { nullptr };
+    RefPtr<FontClient> m_font_client;
 };
 
 }

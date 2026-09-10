@@ -4,30 +4,37 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Atomic.h>
 #include <AK/Bitmap.h>
 #include <AK/QuickSort.h>
-#include <AK/Utf16StringBuilder.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Iterator.h>
 #include <LibWeb/Animations/Animation.h>
+#include <LibWeb/Animations/AnimationTimeline.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Animations/PseudoElementParsing.h>
 #include <LibWeb/Bindings/KeyframeEffect.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
+#include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/Slot.h>
+#include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::Animations {
 
 GC_DEFINE_ALLOCATOR(KeyframeEffect);
+
+static Atomic<u64> s_next_animation_preparation_identity { 1 };
 
 template<typename T>
 WebIDL::ExceptionOr<Variant<T, Vector<T>>> convert_value_to_maybe_list(JS::Realm& realm, JS::Value value, Function<WebIDL::ExceptionOr<T>(JS::Value)>& value_converter)
@@ -168,6 +175,8 @@ static WebIDL::ExceptionOr<KeyframeType<AL>> process_a_keyframe_like_object(JS::
             animation_properties.append(name);
         } else if (name == "float"sv || name == "offset"sv) {
             // Ignore these property names
+        } else if (CSS::is_a_custom_property_name_string(name)) {
+            animation_properties.append(name);
         } else if (auto property = CSS::property_id_from_camel_case_string(name); property.has_value()) {
             if (CSS::is_animatable_property(property.value()))
                 animation_properties.append(name);
@@ -539,27 +548,29 @@ static WebIDL::ExceptionOr<Vector<BaseKeyframe>> process_a_keyframes_argument(JS
         //    highlight
         BaseKeyframe::ParsedProperties parsed_properties;
         for (auto& [property_string, value_string] : keyframe.unparsed_properties()) {
-            Optional<CSS::PropertyID> property_id;
+            Optional<CSS::PropertyNameAndID> property;
 
             // Handle some special cases
             if (property_string == "cssFloat"sv) {
-                property_id = CSS::PropertyID::Float;
+                property = CSS::PropertyNameAndID::from_id(CSS::PropertyID::Float);
             } else if (property_string == "cssOffset"sv) {
                 // FIXME: Support CSS offset property
             } else if (property_string == "float"sv || property_string == "offset"sv) {
                 // Ignore these properties
-            } else if (auto property = CSS::property_id_from_camel_case_string(property_string); property.has_value()) {
-                property_id = *property;
+            } else if (CSS::is_a_custom_property_name_string(property_string)) {
+                property = CSS::PropertyNameAndID::from_name(property_string);
+            } else if (auto property_id = CSS::property_id_from_camel_case_string(property_string); property_id.has_value()) {
+                property = CSS::PropertyNameAndID::from_id(*property_id);
             }
 
-            if (!property_id.has_value())
+            if (!property.has_value())
                 continue;
 
-            if (auto style_value = parse_css_value(CSS::Parser::ParsingParams(), value_string, *property_id)) {
+            if (auto style_value = parse_css_value(CSS::Parser::ParsingParams(), value_string, property->id())) {
                 // Handle 'initial' here so we don't have to get the default value of the property every frame in StyleComputer
-                if (style_value->is_initial())
-                    style_value = CSS::property_initial_value(*property_id);
-                parsed_properties.set(*property_id, *style_value);
+                if (style_value->is_initial() && !property->is_custom_property())
+                    style_value = CSS::property_initial_value(property->id());
+                parsed_properties.set(*property, CSS::RustStyleValueHandle::retained(style_value->rust_style_value_data()));
             }
         }
         keyframe.properties.set(move(parsed_properties));
@@ -595,7 +606,7 @@ WebIDL::ExceptionOr<Vector<BaseKeyframe>> process_keyframes(JS::Realm& realm, GC
 }
 
 // https://www.w3.org/TR/css-animations-2/#keyframe-processing
-void KeyframeEffect::generate_initial_and_final_frames(RefPtr<KeyFrameSet> keyframe_set, HashTable<CSS::PropertyID> const& animated_properties)
+void KeyframeEffect::generate_initial_and_final_frames(RefPtr<KeyFrameSet> keyframe_set, HashTable<CSS::PropertyNameAndID> const& animated_properties)
 {
     // 1. Find or create the initial keyframe, a keyframe with a keyframe offset of 0%, default timing function
     //    as its keyframe timing function, and default composite as its keyframe composite.
@@ -607,13 +618,13 @@ void KeyframeEffect::generate_initial_and_final_frames(RefPtr<KeyFrameSet> keyfr
         initial_keyframe = keyframe_set->keyframes_by_key.find(0);
     }
 
-    auto expanded_properties = [&](HashMap<CSS::PropertyID, Variant<KeyFrameSet::UseInitial, NonnullRefPtr<CSS::StyleValue const>>>& properties) {
-        HashTable<CSS::PropertyID> result;
+    auto expanded_properties = [&](HashMap<CSS::PropertyNameAndID, Variant<KeyFrameSet::UseInitial, CSS::RustStyleValueHandle>>& properties) {
+        HashTable<CSS::PropertyNameAndID> result;
 
         for (auto property : properties) {
-            if (property_is_shorthand(property.key)) {
-                for (auto longhand : expanded_longhands_for_shorthand(property.key))
-                    result.set(longhand);
+            if (!property.key.is_custom_property() && property_is_shorthand(property.key.id())) {
+                for (auto longhand : expanded_longhands_for_shorthand(property.key.id()))
+                    result.set(CSS::PropertyNameAndID::from_id(longhand));
             } else {
                 result.set(property.key);
             }
@@ -841,6 +852,7 @@ void KeyframeEffect::set_target(GC::Ptr<DOM::Element> target)
     }
     m_target_element = target;
 
+    invalidate_animation_preparation();
     invalidate_effect();
     // FIXME: We don't remove the animated style from the old target element as part of normal animated style update and
     //        it will remain "stuck" until it's style is fully invalidated for some other reason.
@@ -850,9 +862,7 @@ Optional<Utf16String> KeyframeEffect::pseudo_element() const
 {
     if (!m_target_pseudo_selector.has_value())
         return {};
-    Utf16StringBuilder builder;
-    m_target_pseudo_selector->serialize_to(builder);
-    return builder.to_string();
+    return m_target_pseudo_selector->serialize();
 }
 
 // https://drafts.csswg.org/web-animations-1/#dom-keyframeeffect-pseudoelement
@@ -863,6 +873,7 @@ WebIDL::ExceptionOr<void> KeyframeEffect::set_pseudo_element(Optional<Utf16Strin
     // NOTE: The actual definition is in pseudo_element_parsing().
     m_target_pseudo_selector = TRY(pseudo_element_parsing(value));
 
+    invalidate_animation_preparation();
     invalidate_effect();
     // FIXME: We don't remove the animated style from the old target element as part of normal animated style update and
     //        it will remain "stuck" until it's style is fully invalidated for some other reason.
@@ -898,6 +909,24 @@ Optional<CSS::PseudoElement> KeyframeEffect::pseudo_element_type() const
 void KeyframeEffect::set_composite(Bindings::CompositeOperation value)
 {
     m_composite = value;
+    invalidate_animation_preparation();
+    invalidate_effect();
+}
+
+void KeyframeEffect::set_key_frame_set(RefPtr<KeyFrameSet const> key_frame_set)
+{
+    if (m_key_frame_set == key_frame_set)
+        return;
+
+    m_target_properties.clear();
+    if (key_frame_set) {
+        for (auto const& keyframe : key_frame_set->keyframes_by_key) {
+            for (auto const& property : keyframe.properties)
+                m_target_properties.set(property.key);
+        }
+    }
+    m_key_frame_set = move(key_frame_set);
+    invalidate_animation_preparation();
     invalidate_effect();
 }
 
@@ -937,9 +966,12 @@ WebIDL::ExceptionOr<GC::RootVector<GC::Ref<JS::Object>>> KeyframeEffect::get_key
                 TRY(object->set(vm.names.composite, JS::PrimitiveString::create(vm, "auto"sv), JS::Object::ShouldThrowExceptions::Yes));
             }
 
-            for (auto const& [id, value] : keyframe.parsed_properties()) {
-                auto key = CSS::camel_case_string_from_property_id(id);
-                auto value_string = JS::PrimitiveString::create(vm, value->to_utf16_string(CSS::SerializationMode::Normal));
+            for (auto const& [property, value] : keyframe.parsed_properties()) {
+                auto key = property.is_custom_property() ? property.name() : CSS::camel_case_string_from_property_id(property.id());
+                // Serialization can still fall back to C++, which needs the typed facade; reflection is cold, so
+                // wrap on demand.
+                auto style_value = CSS::StyleValue::adopt_rust_style_value_data(CSS::StyleValueFFI::rust_style_value_retain(value.data()));
+                auto value_string = JS::PrimitiveString::create(vm, style_value->to_utf16_string(CSS::SerializationMode::Normal));
                 TRY(object->set(JS::PropertyKey { move(key), JS::PropertyKey::StringMayBeNumber::No }, value_string, JS::Object::ShouldThrowExceptions::Yes));
             }
 
@@ -982,11 +1014,17 @@ void KeyframeEffect::set_keyframes(Vector<BaseKeyframe> keyframes)
 
         auto key = static_cast<u64>(keyframe.computed_offset.value() * 100 * AnimationKeyFrameKeyScaleFactor);
 
-        for (auto [property_id, property_value] : keyframe.parsed_properties()) {
-            resolved_keyframe.properties.set(property_id, property_value);
-            CSS::StyleComputer::for_each_property_expanding_shorthands(property_id, property_value, [&](CSS::PropertyID longhand_id, CSS::StyleValue const&) {
-                m_target_properties.set(longhand_id);
-            });
+        for (auto const& [property, property_value] : keyframe.parsed_properties()) {
+            resolved_keyframe.properties.set(property, property_value);
+            if (property.is_custom_property()) {
+                m_target_properties.set(property);
+                continue;
+            }
+            auto expansion = CSS::ComputedValuesFFI::rust_expand_property_shorthands(
+                to_underlying(property.id()), property_value.data());
+            for (size_t i = 0; i < expansion.count; ++i)
+                m_target_properties.set(CSS::PropertyNameAndID::from_id(static_cast<CSS::PropertyID>(expansion.properties[i].property_id)));
+            CSS::ComputedValuesFFI::rust_shorthand_expansion_destroy(expansion.storage);
         }
 
         keyframe_set->keyframes_by_key.insert(key, resolved_keyframe);
@@ -995,15 +1033,29 @@ void KeyframeEffect::set_keyframes(Vector<BaseKeyframe> keyframes)
     generate_initial_and_final_frames(keyframe_set, m_target_properties);
     m_key_frame_set = keyframe_set;
 
+    invalidate_animation_preparation();
     invalidate_effect();
 }
 
-KeyframeEffect::KeyframeEffect() = default;
+KeyframeEffect::KeyframeEffect()
+    : m_animation_preparation_identity(s_next_animation_preparation_identity.fetch_add(1, AK::MemoryOrder::memory_order_relaxed))
+{
+}
 
 void KeyframeEffect::invalidate_effect()
 {
+    m_compositor_opacity_keyframe_value_cache.clear();
+    m_compositor_background_color_keyframe_value_cache.clear();
+    m_compositor_filter_keyframe_value_cache.clear();
+    m_compositor_transform_keyframe_value_cache.clear();
+    m_is_compositor_driven = false;
+    m_is_compositor_replaced = false;
+    m_retained_compositor_animations.clear();
+    m_is_offscreen_throttled = false;
+    m_is_observation_relevant_compositor_animation = false;
+    m_can_skip_per_frame_style_update_cache.clear();
     if (m_target_element)
-        m_target_element->document().set_needs_animated_style_update();
+        m_target_element->document().set_needs_animated_style_update(*this);
 }
 
 void KeyframeEffect::visit_edges(GC::Cell::Visitor& visitor)
@@ -1013,18 +1065,164 @@ void KeyframeEffect::visit_edges(GC::Cell::Visitor& visitor)
     visitor.visit(m_keyframe_objects_cache);
 }
 
+bool KeyframeEffect::can_skip_per_frame_style_update() const
+{
+    if (m_is_compositor_driven || m_is_compositor_replaced)
+        return true;
+
+    auto target = this->target();
+    auto cache_result = [&](bool result) {
+        if (target && target->document().layout_is_up_to_date()) {
+            m_can_skip_per_frame_style_update_cache = CanSkipPerFrameStyleUpdateCache {
+                .target_style_generation = target->animation_style_generation(),
+                .target_subtree_style_generation = target->animation_subtree_style_generation(),
+                .target_is_connected = target->is_connected(),
+                .layout_node = target->unsafe_layout_node(),
+                .result = result,
+            };
+        }
+        return result;
+    };
+    if (target && target->document().layout_is_up_to_date()) {
+        auto const* layout_node = target->unsafe_layout_node();
+        if (m_can_skip_per_frame_style_update_cache.has_value()
+            && m_can_skip_per_frame_style_update_cache->target_style_generation == target->animation_style_generation()
+            && m_can_skip_per_frame_style_update_cache->target_subtree_style_generation == target->animation_subtree_style_generation()
+            && m_can_skip_per_frame_style_update_cache->target_is_connected == target->is_connected()
+            && m_can_skip_per_frame_style_update_cache->layout_node == layout_node) {
+            ++target->document().style_invalidation_counters().animation_style_skip_cache_hits;
+            return m_can_skip_per_frame_style_update_cache->result;
+        }
+        if (m_can_skip_per_frame_style_update_cache.has_value())
+            ++target->document().style_invalidation_counters().animation_style_skip_cache_misses;
+    }
+
+    // INTEROP: Other engines suppress main-thread style sampling for invisible transform animations. Restrict this
+    // optimization to the infinite transform-only case until animation overflow updates can also be throttled safely.
+    if (!isinf(iteration_count()) || pseudo_element_type().has_value())
+        return cache_result(false);
+
+    if (!target)
+        return false;
+    if (!target->is_connected())
+        return cache_result(true);
+    if (target->namespace_uri() == Namespace::SVG)
+        return cache_result(false);
+
+    bool has_animated_property = false;
+    auto const* key_frame_set = m_key_frame_set.ptr();
+    if (!key_frame_set)
+        return false;
+    for (auto const& keyframe : key_frame_set->keyframes_by_key) {
+        for (auto const& property : keyframe.properties) {
+            has_animated_property = true;
+            if (!first_is_one_of(property.key.id(),
+                    CSS::PropertyID::Transform,
+                    CSS::PropertyID::Translate,
+                    CSS::PropertyID::Rotate,
+                    CSS::PropertyID::Scale))
+                return cache_result(false);
+        }
+    }
+    if (!has_animated_property)
+        return cache_result(false);
+
+    if (m_is_offscreen_throttled)
+        return cache_result(true);
+
+    if (!target->document().layout_is_up_to_date())
+        return false;
+    auto const* layout_node = target->unsafe_layout_node();
+    if (!layout_node || layout_node->visibility() != CSS::Visibility::Hidden)
+        return cache_result(false);
+
+    bool has_visible_descendant = false;
+    layout_node->for_each_in_inclusive_subtree_of_type<Layout::NodeWithStyle>([&](auto const& descendant) {
+        if (descendant.visibility() != CSS::Visibility::Visible)
+            return TraversalDecision::Continue;
+        has_visible_descendant = true;
+        return TraversalDecision::Break;
+    });
+    if (has_visible_descendant)
+        return cache_result(false);
+
+    return cache_result(true);
+}
+
+void KeyframeEffect::request_observation_sample()
+{
+    if (m_needs_observation_sample)
+        return;
+    m_needs_observation_sample = true;
+    if (m_target_element)
+        m_target_element->document().set_needs_animated_style_update(*this);
+}
+
+bool KeyframeEffect::can_skip_per_frame_animation_tick() const
+{
+    if (auto animation = associated_animation(); animation && !animation->pending()
+        && animation->play_state() == Bindings::AnimationPlayState::Running
+        && animation->playback_rate() > 0
+        && animation->timeline() && animation->timeline()->is_monotonically_increasing()
+        && is_in_the_before_phase())
+        return true;
+
+    if (!m_is_compositor_driven && !m_is_compositor_replaced && !can_skip_per_frame_style_update())
+        return false;
+
+    // A compositor-handled one-iteration effect has a document timer that wakes the main thread at its active end.
+    if ((m_is_compositor_driven || m_is_compositor_replaced) && (!isinf(iteration_count()) || m_is_observation_relevant_compositor_animation))
+        return true;
+
+    // An infinite effect cannot reach its natural end, so animationend listeners do not require a continuous tick.
+    auto has_css_animation_event_listener_requiring_animation_tick = [](DOM::EventTarget const& event_target) {
+        return event_target.has_event_listener(HTML::EventNames::animationcancel)
+            || event_target.has_event_listener(HTML::EventNames::animationiteration)
+            || event_target.has_event_listener(HTML::EventNames::animationstart)
+            || event_target.has_event_listener(HTML::EventNames::webkitAnimationIteration)
+            || event_target.has_event_listener(HTML::EventNames::webkitAnimationStart);
+    };
+
+    auto target = this->target();
+    VERIFY(target);
+    for (auto* node = static_cast<DOM::Node*>(target.ptr()); node;) {
+        if (has_css_animation_event_listener_requiring_animation_tick(*node))
+            return false;
+        if (auto assigned_slot = DOM::assigned_slot_for_node(*node))
+            node = assigned_slot.ptr();
+        else
+            node = node->parent_or_shadow_host();
+    }
+    if (auto window = target->document().window(); window && has_css_animation_event_listener_requiring_animation_tick(*window))
+        return false;
+
+    return true;
+}
+
+static bool is_in_display_none_subtree_ignoring_animations(DOM::AbstractElement abstract_element)
+{
+    if (abstract_element.pseudo_element().has_value()) {
+        auto pseudo_style = abstract_element.computed_style();
+        if (pseudo_style && pseudo_style->base_values().display().is_none())
+            return true;
+    }
+    return abstract_element.element().has_inclusive_ancestor_with_display_none_ignoring_animations();
+}
+
 void KeyframeEffect::update_computed_properties(AnimationUpdateContext& context)
 {
     auto target = this->target();
     if (!target || !target->is_connected())
         return;
 
-    if (target->has_inclusive_ancestor_with_display_none_ignoring_animations()) {
-        // FIXME: Reaching this point means we failed to cancel animation for an element that started
-        //        being nested in "display: none".
-        //        For now this hack is needed to avoid lots of unnecessary work.
+    // An effect that animates `display` can be the very thing holding its `display: none` target visible, and
+    // the update being skipped is the one that applies or removes that override, so it must always run.
+    // NB: A descendant's retained style can still describe a display-none subtree while ancestor visibility
+    //     reactions are propagating, so inspect the current target and ancestor styles before skipping its update.
+    DOM::AbstractElement abstract_element { *target, pseudo_element_type() };
+    if (!target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Display))
+        && is_in_display_none_subtree_ignoring_animations(abstract_element))
         return;
-    }
 
     target->update_animated_properties({}, pseudo_element_type(), *this, context);
 }
@@ -1033,15 +1231,15 @@ void KeyframeEffect::update_computed_properties_for_style(AnimationUpdateContext
 {
     auto& style_computer = abstract_element.element().document().style_computer();
     auto& element_data = context.elements.ensure(abstract_element, [&abstract_element, &style_computer] {
-        auto computed_values = abstract_element.computed_values();
-        VERIFY(computed_values);
-        auto old_animated_properties = computed_values->animated_properties_snapshot();
-        auto computed_properties = style_computer.reconstruct_computed_properties(*computed_values);
-        computed_properties->reset_non_inherited_animated_properties({});
-        return AnimationUpdateContext::ElementData { move(old_animated_properties), move(computed_properties) };
+        auto style_record = abstract_element.style_record_identity();
+        if (!style_record)
+            return AnimationUpdateContext::ElementData {};
+        auto computed_properties = style_computer.reconstruct_computed_properties_for_animation(style_record);
+        return AnimationUpdateContext::ElementData { style_record, move(computed_properties) };
     });
 
-    VERIFY(element_data.target_style);
+    if (!element_data.target_style)
+        return;
     element_data.effects.append(*this);
 }
 

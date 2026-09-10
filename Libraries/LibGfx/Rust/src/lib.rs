@@ -5,10 +5,29 @@
  */
 
 #[cfg(feature = "allocator")]
+/// cbindgen:ignore
 #[path = "../../../RustAllocator.rs"]
 mod rust_allocator;
 
+#[path = "../../../RustPanic.rs"]
+mod rust_panic;
+
+pub mod bsp_tree;
+pub mod color;
+pub mod corner_radii;
+pub mod filter;
 pub mod font;
+pub mod font_catalog;
+pub mod geometry;
+pub mod image_frame;
+pub mod matrix;
+pub mod paint_enums;
 pub mod path;
 pub mod text_layout;
 pub mod yuv;
+
+pub use color::*;
+pub use corner_radii::*;
+pub use geometry::*;
+pub use matrix::*;
+pub use paint_enums::*;

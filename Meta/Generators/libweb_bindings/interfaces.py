@@ -28,11 +28,11 @@ from Generators.libweb_bindings.wrappers import interface_needs_wrapper
 from Generators.libweb_bindings.wrappers import needs_legacy_platform_object_flags_initialization
 from Generators.libweb_bindings.wrappers import wrapper_base_class_name
 from Generators.libweb_bindings.wrappers import wrapper_class_name
-from Generators.libweb_bindings.wrappers import wrapper_needs_wrappable_impl
 from Utils.webidl_parser import IDLType
 from Utils.webidl_parser import Interface
 
 GENERATED_GLOBAL_SCOPE_EXPOSURE_PREFIXES = {
+    "AudioWorkletGlobalScope": "AudioWorklet",
     "DedicatedWorkerGlobalScope": "DedicatedWorker",
     "SharedWorkerGlobalScope": "SharedWorker",
 }
@@ -87,6 +87,7 @@ def legacy_platform_object_flags_initialization(interface: Interface) -> str:
             "    m_legacy_platform_object_flags->has_legacy_override_built_ins_interface_extended_attribute = true;"
         )
     if "Global" in interface.extended_attributes:
+        lines.append("    set_global_object_flag();")
         lines.append("    m_legacy_platform_object_flags->has_global_interface_extended_attribute = true;")
 
     return "\n".join(lines)
@@ -122,8 +123,7 @@ def write_wrapper_implementation(
     else:
         out.write(
             f"""{wrapper_class}::{wrapper_class}(JS::Realm& realm, GC::Ref<{impl_type}> impl)
-    : {base_class}(realm{location_object_constructor_argument})
-    , m_impl(impl)
+    : {base_class}(realm, impl{location_object_constructor_argument})
 {{
 {legacy_platform_object_flags_initialization(interface)}
 }}
@@ -160,27 +160,12 @@ def write_wrapper_implementation(
         out.write(
             f"""{impl_type}& {wrapper_class}::impl()
 {{
-    return *m_impl;
+    return static_cast<{impl_type}&>(*wrappable_impl());
 }}
 
 {impl_type} const& {wrapper_class}::impl() const
 {{
-    return *m_impl;
-}}
-
-"""
-        )
-
-    if wrapper_needs_wrappable_impl(context, interface):
-        out.write(
-            f"""Wrappable* {wrapper_class}::wrappable_impl()
-{{
-    return &impl();
-}}
-
-Wrappable const* {wrapper_class}::wrappable_impl() const
-{{
-    return &impl();
+    return static_cast<{impl_type} const&>(*wrappable_impl());
 }}
 
 """
@@ -257,18 +242,13 @@ JS::ErrorData const* {wrapper_class}::error_data() const
 
 """
         )
-    if not interface.parent_name or interface.name == "Window":
+    if interface.name in ("Location", "Window"):
         out.write(
             f"""void {wrapper_class}::visit_edges(JS::Cell::Visitor& visitor)
 {{
     Base::visit_edges(visitor);
 """
         )
-        if not interface.parent_name:
-            out.write(
-                """    visitor.visit(m_impl);
-"""
-            )
         if interface.name == "Location":
             out.write(
                 """    visitor.visit(m_default_properties);
@@ -350,7 +330,6 @@ def write_implementation(
     includes.add("LibJS/Runtime/ValueInlines.h")
     includes.add("LibWeb/Bindings/Intrinsics.h")
     includes.add("LibWeb/WebIDL/Types.h")
-    includes.add("LibWeb/WebIDL/Tracing.h")
     includes.add_binding(interface.implemented_name)
     if interface_needs_wrapper(interface):
         includes.add("AK/StdLibExtras.h")
@@ -383,13 +362,15 @@ def write_implementation(
     if interface.name in GENERATED_GLOBAL_SCOPE_EXPOSURE_PREFIXES:
         exposure_prefix = GENERATED_GLOBAL_SCOPE_EXPOSURE_PREFIXES[interface.name]
         add_exposed_interfaces_function = {
+            "AudioWorklet": "add_audio_worklet_exposed_interfaces",
             "DedicatedWorker": "add_dedicated_worker_exposed_interfaces",
             "SharedWorker": "add_shared_worker_exposed_interfaces",
         }[exposure_prefix]
+        implementation_namespace = fully_qualified_name_for_interface(interface).rsplit("::", 1)[0]
         out.write(
             f"""}} // namespace Web::Bindings
 
-namespace Web::HTML {{
+namespace Web::{implementation_namespace} {{
 
 void {interface.name}::initialize_web_interfaces_impl()
 {{
@@ -404,7 +385,7 @@ void {interface.name}::initialize_web_interfaces_impl()
     Base::initialize_web_interfaces_impl();
 }}
 
-}} // namespace Web::HTML
+}} // namespace Web::{implementation_namespace}
 
 namespace Web::Bindings {{
 """
@@ -442,7 +423,6 @@ namespace Web::Bindings {{
 
 JS::ThrowCompletionOr<GC::Ref<JS::Object>> {interface.constructor_class}::construct([[maybe_unused]] InterfaceConstructor& constructor, [[maybe_unused]] JS::FunctionObject& new_target)
 {{
-    WebIDL::log_trace(constructor.vm(), "{interface.constructor_class}::construct");
 """
     )
     if interface.constructors:

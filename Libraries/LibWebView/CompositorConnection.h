@@ -44,22 +44,24 @@ public:
     void stop_presenting_to_client(Web::Compositor::CompositorContextId);
     void destroy_context(Web::Compositor::CompositorContextId);
     void update_display_list(Web::Compositor::CompositorContextId, NonnullRefPtr<Web::Painting::DisplayList> const&, Web::Painting::AccumulatedVisualContextTree const&, Web::Painting::DisplayListResourceTransaction, Web::Painting::ScrollStateSnapshot const&);
-    void update_visual_context_tree(Web::Compositor::CompositorContextId, Web::Painting::AccumulatedVisualContextTree const&);
+    void update_visual_context_tree(Web::Compositor::CompositorContextId, Web::Painting::AccumulatedVisualContextTree const&, Web::Painting::DisplayListResourceTransaction);
     void update_scroll_state(Web::Compositor::CompositorContextId, Web::Painting::ScrollStateSnapshot const&);
     void add_video_sink(Media::VideoSinkHandle);
     void remove_video_sink(Media::VideoSinkHandle);
-    void set_video_update_flags(Media::VideoSinkHandle, Web::Compositor::VideoUpdateFlags);
+    void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick);
     Optional<Web::Painting::CanvasId> create_canvas_2d_context(Gfx::IntSize, bool alpha);
     void update_canvas_2d_stream(Web::Painting::Canvas2DCommandStream&);
     void destroy_canvas_context(Web::Painting::CanvasId);
     Gfx::ShareableBitmap get_canvas_pixels(Web::Painting::CanvasId, Gfx::IntRect);
     void invalidate_wheel_event_listener_state(Web::Compositor::CompositorContextId, u64 generation);
-    Web::Compositor::AsyncScrollEnqueueResult async_scroll_by(Web::Compositor::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::AsyncScrollOperationTracking);
-    Web::Compositor::AsyncScrollEnqueueResult smooth_scroll_to(Web::Compositor::CompositorContextId, Web::Compositor::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel);
+    Web::Compositor::AsyncScrollEnqueueResult async_scroll_by(Web::Compositor::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::SnapContainerHandling, Web::Compositor::AsyncScrollOperationTracking);
+    Web::Compositor::AsyncScrollEnqueueResult smooth_scroll_to(Web::Compositor::CompositorContextId, Web::Compositor::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel, Web::Compositor::ScrollAnimationKind);
     void cancel_smooth_scroll(Web::Compositor::CompositorContextId, Web::Compositor::AsyncScrollNodeStableID);
-    Web::Compositor::PendingAsyncScrollUpdates take_pending_async_scroll_updates(Web::Compositor::CompositorContextId);
+    Web::Compositor::PendingAsyncScrollUpdates take_pending_async_scroll_updates(Web::Compositor::CompositorContextId, Web::Compositor::AsyncScrollUpdateFreshness);
     void viewport_size_updated(Web::Compositor::CompositorContextId, Gfx::IntSize, Web::Compositor::WindowResizingInProgress);
-    void present_frame(Web::Compositor::CompositorContextId, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect);
+    bool request_rendering_opportunity(Web::Compositor::CompositorContextId, double maximum_frames_per_second);
+    void hurry_rendering_opportunity(Web::Compositor::CompositorContextId);
+    void present_frame(Web::Compositor::CompositorContextId, Gfx::IntRect viewport_rect);
     void request_screenshot(Web::Compositor::CompositorContextId, NonnullRefPtr<Gfx::PaintingSurface>, Function<void()>&&);
 
     Optional<Web::Painting::CanvasId> create_webgl_context(Web::WebGL::WebGLVersion, Gfx::IntSize, bool depth, bool stencil, bool antialias, Vector<String>& out_supported_extensions);
@@ -88,14 +90,20 @@ private:
 
     virtual void mouse_event(u64 page_id, Web::MouseEvent) override;
     virtual void request_rendering_update() override;
+    virtual void rendering_opportunity(Web::Compositor::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds) override;
+    virtual void async_scroll_updates(Web::Compositor::CompositorContextId, Web::Compositor::PendingAsyncScrollUpdates) override;
     virtual void did_complete_screenshot(Web::Compositor::ScreenshotRequestId) override;
     virtual void did_fail_screenshot(Web::Compositor::ScreenshotRequestId) override;
     virtual void did_lose_compositor() override;
 
     bool can_send_message_to_compositor() const;
+    void merge_async_scroll_updates(Web::Compositor::CompositorContextId, Web::Compositor::PendingAsyncScrollUpdates);
+    bool post_image_frame_resources_in_batches(Web::Compositor::CompositorContextId, Vector<Web::Painting::DisplayListImageFrameResource>);
     Optional<PendingScreenshot> take_screenshot(Web::Compositor::ScreenshotRequestId);
 
     HashMap<Web::Compositor::ScreenshotRequestId, PendingScreenshot> m_screenshots;
+    // What the compositor process scrolled since the last rendering update adopted it, per context.
+    HashMap<Web::Compositor::CompositorContextId, Web::Compositor::PendingAsyncScrollUpdates> m_pending_async_scroll_updates;
     u64 m_next_screenshot_request_id { 1 };
     bool m_has_lost_compositor { false };
     RefPtr<Media::VideoPresentationServerConnection> m_video_presentation_channel;

@@ -5,6 +5,7 @@
  */
 
 #include <LibGC/Heap.h>
+#include <LibGC/Weak.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibRequests/Request.h>
 #include <LibWeb/Fetch/Fetching/PendingResponse.h>
@@ -39,6 +40,12 @@ void FetchController::visit_edges(JS::Cell::Visitor& visitor)
 void FetchController::set_pending_request(RefPtr<Requests::Request> const& request)
 {
     m_pending_request = request;
+    m_has_started_request |= !!request;
+    if (request && m_fetch_params && m_fetch_params->request()->destination() == Request::Destination::Font) {
+        request->on_requires_network = GC::weak_callback(*this, [](auto& controller) {
+            controller.m_requires_network = true;
+        });
+    }
 }
 
 void FetchController::set_report_timing_steps(Function<void(JS::Object&)> report_timing_steps)
@@ -79,6 +86,13 @@ GC::Ref<FetchTimingInfo> FetchController::extract_full_timing_info() const
 
     // 2. Return this’s full timing info.
     return *m_full_timing_info;
+}
+
+GC::Ptr<FetchTimingInfo> FetchController::timing_info() const
+{
+    if (!m_fetch_params)
+        return nullptr;
+    return m_fetch_params->timing_info();
 }
 
 // https://fetch.spec.whatwg.org/#fetch-controller-abort

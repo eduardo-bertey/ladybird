@@ -2,11 +2,13 @@ set(TEST_SOURCES
     BenchmarkJPEGLoader.cpp
     TestBitmapExport.cpp
     TestColor.cpp
+    TestFontCatalog.cpp
     TestFont.cpp
     TestImageDecoder.cpp
     TestImageWriter.cpp
     TestQuad.cpp
     TestRect.cpp
+    TestSharedFontProvider.cpp
     TestWOFF.cpp
     TestWOFF2.cpp
 )
@@ -18,7 +20,16 @@ endforeach()
 target_link_libraries(BenchmarkJPEGLoader PRIVATE LibImageDecoders)
 target_link_libraries(TestImageDecoder PRIVATE LibImageDecoders)
 target_link_libraries(TestImageWriter PRIVATE LibImageDecoders)
+target_link_libraries(TestFont PRIVATE harfbuzz LibIPC)
+target_link_libraries(TestSharedFontProvider PRIVATE LibIPC)
+target_compile_definitions(TestSharedFontProvider PRIVATE LADYBIRD_SOURCE_DIR="${LADYBIRD_SOURCE_DIR}")
 
 ladybird_test(TestBitmapSequence.cpp LibGfx LIBS LibGfx LibIPC)
 ladybird_test(TestShareableBitmap.cpp LibGfx LIBS LibGfx LibIPC)
+ladybird_test(TestFilter.cpp LibGfx LIBS LibGfx skia)
 ladybird_test(TestYUVData.cpp LibGfx LIBS LibGfx skia)
+
+if (APPLE)
+    ladybird_test(TestVideoSurfaceImage.mm LibGfx LIBS LibGfx skia)
+    target_link_libraries(TestVideoSurfaceImage PRIVATE "-framework CoreVideo")
+endif()

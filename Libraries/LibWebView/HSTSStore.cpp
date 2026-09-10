@@ -18,14 +18,19 @@ static constexpr u32 HSTS_SCHEMA_BASELINE_VERSION = 1u;
 
 ErrorOr<Database::MigrationOutcome> HSTSStore::migrate_schema(Database::Database& database, Database::MigrationMode mode)
 {
-    Array<Database::Migration, 1> migrations { {
-        { .version = HSTS_SCHEMA_BASELINE_VERSION, .sql = "CREATE TABLE IF NOT EXISTS HSTSPolicies ("
-                                                          "    domain TEXT PRIMARY KEY,"
-                                                          "    expiry_time INTEGER NOT NULL,"
-                                                          "    include_sub_domains BOOLEAN NOT NULL,"
-                                                          "    last_observed_time INTEGER NOT NULL"
-                                                          ");"sv },
-    } };
+    auto migrations = to_array<Database::Migration>({
+        {
+            .version = HSTS_SCHEMA_BASELINE_VERSION,
+            .sql = R"#(
+                CREATE TABLE IF NOT EXISTS HSTSPolicies (
+                    domain TEXT PRIMARY KEY,
+                    expiry_time INTEGER NOT NULL,
+                    include_sub_domains BOOLEAN NOT NULL,
+                    last_observed_time INTEGER NOT NULL
+                );
+           )#"sv,
+        },
+    });
 
     return database.migrate("HSTSPolicies"sv, migrations, mode);
 }
@@ -215,7 +220,7 @@ HSTSStore::TransientStorage::Policies HSTSStore::PersistedStorage::select_all_po
 {
     TransientStorage::Policies policies;
 
-    database.execute_statement(statements.select_all_policies, [&](auto row) {
+    database.execute_statement(statements.select_all_policies, [&](auto row) -> ErrorOr<void> {
         auto domain = database.result_column<String>(row, 0);
         StoredPolicy stored_policy {
             .expiry = database.result_column<UnixDateTime>(row, 1),
@@ -223,6 +228,7 @@ HSTSStore::TransientStorage::Policies HSTSStore::PersistedStorage::select_all_po
             .last_observed_time = database.result_column<UnixDateTime>(row, 3),
         };
         policies.set(move(domain), stored_policy);
+        return {};
     });
 
     return policies;

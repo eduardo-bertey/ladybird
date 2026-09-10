@@ -16,6 +16,7 @@
 #include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
+#include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
@@ -23,6 +24,7 @@
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
 
 namespace Web::HTML {
@@ -51,15 +53,6 @@ void NavigableContainer::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_content_navigable);
-}
-
-GC::Ptr<NavigableContainer> NavigableContainer::navigable_container_with_content_navigable(GC::Ref<LocalNavigable> navigable)
-{
-    for (auto* navigable_container : all_instances()) {
-        if (navigable_container->content_navigable() == navigable)
-            return navigable_container;
-    }
-    return nullptr;
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#create-a-new-child-navigable
@@ -101,41 +94,57 @@ void NavigableContainer::create_new_child_navigable()
     GC::Ref<LocalNavigable> navigable = *GC::Heap::the().allocate<LocalNavigable>(page, false);
 
     // 8. Initialize the navigable navigable given documentState and parentNavigable.
-    navigable->initialize_navigable(document_state, parent_navigable, *document);
+    navigable->initialize_navigable(document_state, parent_navigable, *document, parent_navigable->active_document()->visibility_state());
+    navigable->inherit_page_state_from(*parent_navigable);
 
     // 9. Set element's content navigable to navigable.
     m_content_navigable = navigable;
+    navigable->set_container({}, this);
+
+    if (auto* layout_node = unsafe_layout_node())
+        layout_node->refresh_dom_paint_facts();
+    set_needs_repaint();
+
+    (void)parent_navigable->adopt_canonical_id_for_child_created_during_history_reconstruction(navigable);
 
     page.client().page_did_create_child_frame(parent_navigable->id(), navigable->id(), navigable->replicated_state());
 
     // 10. Let historyEntry be navigable's active session history entry.
     auto history_entry = navigable->active_session_history_entry();
 
-    // 11. Let traversable be parentNavigable's traversable navigable.
-    auto traversable = parent_navigable->traversable_navigable();
-
     // 12. Append the following session history traversal steps to traversable:
-    traversable->request_history_operation(
+    page.history_executor().request_history_operation(
         NavigableCreationHistoryOperationParameters {
+            .parent_navigable_id = parent_navigable->id(),
             .navigable_id = navigable->id(),
+            .initial_history_entry = create_pending_session_history_entry_descriptor(*history_entry),
         },
         {
-            .pre_steps = GC::create_function(heap(), [navigable, parent_navigable, history_entry](u64, GC::Ref<LocalTraversableNavigable::OnHistoryOperationReady> ready) mutable {
+            .local_target_navigable_id = navigable->id(),
+            .local_target_entry = history_entry,
+            .pre_steps = GC::create_function(heap(), [navigable, parent_navigable, history_entry](Optional<Web::ReconstructedChildNavigation> reconstructed_child_navigation, GC::Ref<HistoryExecutor::OnHistoryOperationReady> ready) mutable {
                 if (navigable->has_been_destroyed() || parent_navigable->has_been_destroyed()) {
-                    ready->function()(false, {}, HistoryStepResult::Applied);
+                    ready->function()(HistoryStepResult::Applied);
                     return;
                 }
 
                 // 1-6. Append nestedHistory to parentDocState's nested histories.
-                VERIFY(append_nested_history_for_child_navigable(*parent_navigable, *navigable, *history_entry));
+                if (reconstructed_child_navigation.has_value()) {
+                    navigable->route_child_created_during_history_reconstruction(reconstructed_child_navigation.release_value());
+                    ready->function()(HistoryStepResult::Applied);
+                    return;
+                }
+
+                auto parent_document_state = parent_navigable->active_session_history_entry()->document_state();
 
                 // 7. Update for navigable creation/destruction given traversable
-                ready->function()(true, {}, HistoryStepResult::Applied);
+                ready->function()(parent_document_state->cross_process_id());
             }),
             .on_complete = GC::create_function(heap(), [this, navigable](HistoryStepResult) {
                 if (navigable->has_been_destroyed() || content_navigable() != navigable)
                     return;
-                set_content_navigable_has_session_history_entry_and_ready_for_navigation();
+                navigable->set_has_session_history_entry_and_ready_for_navigation();
+                this->document().schedule_html_parser_end_check();
             }),
         });
 }
@@ -148,7 +157,7 @@ DOM::Document const* NavigableContainer::content_document() const
         return nullptr;
 
     // 2. Let document be container's content navigable's active document.
-    auto document = m_content_navigable->active_document();
+    auto document = as<LocalNavigable>(*m_content_navigable).active_document();
 
     // AD-HOC: The active document can be null during navigation, after the old document
     //         has been destroyed but before the new document has been set.
@@ -168,7 +177,7 @@ DOM::Document const* NavigableContainer::content_document_without_origin_check()
     if (!m_content_navigable)
         return nullptr;
 
-    return m_content_navigable->active_document().ptr();
+    return as<LocalNavigable>(*m_content_navigable).active_document().ptr();
 }
 
 // https://html.spec.whatwg.org/multipage/embedded-content-other.html#dom-media-getsvgdocument
@@ -206,7 +215,7 @@ Optional<URL::URL> NavigableContainer::shared_attribute_processing_steps_for_ifr
     auto url = URL::about_blank();
 
     // 2. If element has a src attribute specified, and its value is not the empty string, then:
-    auto src_attribute_value = get_attribute_value_view(HTML::AttributeNames::src);
+    auto src_attribute_value = attribute(HTML::AttributeNames::src);
     if (src_attribute_value.has_value() && !src_attribute_value->is_empty()) {
         // 1. Let maybeURL be the result of encoding-parsing a URL given that attribute's value, relative to element's node document.
         auto maybe_url = document().encoding_parse_url(*src_attribute_value);
@@ -223,22 +232,20 @@ Optional<URL::URL> NavigableContainer::shared_attribute_processing_steps_for_ifr
             return {};
     }
 
-    // AD-HOC: If the content navigable already has a navigation in progress or pending, skip the initial
-    //         about:blank URL update. Without this, the URL update creates a state machine that clobbers the
-    //         navigable's ongoing_navigation, causing the real navigation to be dropped when its populate completion
-    //         callback checks ongoing_navigation != navigation_id. Non-blank src navigations must still be processed
-    //         here, and will be queued by LocalNavigable::navigate() until the child navigable is ready for navigation.
-    auto& local_navigable = *m_content_navigable;
-
-    if (url_matches_about_blank(url) && initial_insertion == InitialInsertion::Yes
-        && (local_navigable.has_pending_navigations() || !local_navigable.ongoing_navigation().has<Empty>())) {
-        return {};
-    }
-
     // 4. If url matches about:blank and initialInsertion is true, then perform the URL and history update steps given element's content navigable's active document and url.
     if (url_matches_about_blank(url) && initial_insertion == InitialInsertion::Yes) {
-        auto& document = *local_navigable.active_document();
-        perform_url_and_history_update_steps(document, url);
+        // NB: A newly inserted element's content navigable was created in this process.
+        auto& local_navigable = as<LocalNavigable>(*m_content_navigable);
+
+        // AD-HOC: If the content navigable already has a navigation in progress or pending, skip the initial
+        //         about:blank URL update. Without this, the URL update creates a state machine that clobbers the
+        //         navigable's ongoing_navigation, causing the real navigation to be dropped when its populate completion
+        //         callback checks ongoing_navigation != navigation_id. Non-blank src navigations must still be processed
+        //         here, and will be queued by LocalNavigable::navigate() until the child navigable is ready for navigation.
+        if (local_navigable.has_pending_navigations() || !local_navigable.ongoing_navigation().has<Empty>())
+            return {};
+
+        perform_url_and_history_update_steps(*local_navigable.active_document(), url);
     }
 
     // 5. Return url.
@@ -255,9 +262,11 @@ void NavigableContainer::navigate_an_iframe_or_frame(URL::URL url, ReferrerPolic
     // AD-HOC: Only apply this check during initial insertion. For subsequent attribute-driven navigations,
     //         the previous document may have parsed and run scripts but not yet fired its load event;
     //         forcing "replace" in that case would incorrectly discard the history entry.
-    auto& local_navigable = *m_content_navigable;
-    if (initial_insertion == InitialInsertion::Yes && local_navigable.active_document() && !local_navigable.active_document()->is_completely_loaded()) {
-        history_handling = NavigationHistoryBehavior::Replace;
+    if (initial_insertion == InitialInsertion::Yes) {
+        // NB: A newly inserted element's content navigable was created in this process.
+        auto active_document = as<LocalNavigable>(*m_content_navigable).active_document();
+        if (active_document && !active_document->is_completely_loaded())
+            history_handling = NavigationHistoryBehavior::Replace;
     }
 
     // 3. If element is an iframe:
@@ -277,7 +286,7 @@ void NavigableContainer::navigate_an_iframe_or_frame(URL::URL url, ReferrerPolic
     if (srcdoc_string.has_value())
         document_resource = *srcdoc_string;
 
-    MUST(local_navigable.navigate({
+    MUST(m_content_navigable->navigate({
         .url = move(url),
         .source_document = document(),
         .document_resource = document_resource,
@@ -299,7 +308,7 @@ void NavigableContainer::destroy_the_child_navigable()
 
     // Not in the spec:
     // Setting container's content navigable makes document *not* be "fully active".
-    // Therefore, it is moved to run in afterAllDestruction callback of "destroy a document and its descendants"
+    // Therefore, it is moved to run in the after-all-unloads callback of "unload a document and its descendants"
     // when all queued tasks are done.
     // "Has been destroyed" flag is used instead to check whether navigable is already destroyed.
     auto& local_navigable = as<LocalNavigable>(*navigable);
@@ -326,41 +335,56 @@ void NavigableContainer::destroy_the_child_navigable()
 
     auto after_document_destruction = GC::create_function(GC::Heap::the(), [this, navigable] {
         // 3. Set container's content navigable to null.
-        m_content_navigable = nullptr;
-        document().schedule_html_parser_end_check();
+        as<LocalNavigable>(*navigable).set_container({}, nullptr);
+
+        // AD-HOC: In the spec this step runs synchronously, before the container could possibly acquire another content
+        //         navigable. Since we defer it, the container may have been re-inserted in the meantime and hold a new
+        //         content navigable, which this step must not clear.
+        if (m_content_navigable == navigable) {
+            m_content_navigable = nullptr;
+            document().schedule_html_parser_end_check();
+            if (auto* layout_node = unsafe_layout_node())
+                layout_node->refresh_dom_paint_facts();
+            set_needs_repaint();
+        }
 
         // Not in the spec:
-        navigable->remove_from_all_local_navigables();
+        as<LocalNavigable>(*navigable).report_child_frame_destroyed();
+        as<LocalNavigable>(*navigable).remove_from_all_local_navigables();
 
         // 6. Let parentDocState be container's node navigable's active session history entry's document state.
-        auto parent_doc_state = this->navigable()->active_session_history_entry()->document_state();
+        auto parent_navigable = this->navigable();
+        auto parent_doc_state = parent_navigable->active_session_history_entry()->document_state();
 
         // 7. Remove the nested history from parentDocState's nested histories whose id equals navigable's id.
-        parent_doc_state->nested_histories().remove_all_matching([&](auto& nested_history) {
-            return navigable->id() == nested_history.id;
-        });
+        // NB: The UI process performs this step in canonical session history.
 
         // 8. Let traversable be container's node navigable's traversable navigable.
-        auto traversable = this->navigable()->traversable_navigable();
-
-        traversable->page().client().page_did_remove_nested_history(this->navigable()->id(), navigable->id());
-
         // 9. Append the following session history traversal steps to traversable:
         // 1. Update for navigable creation/destruction given traversable.
-        traversable->request_history_operation(NavigableDestructionHistoryOperationParameters {
-            .traversable_id = traversable->id(),
+        parent_navigable->page().history_executor().request_history_operation(NavigableDestructionHistoryOperationParameters {
+            .parent_navigable_id = parent_navigable->id(),
+            .parent_document_state_id = parent_doc_state->cross_process_id(),
+            .navigable_id = navigable->id(),
         });
     });
 
     // 5. Destroy a document and its descendants given navigable's active document.
+    // AD-HOC: We unload the document and its descendants, instead of just destroying. Unloading fires pagehide at the
+    //         document's relevant global object, updates its visibility state to "hidden" (firing visibilitychange),
+    //         and fires unload — before destroying the document. The spec as written would leave a removed container's
+    //         content documents reporting a "visible" visibility state — with no events fired; Gecko/WebKit/Blink all
+    //         fire those events, and report such documents as hidden. This also means starting a view transition in a
+    //         removed document skips the transition — since startViewTransition() skips transitions for hidden docs.
+    //         See https://github.com/whatwg/html/issues/12288
     // AD-HOC: The spec assumes the active document is non-null here, but during an ancestor
     //         unload the child documents are unloaded (and destroyed) before the ancestor's
     //         pagehide fires. If that pagehide handler then removes a subtree containing this
     //         container, we reach step 5 with navigable's active document already null. We
-    //         treat the destroy step as a no-op in that case and proceed with the remaining
+    //         treat the unload step as a no-op in that case and proceed with the remaining
     //         post-destruction cleanup.
-    if (auto active_document = local_navigable.active_document())
-        active_document->destroy_a_document_and_its_descendants(after_document_destruction);
+    if (local_navigable.active_document())
+        local_navigable.unload_child_navigable_before_destruction(after_document_destruction);
     else
         after_document_destruction->function()();
 }
@@ -380,28 +404,14 @@ bool NavigableContainer::currently_delays_the_load_event() const
     if (!m_content_navigable)
         return false;
 
-    // - element's content navigable's active document is not ready for post-load tasks;
-    auto& local_navigable = as<LocalNavigable>(*m_content_navigable);
-
-    if (!local_navigable.active_document()->ready_for_post_load_tasks())
-        return true;
-
-    // - element's content navigable's is delaying load events is true; or
-    if (local_navigable.is_delaying_load_events())
-        return true;
-
-    // - anything is delaying the load event of element's content navigable's active document.
-    if (local_navigable.active_document()->anything_is_delaying_the_load_event())
-        return true;
-
-    return false;
+    return m_content_navigable->delays_the_load_event_of_its_container();
 }
 
 bool NavigableContainer::content_navigable_has_session_history_entry_and_ready_for_navigation() const
 {
     if (!content_navigable())
         return false;
-    return as<LocalNavigable>(*m_content_navigable).has_session_history_entry_and_ready_for_navigation();
+    return m_content_navigable->has_session_history_entry_and_ready_for_navigation();
 }
 
 void NavigableContainer::set_potentially_delays_the_load_event(bool value)
@@ -409,15 +419,6 @@ void NavigableContainer::set_potentially_delays_the_load_event(bool value)
     m_potentially_delays_the_load_event = value;
     if (!value)
         document().schedule_html_parser_end_check();
-}
-
-void NavigableContainer::set_content_navigable_has_session_history_entry_and_ready_for_navigation()
-{
-    auto content_navigable = this->content_navigable();
-    if (!content_navigable)
-        return;
-    as<LocalNavigable>(*content_navigable).set_has_session_history_entry_and_ready_for_navigation();
-    document().schedule_html_parser_end_check();
 }
 
 }
