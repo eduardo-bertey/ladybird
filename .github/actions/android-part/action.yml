@@ -79,10 +79,8 @@ runs:
         # The host tool links AK, which needs simdutf and mimalloc as real libraries, plus the
         # fmt and fast_float headers. Android-triplet .a libs cannot link into a macOS binary,
         # so install these four for the HOST triplet (arm64-osx), pinned to the same versions
-        # the Android manifest resolves (classic mode cannot be version-pinned, so use a small
-        # standalone manifest with overrides. simdutf 9.0.0 has no entry in the builtin-baseline's
-        # version database, so it must come from the repo's overlay-port (same as the Android
-        # build does); point vcpkg at it via a local vcpkg-configuration.json.
+        # the root vcpkg.json resolves (classic mode cannot be version-pinned, so use a small
+        # standalone manifest with overrides + the same builtin-baseline as the root manifest).
         HOST_MANIFEST_DIR="${{ github.workspace }}/Build/host-tools/vcpkg-manifest"
         mkdir -p "$HOST_MANIFEST_DIR"
         cat > "$HOST_MANIFEST_DIR/vcpkg.json" <<'EOF'
@@ -91,12 +89,12 @@ runs:
           "version": "1",
           "dependencies": [ "simdutf", "mimalloc", "fmt", "fast-float" ],
           "overrides": [
-            { "name": "simdutf", "version": "9.0.0" },
+            { "name": "simdutf", "version": "9.1.0" },
             { "name": "mimalloc", "version": "2.2.7" },
             { "name": "fmt", "version": "12.2.0", "port-version": 1 },
             { "name": "fast-float", "version": "8.2.10", "port-version": 1 }
           ],
-          "builtin-baseline": "40f3c709db80acf154ac4b17a1f83c564ebd022e"
+          "builtin-baseline": "7f3781e19cc7d4e4882a4caec01668c6f7b5c163"
         }
         EOF
         cat > "$HOST_MANIFEST_DIR/vcpkg-configuration.json" <<'EOF'
