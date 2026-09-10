@@ -17,4 +17,3 @@ jobs:
         uses: ./.github/actions/android-part
         with:
           target: LibWebView
-          need-host-tools: 'true'

@@ -20,4 +20,3 @@ jobs:
         uses: ./.github/actions/android-part
         with:
           target: ladybird
-          need-host-tools: 'true'

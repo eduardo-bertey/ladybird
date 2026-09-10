@@ -10,10 +10,6 @@ inputs:
   target:
     description: Target CMake a compilar (LibCore, LibGfx, LibJS, LibMedia, LibWeb, LibWebView, ladybird)
     required: true
-  need-host-tools:
-    description: "'true' si el target necesita generate_interpreter_layout del host (LibJS y todo lo que depende de el)"
-    required: false
-    default: 'false'
 
 runs:
   using: composite
@@ -59,8 +55,10 @@ runs:
         ccache_path: ${{ steps.setup.outputs.ccache_path }}
         vcpkg_cache_path: ${{ steps.setup.outputs.vcpkg_cache_path }}
 
+    # OJO: se construye SIEMPRE (aunque el target no sea LibJS): el configure de
+    # CMake arma todo el proyecto y LibJS corta con FATAL_ERROR si no hay
+    # generador del host (Libraries/LibJS/CMakeLists.txt).
     - name: Build Host Tools
-      if: inputs.need-host-tools == 'true'
       shell: bash
       run: |
         set -euxo pipefail
@@ -143,10 +141,8 @@ runs:
           -DANDROID_STL=c++_shared
           -DVCPKG_TARGET_ANDROID=ON
           -DLADYBIRD_CACHE_DIR="${{ github.workspace }}/Build/caches"
-          -DENABLE_CRANELIFT_JIT=OFF )
-        if [ "${{ inputs.need-host-tools }}" = "true" ]; then
-          ARGS+=( -DLADYBIRD_HOST_LAYOUT_GENERATOR="${{ github.workspace }}/Build/host-tools/generate_interpreter_layout" )
-        fi
+          -DENABLE_CRANELIFT_JIT=OFF
+          -DLADYBIRD_HOST_LAYOUT_GENERATOR="${{ github.workspace }}/Build/host-tools/generate_interpreter_layout" )
         cmake "${ARGS[@]}"
 
     - name: Build ${{ inputs.target }}
