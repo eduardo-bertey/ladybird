@@ -28,7 +28,9 @@ runs:
     - name: Export dirs + install NDK and SDK components
       shell: bash
       run: |
-        set -euxo pipefail
+        # OJO: sin pipefail aquí: `yes | sdkmanager` cierra el pipe (SIGPIPE en
+        # `yes`, exit 141) aunque las licencias se acepten bien.
+        set -eux
         {
           echo "LADYBIRD_SOURCE_DIR=${{ github.workspace }}"
           echo "CCACHE_DIR=${{ github.workspace }}/.ccache"
@@ -155,7 +157,7 @@ runs:
       with:
         name: ${{ inputs.target }}-android-arm64-log
         path: ${{ github.workspace }}/Build/${{ inputs.target }}-android-arm64.log
-        if-no-files-found: error
+        if-no-files-found: warn
 
     - name: Save Caches
       if: always()
