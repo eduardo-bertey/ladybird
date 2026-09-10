@@ -14,8 +14,8 @@ todo lo anterior esté verde). Todo `workflow_dispatch` (nada automático).
 | 03 | `android-03-js.yml` | `LibJS` | 🟢 verde | `34539009088` | falló 1 vez por host-tools, ver errores difíciles |
 | 04 | `android-04-media.yml` | `LibMedia` | 🟢 verde | `34539012121` | FFmpeg de vcpkg (video sist. pendiente #421) |
 | 05 | `android-05-web.yml` | `LibWeb` | 🟢 verde | `34539014759` | la más pesada, pool compile=2 |
-| 06 | `android-06-webview.yml` | `LibWebView` | 🟡 compilando (reintento) | `34533018921` | vista web + IPC |
-| 07 | `android-07-browser.yml` | `ladybird` | ⬜ pendiente | — | puerta al APK, solo con 01..06 verdes |
+| 06 | `android-06-webview.yml` | `LibWebView` | 🟢 verde | `34539018540` | vista web + IPC |
+| 07 | `android-07-browser.yml` | `ladybird` | 🟡 compilando | — | puerta al APK, solo con 01..06 verdes |
 
 Leyenda: 🟢 verde / 🟡 en curso / 🔴 rojo (ver causa + fix) / ⬜ no lanzado.
 
