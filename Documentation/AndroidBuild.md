@@ -9,7 +9,7 @@ todo lo anterior esté verde). Todo `workflow_dispatch` (nada automático).
 
 | # | Workflow | Target | Estado | Run | Nota |
 |---|----------|--------|--------|-----|------|
-| 01 | `android-01-core.yml` | `LibCore` | 🟡 compilando | `34532285227` | AK + Unicode + Core |
+| 01 | `android-01-core.yml` | `LibCore` | 🟢 verde | `34538245769` | AK + Unicode + Core |
 | 02 | `android-02-gfx.yml` | `LibGfx` | 🟡 compilando | `34532289686` | gráficos + decodificadores |
 | 03 | `android-03-js.yml` | `LibJS` | 🟡 compilando (reintento) | `34533011358` | falló 1 vez por host-tools, ver errores difíciles |
 | 04 | `android-04-media.yml` | `LibMedia` | 🟡 compilando | `34532297901` | FFmpeg de vcpkg (video sist. pendiente #421) |
