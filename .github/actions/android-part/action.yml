@@ -28,8 +28,9 @@ runs:
     - name: Export dirs + install NDK and SDK components
       shell: bash
       run: |
-        # OJO: sin pipefail aquí: `yes | sdkmanager` cierra el pipe (SIGPIPE en
-        # `yes`, exit 141) aunque las licencias se acepten bien.
+        # OJO: el runner trae pipefail activado y `yes` muere con SIGPIPE cuando
+        # sdkmanager cierra stdin (aunque todo salga bien). Por eso NO se confía
+        # en el exit code de sdkmanager: se verifica por EFECTO.
         set -eux
         {
           echo "LADYBIRD_SOURCE_DIR=${{ github.workspace }}"
@@ -37,9 +38,12 @@ runs:
           echo "VCPKG_ROOT=${{ github.workspace }}/Build/vcpkg"
           echo "VCPKG_BINARY_SOURCES=clear;files,${{ github.workspace }}/Build/caches/vcpkg-binary-cache,readwrite"
         } >> "$GITHUB_ENV"
-        yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses
-        yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "build-tools;35.0.0" "platforms;android-35"
-        yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "ndk;29.0.13599879"
+        yes 2>/dev/null | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses > /tmp/sdk-licenses.log 2>&1 || true
+        grep -q "All SDK package licenses accepted" /tmp/sdk-licenses.log || { tail -30 /tmp/sdk-licenses.log; exit 1; }
+        yes 2>/dev/null | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "build-tools;35.0.0" "platforms;android-35" > /tmp/sdk-install.log 2>&1 || true
+        test -d "${ANDROID_SDK_ROOT}/platform-tools" || { tail -30 /tmp/sdk-install.log; exit 1; }
+        yes 2>/dev/null | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "ndk;29.0.13599879" > /tmp/sdk-ndk.log 2>&1 || true
+        test -d "${ANDROID_SDK_ROOT}/ndk/29.0.13599879" || { tail -30 /tmp/sdk-ndk.log; ls "${ANDROID_SDK_ROOT}/ndk" 2>/dev/null; exit 1; }
         echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/29.0.13599879" >> "$GITHUB_ENV"
 
     - name: Restore Caches
