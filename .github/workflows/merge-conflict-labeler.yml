@@ -1,15 +1,6 @@
 name: 'Label PRs with merge conflicts'
 on:
-  # PRs typically get conflicted after a push to master.
-  push:
-    branches: [master]
-
-  # If a PR targeting master is (re)opened or updated, recheck for conflicts and update the label.
-  # NOTE: This runs against the target branch, not the PR branch.
-  pull_request_target:
-    types: [opened, synchronize, reopened]
-    branches: [master]
-
+  workflow_dispatch:
 jobs:
   auto-labeler:
     runs-on: blacksmith-2vcpu-ubuntu-2404

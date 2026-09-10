@@ -3,14 +3,6 @@
 name: 'Build Dev Container Image'
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '.devcontainer/**'
-      - 'vcpkg.json'
-  schedule:
-    # https://crontab.guru/#0_0_*_*_1
-    - cron:  '0 0 * * 1'
-
 permissions:
   contents: read
   # Push images to GHCR.

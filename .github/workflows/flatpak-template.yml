@@ -9,7 +9,6 @@ on:
       runner_labels:
         required: true
         type: string
-
 jobs:
   flatpak:
     runs-on: ${{ fromJSON(inputs.runner_labels) }}

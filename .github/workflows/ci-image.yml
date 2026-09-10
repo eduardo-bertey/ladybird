@@ -1,22 +1,7 @@
 name: Build CI Image
 
 on:
-  pull_request:
-    paths:
-      - '.github/workflows/ci-image.yml'
-      - 'Meta/Docker/ci/**'
-      - 'rust-toolchain.toml'
-  push:
-    branches: [master]
-    paths:
-      - '.github/workflows/ci-image.yml'
-      - 'Meta/Docker/ci/**'
-      - 'rust-toolchain.toml'
   workflow_dispatch:
-  schedule:
-    # Keep image build breakage visible before dependency changes block regular CI.
-    - cron: '0 0 * * 1'
-
 permissions:
   contents: read
   packages: write

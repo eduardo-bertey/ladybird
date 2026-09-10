@@ -1,6 +1,7 @@
 name: Lint Commit Messages
 
-on: [pull_request_target]
+on:
+  workflow_dispatch:
 
 # Make sure to update Meta/lint-commit.sh to match this script when adding new checks!
 # (… but don't accept overlong 'fixup!' commit descriptions.)

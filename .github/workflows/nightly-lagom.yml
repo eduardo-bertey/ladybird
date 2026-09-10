@@ -1,10 +1,7 @@
 name: Nightly Lagom
 
 on:
-  # Automatically run at the end of every day.
-  schedule:
-    - cron: '0 0 * * *'
-
+  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

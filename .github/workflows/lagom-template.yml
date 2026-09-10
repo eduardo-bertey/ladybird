@@ -26,7 +26,6 @@ on:
         required: false
         type: string
         default: 'null'
-
 env:
   # runner.workspace = /home/runner/work/ladybird
   # github.workspace = /home/runner/work/ladybird/ladybird

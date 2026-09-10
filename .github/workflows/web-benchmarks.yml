@@ -1,9 +1,7 @@
 name: 'Web benchmarks'
 
 on:
-  push:
-    branches: [master]
-
+  workflow_dispatch:
 env:
   LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
   CCACHE_DIR: ${{ github.workspace }}/.ccache

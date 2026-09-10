@@ -1,12 +1,7 @@
 name: Android Build
 
 on:
-  push:
-    branches:
-      - master
-      - main
   workflow_dispatch:
-
 env:
   # runner.workspace = /home/runner/work/ladybird
   # github.workspace = /home/runner/work/ladybird/ladybird

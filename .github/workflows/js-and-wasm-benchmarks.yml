@@ -1,11 +1,7 @@
 name: 'JS benchmarks'
 
 on:
-  workflow_run:
-    workflows: ['Package the js repl as a binary artifact']
-    branches: [master]
-    types: [completed]
-
+  workflow_dispatch:
 jobs:
   js-benchmarks:
     runs-on: ${{ fromJSON(matrix.runner_labels) }}
