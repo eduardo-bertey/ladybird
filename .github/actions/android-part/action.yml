@@ -35,7 +35,9 @@ runs:
         {
           echo "LADYBIRD_SOURCE_DIR=${{ github.workspace }}"
           echo "CCACHE_DIR=${{ github.workspace }}/.ccache"
-          echo "VCPKG_ROOT=${{ github.workspace }}/Build/vcpkg"
+          # El setup crea Build/vcpkg-release (preset Release de ladybird.py),
+          # NO Build/vcpkg: apuntar ahi o el toolchain de vcpkg no existe.
+          echo "VCPKG_ROOT=${{ github.workspace }}/Build/vcpkg-release"
           echo "VCPKG_BINARY_SOURCES=clear;files,${{ github.workspace }}/Build/caches/vcpkg-binary-cache,readwrite"
         } >> "$GITHUB_ENV"
         yes 2>/dev/null | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses > /tmp/sdk-licenses.log 2>&1 || true
