@@ -1,0 +1,23 @@
+name: Android parte 07 - Navegador (lib ladybird)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || format('{0}-{1}', github.ref, github.run_number) }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # Ultima puerta antes del APK: compila la lib JNI nativa completa
+      # (UI/Android + bundle, igual que el paso nativo de android-build.yml).
+      # Correr solo cuando 01..06 estan verdes.
+      - name: Compilar ladybird para arm64-v8a
+        uses: ./.github/actions/android-part
+        with:
+          target: ladybird
+          need-host-tools: 'true'

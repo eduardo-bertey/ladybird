@@ -1,0 +1,20 @@
+name: Android parte 06 - WebView (LibWebView)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || format('{0}-{1}', github.ref, github.run_number) }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Compilar LibWebView para arm64-v8a
+        uses: ./.github/actions/android-part
+        with:
+          target: LibWebView
+          need-host-tools: 'true'

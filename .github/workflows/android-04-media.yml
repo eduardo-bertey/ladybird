@@ -1,0 +1,21 @@
+name: Android parte 04 - Media (LibMedia)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || format('{0}-{1}', github.ref, github.run_number) }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # En Android LibMedia usa el FFmpeg de vcpkg (no el del sistema).
+      # Video por Media NDK del sistema: pendiente, ver issue #421.
+      - name: Compilar LibMedia para arm64-v8a
+        uses: ./.github/actions/android-part
+        with:
+          target: LibMedia

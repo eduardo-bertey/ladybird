@@ -1,0 +1,22 @@
+name: Android parte 03 - JS (LibJS)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || format('{0}-{1}', github.ref, github.run_number) }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # LibJS en cross-compile exige generate_interpreter_layout del host
+      # (ver issue #8672: el interprete ASM no es cross-compilable).
+      - name: Compilar LibJS para arm64-v8a
+        uses: ./.github/actions/android-part
+        with:
+          target: LibJS
+          need-host-tools: 'true'
