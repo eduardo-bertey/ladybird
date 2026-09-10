@@ -111,6 +111,18 @@ elseif (APPLE)
         set(ASSERTION_HANDLER_VISIBILITY INTERFACE)
     endif()
     target_link_options(AK ${ASSERTION_HANDLER_VISIBILITY} LINKER:-U,_ak_assertion_handler)
+    if (NOT BUILD_SHARED_LIBS)
+        target_link_options(AK INTERFACE
+            LINKER:-u,_ladybird_rust_alloc
+            LINKER:-u,_ladybird_rust_alloc_zeroed
+            LINKER:-u,_ladybird_rust_dealloc
+            LINKER:-u,_ladybird_rust_realloc
+        )
+    endif()
+elseif (ANDROID)
+    # AK uses __android_log_write() for logging on Android; make sure consumers
+    # of the static AK library link against Android's log library.
+    target_link_libraries(AK PUBLIC log)
 endif()
 
 # Manually install AK headers

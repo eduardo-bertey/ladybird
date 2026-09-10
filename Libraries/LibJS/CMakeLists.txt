@@ -351,24 +351,36 @@ if (DEFINED FLAP_ARCH)
 
     # Build-time offset generator: compiles a small C++ program that uses
     # offsetof() to emit struct field offsets as DSL constants.
-    add_executable(generate_interpreter_layout "${CMAKE_CURRENT_SOURCE_DIR}/Interpreter/GenerateLayout.cpp")
-    target_link_libraries(generate_interpreter_layout PRIVATE AK)
-    if (MSVC)
-        target_compile_definitions(generate_interpreter_layout PRIVATE _ALLOW_KEYWORD_MACROS)
-    endif()
-    target_compile_definitions(generate_interpreter_layout PRIVATE private=public protected=public)
-    # NB: Strip fuzzer sanitizer flags so generate_interpreter_layout can define its own main().
-    if (ENABLE_FUZZERS_LIBFUZZER)
-        target_compile_options(generate_interpreter_layout PRIVATE -fno-sanitize=fuzzer)
-        target_link_options(generate_interpreter_layout PRIVATE -fno-sanitize=fuzzer)
+    # When cross-compiling (e.g. Android), this tool cannot run on the build host,
+    # so a host-built binary must be supplied via LADYBIRD_HOST_LAYOUT_GENERATOR.
+    if (CMAKE_CROSSCOMPILING)
+        if (NOT LADYBIRD_HOST_LAYOUT_GENERATOR)
+            message(FATAL_ERROR "Cross-compiling requires a host-built generate_interpreter_layout. Pass -DLADYBIRD_HOST_LAYOUT_GENERATOR=<path to host binary>")
+        endif()
+        set(GENERATE_LAYOUT_EXEC "${LADYBIRD_HOST_LAYOUT_GENERATOR}")
+        set(GENERATE_LAYOUT_DEPENDENCY "")
+    else()
+        add_executable(generate_interpreter_layout "${CMAKE_CURRENT_SOURCE_DIR}/Interpreter/GenerateLayout.cpp")
+        target_link_libraries(generate_interpreter_layout PRIVATE AK)
+        if (MSVC)
+            target_compile_definitions(generate_interpreter_layout PRIVATE _ALLOW_KEYWORD_MACROS)
+        endif()
+        target_compile_definitions(generate_interpreter_layout PRIVATE private=public protected=public)
+        # NB: Strip fuzzer sanitizer flags so generate_interpreter_layout can define its own main().
+        if (ENABLE_FUZZERS_LIBFUZZER)
+            target_compile_options(generate_interpreter_layout PRIVATE -fno-sanitize=fuzzer)
+            target_link_options(generate_interpreter_layout PRIVATE -fno-sanitize=fuzzer)
+        endif()
+        set(GENERATE_LAYOUT_EXEC "$<TARGET_FILE:generate_interpreter_layout>")
+        set(GENERATE_LAYOUT_DEPENDENCY "generate_interpreter_layout")
     endif()
     # NB: GenerateLayout.cpp does not depend on Op.h since opcode field
     # offsets are computed from interpreter.flap by flapc directly.
 
     add_custom_command(
         OUTPUT "${INTERPRETER_LAYOUT_FILE}"
-        COMMAND "$<TARGET_FILE:generate_interpreter_layout>" > "${INTERPRETER_LAYOUT_FILE}"
-        DEPENDS generate_interpreter_layout
+        COMMAND "${GENERATE_LAYOUT_EXEC}" > "${INTERPRETER_LAYOUT_FILE}"
+        DEPENDS ${GENERATE_LAYOUT_DEPENDENCY}
         COMMENT "Generating JS interpreter layout"
     )
 

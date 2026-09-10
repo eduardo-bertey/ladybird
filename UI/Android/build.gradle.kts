@@ -22,9 +22,14 @@ android {
                 cppFlags += "-std=c++23"
                 arguments += listOf(
                     "-DANDROID_STL=c++_shared",
-                    "-DLADYBIRD_VCPKG_TYPE=release",
-                    "-DVCPKG_TARGET_ANDROID=ON"
+                    "-DLADYBIRD_CACHE_DIR=$cacheDir",
+                    "-DVCPKG_ROOT=$sourceDir/Build/vcpkg",
+                    "-DVCPKG_TARGET_ANDROID=ON",
+                    "-DENABLE_CRANELIFT_JIT=OFF"
                 )
+                System.getenv("LADYBIRD_HOST_LAYOUT_GENERATOR")?.let {
+                    arguments += "-DLADYBIRD_HOST_LAYOUT_GENERATOR=$it"
+                }
             }
         }
         ndk {

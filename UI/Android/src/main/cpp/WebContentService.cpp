@@ -13,7 +13,6 @@
 #include <LibCore/System.h>
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibImageDecoderClient/Client.h>
-#include <LibMedia/Audio/Loader.h>
 #include <LibRequests/RequestClient.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/HTML/Window.h>
@@ -63,7 +62,7 @@ ErrorOr<int> service_main(int ipc_socket)
     WebView::set_site_isolation_mode(WebView::SiteIsolationMode::Disabled);
 
     auto webcontent_socket = TRY(Core::LocalSocket::adopt_fd(ipc_socket));
-    auto webcontent_client = TRY(WebContent::ConnectionFromClient::try_create(make<IPC::Transport>(move(webcontent_socket))));
+    auto webcontent_client = WebContent::ConnectionFromClient::construct(make<IPC::Transport>(move(webcontent_socket)));
 
     return event_loop.exec();
 }
