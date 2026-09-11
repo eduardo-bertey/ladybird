@@ -47,16 +47,20 @@ jobs:
           gh run download "$RUN_ID" --repo "${{ github.repository }}" -n ladybird-android-sos -D UI/Android/src/main/jniLibs/arm64-v8a/
           find UI/Android/src/main/jniLibs -name "*.so"
 
-      - name: Download assets (ladybird-assets.zip del mismo run)
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Build ladybird-assets.zip (recursos, sin CMake ni NDK)
         run: |
-          set -euxo pipefail
-          RUN_ID=$(gh run list --repo "${{ github.repository }}" --workflow android-07-browser.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
-          test -n "$RUN_ID" && test "$RUN_ID" != "null"
+          set -eux
+          cd "${{ github.workspace }}"
+          # Mismo contenido que genera copy-assets en AndroidExtras.cmake:
+          # zip -r de asset-bundle/ (mismo comando, sin compilar nada).
+          rm -rf asset-bundle
+          mkdir -p asset-bundle/res/ladybird/site-compatibility
+          cp -r Base/res/ladybird Base/res/fonts Base/res/icons Base/res/themes asset-bundle/res/
+          cp WebCompat/*.json asset-bundle/res/ladybird/site-compatibility/
           mkdir -p UI/Android/src/main/assets
-          gh run download "$RUN_ID" --repo "${{ github.repository }}" -n ladybird-android-assets -D UI/Android/src/main/assets/
-          ls -la UI/Android/src/main/assets/
+          (cd asset-bundle && zip -qr ../ladybird-assets.zip ./)
+          mv ladybird-assets.zip UI/Android/src/main/assets/
+          unzip -l UI/Android/src/main/assets/ladybird-assets.zip | head -10
 
       - name: Strip .so + agregar libc++_shared (sacar debug symbols, achica ~10x)
         run: |
