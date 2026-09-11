@@ -46,6 +46,20 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 9. ANGLE sin display Android + CrashReport sin impl (07-browser)
+
+- **Síntoma:** `undefined symbol: rx::DisplayAndroid::DisplayAndroid(...)` en
+  `libexec/Compositor` + `undefined symbol: WebView::CrashReport::is_supported`
+  (y `show_directory`, `symbolicate_frame`) en `libwebcontentservice.so`.
+- **Causa A:** el overlay ANGLE de vcpkg no seteaba `is_android`, así que
+  ANGLE no compilaba su código de display Android. Fix del PR #8504,
+  verificado: `set(is_android TRUE)` en el `elseif (ANDROID)` del overlay.
+- **Causa B:** en Android `AK_OS_LINUX` está definido (los stubs de
+  `CrashReport.cpp` quedan fuera por `#if !defined(AK_OS_MACOS) &&
+  !defined(AK_OS_LINUX)`) pero el `LINUX` de CMake es falso para Android, así
+  que `CrashReportPOSIX.cpp` tampoco se compilaba. Fix:
+  `elseif (LINUX OR ANDROID)` en `LibWebView/CMakeLists.txt`.
+
 ## 8. Servicios JNI viejos contra APIs nuevas de Services (07-browser)
 
 - **Síntoma:** `RequestServerService.cpp.o: ConnectionFromClient.h:44: no
