@@ -6,6 +6,7 @@
 
 #include "WebViewImplementationNative.h"
 #include "JNIHelpers.h"
+#include <LibCore/System.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Painter.h>
@@ -38,12 +39,16 @@ WebViewImplementationNative::WebViewImplementationNative(jobject thiz)
         env.get()->CallVoidMethod(m_java_instance, invalidate_layout_method);
     };
 
-    on_load_start = [this](URL::URL const& url, bool is_redirect) {
-        JavaEnvironment env(global_vm);
-        auto url_string = env.jstring_from_ak_string(url.to_string());
-        env.get()->CallVoidMethod(m_java_instance, on_load_start_method, url_string, is_redirect);
-        env.get()->DeleteLocalRef(url_string);
-    };
+    // FIXME: el listener nuevo no trae is_redirect; se manda false hasta
+    // cambiar la firma Java de on_load_start.
+    add_navigation_listener({
+        .on_load_start = [this](URL::URL const& url) {
+            JavaEnvironment env(global_vm);
+            auto url_string = env.jstring_from_ak_string(url.to_string());
+            env.get()->CallVoidMethod(m_java_instance, on_load_start_method, url_string, false);
+            env.get()->DeleteLocalRef(url_string);
+        },
+    });
 }
 
 void WebViewImplementationNative::initialize_client(WebView::ViewImplementation::CreateNewClient, Optional<Web::HTML::CrossProcessId>)
@@ -53,12 +58,8 @@ void WebViewImplementationNative::initialize_client(WebView::ViewImplementation:
     auto new_client = bind_web_content_client();
 
     m_client_state.client = new_client;
-    m_client_state.client->on_web_content_process_crash = [] {
-        warnln("WebContent crashed!");
-        // FIXME: launch a new client
-    };
 
-    m_client_state.client_handle = MUST(Web::Crypto::generate_random_uuid());
+    m_client_state.client_handle = Web::Crypto::generate_random_uuid();
     client().async_set_window_handle(0, m_client_state.client_handle);
 
     client().async_set_viewport(0, viewport_size(), m_device_pixel_ratio, Web::ViewportIsFullscreen::No);
@@ -76,7 +77,14 @@ void WebViewImplementationNative::paint_into_bitmap(void* android_bitmap_raw, An
 
     auto android_bitmap = MUST(Gfx::Bitmap::create_wrapper(to_gfx_bitmap_format(info.format), Gfx::AlphaType::Premultiplied, { info.width, info.height }, info.stride, android_bitmap_raw));
     auto painter = Gfx::Painter::create(android_bitmap);
-    if (auto* bitmap = m_client_state.has_usable_bitmap ? m_client_state.front_bitmap.bitmap.ptr() : m_backup_bitmap.ptr())
+    // Modelo nuevo: SharedImageBuffer (ya no hay Gfx::Bitmap directo ni
+    // m_backup_bitmap; el backup es m_backup_shared_image_buffer).
+    RefPtr<Gfx::Bitmap> bitmap;
+    if (m_client_state.has_usable_bitmap && m_client_state.front_bitmap.shared_image_buffer)
+        bitmap = m_client_state.front_bitmap.shared_image_buffer->bitmap_if_present();
+    else if (m_backup_shared_image_buffer)
+        bitmap = m_backup_shared_image_buffer->bitmap_if_present();
+    if (bitmap)
         painter->draw_bitmap(android_bitmap->rect().to_type<float>(), Gfx::DecodedImageFrame { *MUST(bitmap->clone()) }, bitmap->rect(), Gfx::ScalingMode::NearestNeighbor, {}, 1.0f, Gfx::CompositingAndBlendingOperator::Copy);
     else
         painter->fill_rect(android_bitmap->rect().to_type<float>(), Gfx::Color::Magenta);
@@ -138,7 +146,11 @@ NonnullRefPtr<WebView::WebContentClient> WebViewImplementationNative::bind_web_c
     auto socket = MUST(Core::LocalSocket::adopt_fd(ui_fd));
     MUST(socket->set_blocking(true));
 
-    auto new_client = make_ref_counted<WebView::WebContentClient>(make<IPC::Transport>(move(socket)), *this);
+    auto new_client = make_ref_counted<WebView::WebContentClient>(
+        make<IPC::Transport>(move(socket)),
+        WebView::IsPrivate::No,
+        0,
+        Web::HTML::CrossProcessId {});
 
     return new_client;
 }
