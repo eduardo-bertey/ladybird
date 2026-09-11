@@ -197,13 +197,9 @@ void ALooperEventLoopImplementation::wake()
     ALooper_wake(m_event_loop);
 }
 
-void ALooperEventLoopImplementation::post_event(Core::EventReceiver& receiver, NonnullOwnPtr<Core::Event>&& event)
-{
-    m_thread_event_queue.post_event(receiver, move(event));
-
-    if (&m_thread_event_queue != &Core::ThreadEventQueue::current())
-        wake();
-}
+// NOTA: el post_event viejo se elimino: el modelo nuevo encola via
+// Core::ThreadEventQueue y avisa con EventLoopManager::did_post_event()
+// (ya porteado arriba via on_did_post_event).
 
 static int notifier_callback(int fd, int events, void* data)
 {
