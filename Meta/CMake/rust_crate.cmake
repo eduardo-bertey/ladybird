@@ -132,6 +132,7 @@ function(build_rust_binary)
     endif()
 
     _rust_crate_common_setup(
+        HOST_TOOL
         MANIFEST_PATH "${ARG_MANIFEST_PATH}"
         CRATE_NAME ${ARG_CRATE_NAME}
         FFI_OUTPUT_DIR "${ARG_FFI_OUTPUT_DIR}"
@@ -187,6 +188,7 @@ endfunction()
 function(test_rust_crate)
     cmake_parse_arguments(PARSE_ARGV 0 ARG "" "MANIFEST_PATH;CRATE_NAME" "")
     _rust_crate_common_setup(
+        HOST_TOOL
         MANIFEST_PATH "${ARG_MANIFEST_PATH}"
         CRATE_NAME ${ARG_CRATE_NAME}
         TARGET_DIR "${CMAKE_BINARY_DIR}/cargo/tests/${ARG_CRATE_NAME}"
@@ -206,8 +208,11 @@ function(test_rust_crate)
 endfunction()
 
 # Shared cargo setup for Rust build and test targets.
+# HOST_TOOL: build for the build machine (host tools like flapc that run
+# during the build). Without it, when cross-compiling (Android) the crate
+# targets the device triple.
 function(_rust_crate_common_setup)
-    cmake_parse_arguments(PARSE_ARGV 0 ARG "" "MANIFEST_PATH;CRATE_NAME;FFI_OUTPUT_DIR;TARGET_DIR" "")
+    cmake_parse_arguments(PARSE_ARGV 0 ARG "HOST_TOOL" "MANIFEST_PATH;CRATE_NAME;FFI_OUTPUT_DIR;TARGET_DIR" "")
 
     set(manifest_path "${CMAKE_CURRENT_SOURCE_DIR}/${ARG_MANIFEST_PATH}")
 
@@ -236,8 +241,36 @@ function(_rust_crate_common_setup)
         set(RUST_TARGET_TRIPLE "${host_triple}" CACHE INTERNAL "Rust target triple")
     endif()
 
+    # When cross-compiling to Android, staticlibs must target the device
+    # (else Mach-O objects end up in the ELF link). Host tools keep the host
+    # triple. NOT cached: both triples are needed in the same configure.
+    # ABI names follow PR LadybirdBrowser/ladybird#8504 (CMAKE_ANDROID_ARCH_ABI
+    # comes from the NDK toolchain; ANDROID_ABI is the Gradle/CMake input).
+    if (ANDROID AND NOT ARG_HOST_TOOL)
+        if (NOT DEFINED _ANDROID_ABI_NAME)
+            if (DEFINED CMAKE_ANDROID_ARCH_ABI)
+                set(_ANDROID_ABI_NAME "${CMAKE_ANDROID_ARCH_ABI}")
+            else()
+                set(_ANDROID_ABI_NAME "${ANDROID_ABI}")
+            endif()
+        endif()
+        if (_ANDROID_ABI_NAME STREQUAL "arm64-v8a")
+            set(_rust_triple "aarch64-linux-android")
+        elseif (_ANDROID_ABI_NAME STREQUAL "x86_64")
+            set(_rust_triple "x86_64-linux-android")
+        elseif (_ANDROID_ABI_NAME STREQUAL "armeabi-v7a")
+            set(_rust_triple "armv7-linux-androideabi")
+        elseif (_ANDROID_ABI_NAME STREQUAL "x86")
+            set(_rust_triple "i686-linux-android")
+        else()
+            message(FATAL_ERROR "Rust: no Rust triple for Android ABI=${_ANDROID_ABI_NAME}")
+        endif()
+    else()
+        set(_rust_triple "${RUST_TARGET_TRIPLE}")
+    endif()
+
     # Build the uppercased and underscored variants of the target triple.
-    string(REPLACE "-" "_" target_underscore "${RUST_TARGET_TRIPLE}")
+    string(REPLACE "-" "_" target_underscore "${_rust_triple}")
     string(TOUPPER "${target_underscore}" target_upper)
 
     # Determine the cargo profile and output directory name.
@@ -255,7 +288,7 @@ function(_rust_crate_common_setup)
     else()
         set(cargo_target_dir "${CMAKE_BINARY_DIR}/cargo/build")
     endif()
-    set(cargo_output_dir "${cargo_target_dir}/${RUST_TARGET_TRIPLE}/${cargo_profile_dir}")
+    set(cargo_output_dir "${cargo_target_dir}/${_rust_triple}/${cargo_profile_dir}")
 
     # Build environment variables for cargo.
     set(cargo_env
@@ -298,7 +331,7 @@ function(_rust_crate_common_setup)
     endif()
 
     set(cargo_common_flags
-        "--target=${RUST_TARGET_TRIPLE}"
+        "--target=${_rust_triple}"
         --package ${ARG_CRATE_NAME}
         --manifest-path "${manifest_path}"
         --target-dir "${cargo_target_dir}"

@@ -46,6 +46,25 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 6. Rust compilaba para el host y envenenaba el link (adblock-rust)
+
+- **Síntoma:** 05-web verde pero 07-browser roja en el link:
+  `ld.lld: error: lib/liblagom-web.a: archive member
+  '42c5d46f287ea510-lse_cas16_acq.o' is neither ET_REL nor LLVM bitcode`
+  (decenas de `lse_cas*`). El `ar` no valida formato, por eso la 05 pasó y
+  la 07 explotó.
+- **Causa raíz:** objetos con hash (`XXXX-*.o`) = `compiler_builtins` de Rust.
+  `rust_crate.cmake` fijaba `RUST_TARGET_TRIPLE` al triple del **host**
+  siempre, así que adblock-rust salía Mach-O (macOS) dentro de un link ELF.
+  Referencia: PR `LadybirdBrowser/ladybird#8504` ("Fix Android Compilation",
+  cerrado sin mergear) que mapea ABIs Android→Rust (`CMAKE_ANDROID_ARCH_ABI`).
+  Ojo: ese PR no distingue binarios host (flapc DEBE seguir en host porque se
+  ejecuta en build time); nuestro fix sí.
+- **Fix:** en `_rust_crate_common_setup`, flag `HOST_TOOL`: `build_rust_binary`
+  (flapc) y `test_rust_crate` usan host; `import_rust_crate` usa el triple del
+  device según ABI (4 ABIs como el PR). Más `rustup target add
+  aarch64-linux-android` (y `x86_64` para el APK por Gradle) en CI.
+
 ## 5. El interprete ASM en ARM64 (lo que rompia el compilador anterior)
 
 - **Contexto:** en Android arm64 el ASM **sí** está activo
