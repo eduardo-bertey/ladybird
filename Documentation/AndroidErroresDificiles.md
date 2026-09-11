@@ -58,6 +58,13 @@
   archivos pero contra otro árbol: se adaptó lo mínimo.
 - **Fix:** pasar `RequestTransferLeaseMap` + mantener orden de 7 args en
   RequestServer; pasar `is_test_mode` en WebContent (igual que desktop).
+- **Segunda vuelta (link):** `undefined symbol:
+  RequestServer::g_default_certificate_path` y `g_resource_substitution_map`.
+  En el árbol nuevo el path es `static` en `Resolver.cpp` (se usa
+  `set_default_certificate_path`) y el mapa lo DEFINE el main del servicio
+  (desktop lo hace en `Services/RequestServer/main.cpp:28`). El servicio
+  Android hacía lo viejo: fix = definir el `OwnPtr` + llamar al setter
+  (igual que el PR #8504, verificado contra nuestro árbol).
 
 ## 7. Dos Rust crates duplican shims + falta include de curl (07-browser)
 
