@@ -46,6 +46,18 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 15. Runtime: falta libc++_shared.so en el APK (UnsatisfiedLinkError)
+
+- **Síntoma (en el celu):**
+  `dlopen failed: library "libc++_shared.so" not found: needed by
+  libLadybird.so` en `LadybirdActivity.<clinit>`.
+- **Causa raíz:** con `ANDROID_STL=c++_shared` hay que empaquetar el STL.
+  Antes lo copiaba Gradle solo vía externalNativeBuild; con prebuilt nadie lo
+  copia.
+- **Fix:** `cp` de `libc++_shared.so` del NDK
+  (`toolchains/llvm/prebuilt/*/sysroot/usr/lib/aarch64-linux-android/`) a
+  `jniLibs/arm64-v8a/` en el workflow, junto al strip.
+
 ## 14. APK muere por OOM compilando 2 ABIs a la vez (Android Build)
 
 - **Síntoma:** `buildCMakeDebug[arm64-v8a] FAILED` con `libc++abi:` vacío
