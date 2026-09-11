@@ -18,7 +18,7 @@ todo lo anterior esté verde). Todo `workflow_dispatch` (nada automático).
 | 07 | `android-07-browser.yml` | `ladybird` | 🟢 verde | `34620597237` | lib JNI nativa completa arm64 + sube las 4 .so |
 | 08 | `android-08-js-asm.yml` | `LibJS` | 🟢 verde | `34548215391` | test regresión: ASM aarch64 verificado ELF (no Mach-O) |
 | 09 | `android-09-sos.yml` | todas | ⬜ reserva | — | junta .so (la 07 ya sube las 4, 09 redundante por ahora) |
-| APK | `android-build.yml` | apk debug | 🟢 verde | `34629154449` | `ladybird-apk` 235 MB (llvm-strip: .so 3.2G→651M) |
+| APK | `android-build.yml` | apk debug | 🟢 verde | `34641290222` | `ladybird-apk` con libc++_shared.so (fix UnsatisfiedLinkError) |
 
 Leyenda: 🟢 verde / 🟡 en curso / 🔴 rojo (ver causa + fix) / ⬜ no lanzado.
 
