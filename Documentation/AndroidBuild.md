@@ -16,7 +16,7 @@ todo lo anterior esté verde). Todo `workflow_dispatch` (nada automático).
 | 05 | `android-05-web.yml` | `LibWeb` | 🟢 verde | `34539014759` | la más pesada, pool compile=2 |
 | 06 | `android-06-webview.yml` | `LibWebView` | 🟢 verde | `34539018540` | vista web + IPC |
 | 07 | `android-07-browser.yml` | `ladybird` | 🟡 compilando | `34543765279` | puerta al APK, solo con 01..06 verdes |
-| 08 | `android-08-js-asm.yml` | `LibJS` | 🟢 verde | `34545520167` | test regresión: ASM aarch64 (flapc+layout) |
+| 08 | `android-08-js-asm.yml` | `LibJS` | 🟢 verde | `34548215391` | test regresión: ASM aarch64 verificado ELF (no Mach-O) |
 
 Leyenda: 🟢 verde / 🟡 en curso / 🔴 rojo (ver causa + fix) / ⬜ no lanzado.
 
