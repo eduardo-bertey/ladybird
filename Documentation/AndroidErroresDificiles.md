@@ -46,6 +46,21 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 10. JNI WebView con APIs viejas (07-browser, lib ladybird)
+
+- **Síntoma:** `WebViewImplementationNative.cpp`: `no viable overloaded '='`
+  (on_load_start), `no member on_web_content_process_crash`, `MUST(uuid)` sin
+  ErrorOr, `front_bitmap.bitmap` + `m_backup_bitmap` inexistentes,
+  `Core::System` sin include, `make_ref_counted` sin match.
+- **Causa raíz:** el modelo de `ViewImplementation` cambió
+  (`NavigationListener`, uuid devuelve `String`, `SharedImageBuffer` en vez de
+  `Bitmap` directo, ctor `WebContentClient` con 4 args) y el JNI quedó viejo.
+  El PR #8504 solo cubre parte (include System, sacar el callback de crash,
+  un arg de MouseEvent): se porteó el resto contra el árbol actual.
+- **Fix:** listener de navegación (is_redirect=false + FIXME Java),
+  uuid directo, pintado desde `shared_image_buffer`/`m_backup_shared_image_buffer`
+  (protected, acceso OK), ctor cliente con `(No, 0, CrossProcessId{})`.
+
 ## 9. ANGLE sin display Android + CrashReport sin impl (07-browser)
 
 - **Síntoma:** `undefined symbol: rx::DisplayAndroid::DisplayAndroid(...)` en
