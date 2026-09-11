@@ -62,7 +62,7 @@ ErrorOr<int> service_main(int ipc_socket)
     WebView::set_site_isolation_mode(WebView::SiteIsolationMode::Disabled);
 
     auto webcontent_socket = TRY(Core::LocalSocket::adopt_fd(ipc_socket));
-    auto webcontent_client = WebContent::ConnectionFromClient::construct(make<IPC::Transport>(move(webcontent_socket)));
+    auto webcontent_client = WebContent::ConnectionFromClient::construct(make<IPC::Transport>(move(webcontent_socket)), is_test_mode);
 
     return event_loop.exec();
 }

@@ -34,12 +34,14 @@ ErrorOr<int> service_main(int ipc_socket)
     auto socket = TRY(Core::LocalSocket::adopt_fd(ipc_socket));
 
     RequestServer::ConnectionFromClient::ConnectionMap connections;
+    RequestServer::ConnectionFromClient::RequestTransferLeaseMap request_transfer_leases;
     Optional<HTTP::DiskCache&> disk_cache;
     auto client = RequestServer::ConnectionFromClient::construct(
         make<IPC::Transport>(move(socket)),
         RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes,
         RequestServer::IsPrivate::No,
         connections,
+        request_transfer_leases,
         disk_cache,
         ""sv);
 
