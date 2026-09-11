@@ -46,6 +46,17 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 12. Timer JNI posteaba al impl viejo (07-browser, lib ladybird)
+
+- **Síntoma:** al borrar `post_event` (error 11),
+  `TimerExecutorService.cpp:28: no member named 'post_event'` + tipos
+  incompletos `EventReceiver`.
+- **Causa raíz:** el timer corre en otro hilo Java y posteaba al impl. Modelo
+  nuevo: `ThreadEventQueue::post_event(receiver*, type)` con mutex + aviso
+  `did_post_event` (wake por pipe, ya cableado).
+- **Fix:** postear a `thread_data().thread_queue` (la cola del hilo del loop,
+  capturada en el ctor del impl) + `#include <LibCore/EventReceiver.h>`.
+
 ## 11. EventLoop Android con modelo viejo (07-browser, lib ladybird)
 
 - **Síntoma:** `ALooperEventLoopImplementation.cpp:200: out-of-line definition
