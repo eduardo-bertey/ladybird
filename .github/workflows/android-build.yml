@@ -28,12 +28,12 @@ jobs:
       - name: Set Up Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Download prebuilt .so (latest green android-09-sos)
+      - name: Download prebuilt .so (latest green android-07-browser)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
-          RUN_ID=$(gh run list --repo "${{ github.repository }}" --workflow android-09-sos.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          RUN_ID=$(gh run list --repo "${{ github.repository }}" --workflow android-07-browser.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
           test -n "$RUN_ID" && test "$RUN_ID" != "null"
           echo "Usando .so del run $RUN_ID"
           rm -rf UI/Android/src/main/jniLibs
