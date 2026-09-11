@@ -51,5 +51,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ladybird-apk
-          path: UI/Android/build/outputs/apk/*/app-*.apk
+          path: UI/Android/build/outputs/apk/*/*.apk
           if-no-files-found: error
