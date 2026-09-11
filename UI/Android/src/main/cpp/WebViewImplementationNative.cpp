@@ -48,6 +48,7 @@ WebViewImplementationNative::WebViewImplementationNative(jobject thiz)
             env.get()->CallVoidMethod(m_java_instance, on_load_start_method, url_string, false);
             env.get()->DeleteLocalRef(url_string);
         },
+        .on_load_finish = [](URL::URL const&) { },
     });
 }
 
