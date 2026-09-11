@@ -22,6 +22,7 @@
 #include <LibRequests/WebSocket.h>
 #include <LibWebSocket/WebSocket.h>
 #include <RequestServer/Forward.h>
+#include <curl/curl.h>
 #include <RequestServer/IsPrivate.h>
 #include <RequestServer/RequestClientEndpoint.h>
 #include <RequestServer/RequestServerEndpoint.h>

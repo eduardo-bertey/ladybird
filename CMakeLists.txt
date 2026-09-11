@@ -46,6 +46,11 @@ if (ANDROID)
     # "unknown pool name 'compile'". APPEND to not clobber link_pool.
     set_property(GLOBAL APPEND PROPERTY JOB_POOLS "compile=2")
     set(CMAKE_JOB_POOL_COMPILE "compile" CACHE STRING "Compile pool for the Android build" FORCE)
+    # Each Rust staticlib bundles its own allocator shims (__rustc::__rust_alloc
+    # etc.). Android service .so's bundle several Rust crates (adblock +
+    # imagedecoders), so the link would die with "duplicate symbol". The shims
+    # are identical; first one wins.
+    add_link_options(-Wl,--allow-multiple-definition)
 endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
