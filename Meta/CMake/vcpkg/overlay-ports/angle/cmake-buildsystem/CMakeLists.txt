@@ -92,6 +92,10 @@ if (APPLE)
     if (USE_OPENGL AND NOT angle_enable_eagl)
         set(angle_enable_cgl TRUE)
     endif()
+elseif (ANDROID)
+    # Sin esto ANGLE no compila su display Android (rx::DisplayAndroid queda
+    # indefinido y el link muere). Ver PR LadybirdBrowser/ladybird#8504.
+    set(is_android TRUE)
 elseif (WIN32)
     set(is_win TRUE)
     if (NOT WINDOWS_STORE)

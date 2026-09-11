@@ -80,7 +80,11 @@ if (APPLE)
         CrashReportPOSIX.cpp
         PlatformColorsMacOS.cpp
     )
-elseif (LINUX)
+elseif (LINUX OR ANDROID)
+    # ANDROID también necesita la impl POSIX: AK_OS_LINUX está definido en
+    # Android (los stubs de CrashReport.cpp quedan excluidos) pero el LINUX
+    # de CMake es falso para Android, así que sin esto nada define
+    # is_supported/show_directory/symbolicate_frame.
     list(APPEND SOURCES CrashReportPOSIX.cpp)
 endif()
 
