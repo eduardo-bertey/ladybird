@@ -46,6 +46,23 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 7. Dos Rust crates duplican shims + falta include de curl (07-browser)
+
+- **Síntoma A (link):** `ld.lld: error: duplicate symbol:
+  __rustc::__rust_alloc` (+dealloc/realloc/alloc_zeroed) entre
+  `web_content_blocker_rust` (adblock, en `liblagom-web.a`) e
+  `imagedecoders_rust`. Las partes 01-06 pasan porque `ar` no valida; solo el
+  link del `.so` lo expone. En desktop no pasa porque esos crates caen en
+  binarios distintos; en Android los servicios empaquetan más cosas juntas.
+- **Fix A:** `-Wl,--allow-multiple-definition` solo-Andro
+  en `CMakeLists.txt` (los shims son idénticos, gana el primero).
+- **Síntoma B (compile):** `RequestServerService.cpp` (JNI Android):
+  `ConnectionFromClient.h:38: unknown type name 'curl_slist'`. El header
+  usaba tipos curl sin incluir el header (en desktop llegaba transitivo).
+- **Fix B:** `#include <curl/curl.h>` en
+  `Services/RequestServer/ConnectionFromClient.h` (el target ya linkeaba
+  `CURL::libcurl`).
+
 ## 6. Rust compilaba para el host y envenenaba el link (adblock-rust)
 
 - **Síntoma:** 05-web verde pero 07-browser roja en el link:
