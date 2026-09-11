@@ -6,6 +6,7 @@
 
 #include "ALooperEventLoopImplementation.h"
 #include <LibCore/EventLoop.h>
+#include <LibCore/EventReceiver.h>
 #include <LibCore/ThreadEventQueue.h>
 #include <jni.h>
 
@@ -25,7 +26,10 @@ Java_org_serenityos_ladybird_TimerExecutorService_00024Timer_nativeRun(JNIEnv*, 
         if (!receiver)
             return;
 
-        event_loop_impl.post_event(*receiver, Core::Event::Type::Timer);
+        // Modelo nuevo: se postea a la cola del hilo del loop (guardada en
+        // thread_data por el impl, creado en el hilo principal), no a la de
+        // este hilo. El wake llega via did_post_event -> pipe.
+        thread_data.thread_queue->post_event(receiver.ptr(), Core::Event::Type::Timer);
     }
     // Flush the event loop on this thread to keep any garbage from building up
     if (auto num_events = s_event_loop.pump(Core::EventLoop::WaitMode::PollForEvents); num_events != 0) {
