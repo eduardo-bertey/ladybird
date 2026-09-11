@@ -22,10 +22,11 @@ jobs:
           target: ladybird
 
       # La lib nativa NO se pierde: se sube como artifact (los runners son
-      # efimeros y el Build/ muere con ellos).
+      # efimeros y el Build/ muere con ellos). OJO: es libLadybird.so con L
+      # mayuscula (OUTPUT_NAME de CMake), el glob es case-sensitive.
       - name: Subir libladybird.so
         uses: actions/upload-artifact@v4
         with:
           name: libladybird-arm64-so
-          path: ${{ github.workspace }}/Build/android-arm64/**/libladybird.so
+          path: ${{ github.workspace }}/Build/android-arm64/**/libLadybird.so
           if-no-files-found: error
