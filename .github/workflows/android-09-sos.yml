@@ -1,0 +1,33 @@
+name: Android parte 09 - SOs del APK (prebuilt)
+
+# Junta TODAS las .so que empaqueta el APK (ladybird + servicios) en un solo
+# artifact, para que el workflow Android Build arme el APK sin recompilar
+# nativo (Gradle solo empaqueta Java + .so prebuilt). Error rapido por target:
+# el log muestra cual fallo.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || format('{0}-{1}', github.ref, github.run_number) }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Compilar todas las .so para arm64-v8a
+        uses: ./.github/actions/android-part
+        with:
+          target: ladybird
+          extra-targets: 'requestserverservice webcontentservice imagedecoderservice'
+
+      # Todo .so del dir de build = exactamente lo que empaqueta Gradle.
+      - name: Subir todas las .so
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladybird-android-sos
+          path: ${{ github.workspace }}/Build/android-arm64/**/*.so
+          if-no-files-found: error

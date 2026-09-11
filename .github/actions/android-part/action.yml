@@ -10,6 +10,10 @@ inputs:
   target:
     description: Target CMake a compilar (LibCore, LibGfx, LibJS, LibMedia, LibWeb, LibWebView, ladybird)
     required: true
+  extra-targets:
+    description: Otros targets a compilar despues (separados por espacio, mismo log). Para juntar todas las .so del APK.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -154,6 +158,9 @@ runs:
       run: |
         set -euxo pipefail
         cmake --build "${{ github.workspace }}/Build/android-arm64" --target "${{ inputs.target }}" 2>&1 | tee "${{ github.workspace }}/Build/${{ inputs.target }}-android-arm64.log"
+        for t in ${{ inputs.extra-targets }}; do
+          cmake --build "${{ github.workspace }}/Build/android-arm64" --target "$t" 2>&1 | tee -a "${{ github.workspace }}/Build/${{ inputs.target }}-android-arm64.log"
+        done
 
     - name: Upload build log
       if: always()

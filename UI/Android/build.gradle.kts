@@ -3,6 +3,12 @@ plugins {
     id("org.jetbrains.kotlin.android") version "2.1.20"
 }
 
+// ladybird: con -PusePrebuiltNative=true se saltea CMake por completo y se
+// empaquetan las .so prebuilt de src/main/jniLibs/<abi>/ (bajadas del artifact
+// ladybird-android-sos). Solo arm64-v8a por ahora; sin el flag todo igual que
+// el oficial (CMake compila x86_64 + arm64-v8a).
+val usePrebuiltNative = (project.findProperty("usePrebuiltNative") ?: "false") == "true"
+
 android {
     namespace = "org.serenityos.ladybird"
     compileSdk = 35
@@ -17,24 +23,26 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        externalNativeBuild {
-            cmake {
-                cppFlags += "-std=c++23"
-                arguments += listOf(
-                    "-DANDROID_STL=c++_shared",
-                    "-DLADYBIRD_VCPKG_TYPE=release",
-                    "-DVCPKG_TARGET_ANDROID=ON",
-                    "-DENABLE_CRANELIFT_JIT=OFF"
-                )
-                System.getenv("LADYBIRD_HOST_LAYOUT_GENERATOR")?.let {
-                    arguments += "-DLADYBIRD_HOST_LAYOUT_GENERATOR=$it"
+        if (!usePrebuiltNative) {
+            externalNativeBuild {
+                cmake {
+                    cppFlags += "-std=c++23"
+                    arguments += listOf(
+                        "-DANDROID_STL=c++_shared",
+                        "-DLADYBIRD_VCPKG_TYPE=release",
+                        "-DVCPKG_TARGET_ANDROID=ON",
+                        "-DENABLE_CRANELIFT_JIT=OFF"
+                    )
+                    System.getenv("LADYBIRD_HOST_LAYOUT_GENERATOR")?.let {
+                        arguments += "-DLADYBIRD_HOST_LAYOUT_GENERATOR=$it"
+                    }
                 }
             }
         }
         ndk {
             // Specifies the ABI configurations of your native
             // libraries Gradle should build and package with your app.
-            abiFilters += listOf("x86_64", "arm64-v8a")
+            abiFilters += if (usePrebuiltNative) listOf("arm64-v8a") else listOf("x86_64", "arm64-v8a")
         }
     }
 
@@ -55,9 +63,11 @@ android {
         jvmTarget = "11"
     }
     externalNativeBuild {
-        cmake {
-            path = file("../../CMakeLists.txt")
-            version = "3.23.0+"
+        if (!usePrebuiltNative) {
+            cmake {
+                path = file("../../CMakeLists.txt")
+                version = "3.23.0+"
+            }
         }
     }
 
