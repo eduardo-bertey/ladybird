@@ -43,7 +43,8 @@ jobs:
           test -n "$ASM_OBJ"
           echo "ASM_OBJ=$ASM_OBJ"
           # 4. el objeto ASM esta dentro de la estatica LibJS
-          JS_LIB=$(find "$BUILD" -name "*.a" -path "*LibJS*" | head -1)
+          # (OUTPUT_NAME es lagom-js, en el dir comun de libs)
+          JS_LIB=$(find "$BUILD" -name "liblagom-js.a" | head -1)
           test -n "$JS_LIB"
           echo "JS_LIB=$JS_LIB"
           LLVM_AR=$(echo "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/"*/bin/llvm-ar)
