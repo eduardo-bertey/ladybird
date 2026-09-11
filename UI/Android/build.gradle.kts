@@ -22,8 +22,7 @@ android {
                 cppFlags += "-std=c++23"
                 arguments += listOf(
                     "-DANDROID_STL=c++_shared",
-                    "-DLADYBIRD_CACHE_DIR=$cacheDir",
-                    "-DVCPKG_ROOT=$sourceDir/Build/vcpkg",
+                    "-DLADYBIRD_VCPKG_TYPE=release",
                     "-DVCPKG_TARGET_ANDROID=ON",
                     "-DENABLE_CRANELIFT_JIT=OFF"
                 )

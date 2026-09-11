@@ -46,6 +46,21 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 13. Gradle híbrido roto por el merge (Android Build/APK)
+
+- **Síntoma:** `assembleDebug` muere en 1 min:
+  `build.gradle.kts:25: Unresolved reference: cacheDir` (+ `sourceDir`).
+- **Causa raíz:** el oficial (`ac28b52`) eliminó `var buildDir/cacheDir/sourceDir`
+  y los args `-DLADYBIRD_CACHE_DIR`/`-DVCPKG_ROOT`, reemplazados por
+  `-DLADYBIRD_VCPKG_TYPE=release` (CMake deriva todo en `environment.cmake`).
+  El merge con la rama eduardo dejó un híbrido: usa las vars pero sin
+  definirlas.
+- **Fix:** alinear con el oficial (`LADYBIRD_VCPKG_TYPE=release`, se mantiene
+  `ENABLE_CRANELIFT_JIT=OFF` explícito). De paso se elimina el
+  `VCPKG_ROOT=Build/vcpkg` viejo del path Gradle.
+- **Mejora:** la 07 ahora sube `libladybird.so` como artifact
+  (`libladybird-arm64-so`), antes se perdía con el runner.
+
 ## 12. Timer JNI posteaba al impl viejo (07-browser, lib ladybird)
 
 - **Síntoma:** al borrar `post_event` (error 11),
