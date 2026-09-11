@@ -15,6 +15,11 @@ if (DEFINED LADYBIRD_VCPKG_TYPE)
 
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "" FORCE)
     set(VCPKG_INSTALL_OPTIONS "--no-print-usage" CACHE STRING "" FORCE)
+    if (ANDROID)
+        # En CI Android un solo runner construye vcpkg para 2 ABIs: borrar los
+        # buildtrees al terminar cada port o el disco no alcanza.
+        set(VCPKG_INSTALL_OPTIONS "--no-print-usage;--clean-after-build" CACHE STRING "" FORCE)
+    endif()
     set(VCPKG_OVERLAY_TRIPLETS "$ENV{LADYBIRD_SOURCE_DIR}/Meta/CMake/vcpkg/${LADYBIRD_VCPKG_TYPE}-triplets" CACHE STRING "" FORCE)
 
     set(ENV{VCPKG_BINARY_SOURCES} "clear;files,${LADYBIRD_CACHE_DIR}/vcpkg-binary-cache,readwrite;$ENV{VCPKG_BINARY_SOURCES}")
