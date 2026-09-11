@@ -46,6 +46,20 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 16. Runtime: falta SDLActivity java (SIGABRT en el celu)
+
+- **Síntoma (en el celu):**
+  `ClassNotFoundException: Didn't find class "org.libsdl.app.SDLActivity"`
+  → `JNI DETECTED ERROR` → SIGABRT en `LadybirdActivity.<clinit>` (línea 120,
+  `System.loadLibrary`).
+- **Causa raíz:** `LibWeb` linkea SDL3 estático; su `JNI_OnLoad` (código C de
+  SDL para Android) hace `FindClass` de su `SDLActivity` para el contexto.
+  La clase Java no existía en la app (nadie la vendoreó; el oficial no corre
+  Android y no lo notó).
+- **Fix:** vendorear los 11 `.java` de `org.libsdl.app` de SDL **3.2.28**
+  (misma versión del vcpkg) en `UI/Android/src/main/java/`. No hace falta
+  declararla en el manifest (no se lanza, solo debe existir la clase).
+
 ## 15. Runtime: falta libc++_shared.so en el APK (UnsatisfiedLinkError)
 
 - **Síntoma (en el celu):**
