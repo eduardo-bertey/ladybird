@@ -46,6 +46,18 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 18. Runtime: VERIFY por site-compatibility faltante (initNativeCode)
+
+- **Síntoma (en el celu):** `Unable to load site compatibility data: stat: No
+  such file or directory` + `VERIFICATION FAILED: !is_error()` (SIGTRAP) en
+  `initNativeCode`. Todo lo anterior ya anda (nativo, SDL, assets).
+- **Causa raíz:** `resource://ladybird/site-compatibility` (WebCompat/*.json)
+  viaja en desktop pero AndroidExtras solo empaquetaba 4 carpetas
+  (ladybird/fonts/icons/themes).
+- **Fix:** target `copy-android-extra-res` en `AndroidExtras.cmake` que copia
+  `WebCompat/` y `about-pages/` al asset-bundle antes del zip (igual que
+  desktop en `ResourceFiles.cmake`).
+
 ## 17. Runtime: falta ladybird-assets.zip (NoSuchFileException)
 
 - **Síntoma (en el celu):**
