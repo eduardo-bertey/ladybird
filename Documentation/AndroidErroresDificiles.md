@@ -46,6 +46,19 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 8. Servicios JNI viejos contra APIs nuevas de Services (07-browser)
+
+- **Síntoma:** `RequestServerService.cpp.o: ConnectionFromClient.h:44: no
+  matching constructor` y lo mismo en `WebContentService.cpp.o:56`. Además
+  antes: `unknown type name 'curl_slist'` (ya fixeado con el include).
+- **Causa raíz:** los Services cambiaron sus constructores
+  (`RequestTransferLeaseMap&` nuevo en RequestServer, `enable_test_mode` en
+  WebContent) y `UI/Android` quedó desactualizado (el oficial no compila
+  Android en CI, nadie lo notó). El PR #8504 trae rewrites grandes de esos
+  archivos pero contra otro árbol: se adaptó lo mínimo.
+- **Fix:** pasar `RequestTransferLeaseMap` + mantener orden de 7 args en
+  RequestServer; pasar `is_test_mode` en WebContent (igual que desktop).
+
 ## 7. Dos Rust crates duplican shims + falta include de curl (07-browser)
 
 - **Síntoma A (link):** `ld.lld: error: duplicate symbol:
