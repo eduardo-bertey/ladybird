@@ -46,6 +46,18 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 11. EventLoop Android con modelo viejo (07-browser, lib ladybird)
+
+- **Síntoma:** `ALooperEventLoopImplementation.cpp:200: out-of-line definition
+  of 'post_event' does not match` + conversión `EventReceiver&`→`*`.
+- **Causa raíz:** el modelo de eventos cambió: se encola con
+  `ThreadEventQueue::post_event(receiver*, type)` y se avisa con
+  `EventLoopManager::did_post_event()`. El manager Android ya estaba porteado
+  (`did_post_event` + `on_did_post_event`); solo sobraba el `post_event` del
+  implementation, que la base ya no declara.
+- **Fix:** borrar `ALooperEventLoopImplementation::post_event`. Nota: esto
+  conecta con el issue #484 (EventLoop Android) a nivel runtime, pendiente.
+
 ## 10. JNI WebView con APIs viejas (07-browser, lib ladybird)
 
 - **Síntoma:** `WebViewImplementationNative.cpp`: `no viable overloaded '='`
