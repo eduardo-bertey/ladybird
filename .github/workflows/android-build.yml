@@ -83,6 +83,7 @@ jobs:
         run: ./gradlew assembleDebug -PusePrebuiltNative=true
         env:
           GRADLE_OPTS: '-Xmx3072m'
+          LADYBIRD_BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

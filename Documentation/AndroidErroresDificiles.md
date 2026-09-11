@@ -46,6 +46,15 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 19. Updates con datos viejos no se curaban (pm install -r)
+
+- **Síntoma:** tras update (`pm install -r` conserva datos), mezcla de layouts
+  viejos/nuevos y crashes confusos; imposible distinguir qué APK tiene
+  instalado (todos se llaman igual, mismo versionCode).
+- **Fix:** extracción versionada en `LadybirdActivity.kt`: prefs
+  `assets_version` (2 = plano). Si cambia o falta el testigo, re-extrae y
+  guarda la versión. Los updates se autocuran sin desinstalar.
+
 ## 18. Runtime: VERIFY por site-compatibility faltante (initNativeCode)
 
 - **Síntoma (en el celu):** `Unable to load site compatibility data: stat: No

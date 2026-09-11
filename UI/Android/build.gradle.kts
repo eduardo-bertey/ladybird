@@ -19,8 +19,10 @@ android {
         applicationId = "org.serenityos.ladybird"
         minSdk = 30
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        // Version unica por build de CI para saber que APK esta instalado
+        // (todos se llamaban igual y era imposible distinguirlos).
+        versionCode = (System.getenv("LADYBIRD_BUILD_NUMBER") ?: "1").toInt()
+        versionName = "1.0.${System.getenv("LADYBIRD_BUILD_NUMBER") ?: "0"}"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         if (!usePrebuiltNative) {

@@ -36,8 +36,13 @@ class LadybirdActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         resourceDir = TransferAssets.transferAssets(this)
+        // Los assets se re-extraen si cambia el layout/contenido (version) o si
+        // falta el testigo. Asi un update (pm install -r conserva datos viejos)
+        // se autocura solo sin desinstalar.
+        val prefs = getSharedPreferences("ladybird_assets", MODE_PRIVATE)
+        val ASSETS_VERSION = 2 // 1=res/, 2=plano como desktop
         val testFile = File("$resourceDir/icons/48x48/app-browser.png")
-        if (!testFile.exists())
+        if (prefs.getInt("assets_version", 0) != ASSETS_VERSION || !testFile.exists())
         {
             ZipFile("$resourceDir/ladybird-assets.zip").use { zip ->
                 zip.entries().asSequence().forEach { entry ->
@@ -69,6 +74,7 @@ class LadybirdActivity : AppCompatActivity() {
                     }
                 }
             }
+            prefs.edit().putInt("assets_version", ASSETS_VERSION).apply()
         }
         val userDir = applicationContext.getExternalFilesDir(null)!!.absolutePath;
         initNativeCode(resourceDir, "Ladybird", timerService, userDir)
