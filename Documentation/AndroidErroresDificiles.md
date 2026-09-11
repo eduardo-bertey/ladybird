@@ -46,6 +46,20 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 14. APK muere por OOM compilando 2 ABIs a la vez (Android Build)
+
+- **Síntoma:** `buildCMakeDebug[arm64-v8a] FAILED` con `libc++abi:` vacío
+  compilando TUs pesados de LibWeb (`[2414/2862]`). Es el OOM que describe el
+  comentario del pool en `CMakeLists.txt`.
+- **Causa raíz:** el pool `compile=2` vale POR invocación ninja, pero Gradle
+  corre arm64-v8a + x86_64 en paralelo (2 pools = 4 clang pesados + cargo +
+  vcpkg + Gradle en 14 GB) → OOM. Las partes (1 ABI) no lo sufren.
+- **Fix/estrategia:** no pelear el OOM: el APK pasa a prebuilt
+  (`android-09-sos.yml` junta las .so, `android-build.yml` solo empaqueta
+  Java + `.so`, flag `-PusePrebuiltNative`, solo arm64-v8a por ahora).
+  Antes también murió por disco lleno (vcpkg+nativo x2 en un runner):
+  cachés compartidas + `--clean-after-build` mitigan, pero prebuilt lo evita.
+
 ## 13. Gradle híbrido roto por el merge (Android Build/APK)
 
 - **Síntoma:** `assembleDebug` muere en 1 min:
