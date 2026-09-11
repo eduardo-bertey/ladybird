@@ -28,6 +28,12 @@ jobs:
       - name: Set Up Gradle
         uses: gradle/actions/setup-gradle@v6
 
+      - name: Install NDK (solo para llvm-strip)
+        run: |
+          yes 2>/dev/null | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          yes 2>/dev/null | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "ndk;29.0.13599879" > /dev/null 2>&1 || true
+          test -d "${ANDROID_SDK_ROOT}/ndk/29.0.13599879"
+
       - name: Download prebuilt .so (latest green android-07-browser)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -39,6 +45,15 @@ jobs:
           rm -rf UI/Android/src/main/jniLibs
           mkdir -p UI/Android/src/main/jniLibs/arm64-v8a
           gh run download "$RUN_ID" --repo "${{ github.repository }}" -n ladybird-android-sos -D UI/Android/src/main/jniLibs/arm64-v8a/
+          find UI/Android/src/main/jniLibs -name "*.so"
+
+      - name: Strip .so (sacar debug symbols, achica ~10x)
+        run: |
+          set -eux
+          LLVM_STRIP=$(echo "${ANDROID_SDK_ROOT}/ndk/29.0.13599879/toolchains/llvm/prebuilt/"*/bin/llvm-strip)
+          du -sh UI/Android/src/main/jniLibs/arm64-v8a/
+          "$LLVM_STRIP" --strip-unneeded UI/Android/src/main/jniLibs/arm64-v8a/*.so
+          du -sh UI/Android/src/main/jniLibs/arm64-v8a/
           find UI/Android/src/main/jniLibs -name "*.so"
 
       - name: Build APK (prebuilt native, arm64-v8a)
