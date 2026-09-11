@@ -62,7 +62,7 @@ Java_org_serenityos_ladybird_LadybirdActivity_initNativeCode(JNIEnv* env, jobjec
 
     dbgln("Set resource dir to {}", WebView::s_ladybird_resource_root);
 
-    auto file_or_error = Core::System::open(MUST(String::formatted("{}/res/icons/48x48/app-browser.png", WebView::s_ladybird_resource_root)), O_RDONLY);
+    auto file_or_error = Core::System::open(MUST(String::formatted("{}/icons/48x48/app-browser.png", WebView::s_ladybird_resource_root)), O_RDONLY);
     if (file_or_error.is_error()) {
         dbgln("No resource files, perhaps extracting went wrong?");
     } else {

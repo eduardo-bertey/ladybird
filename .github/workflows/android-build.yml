@@ -53,10 +53,13 @@ jobs:
           cd "${{ github.workspace }}"
           # Mismo contenido que genera copy-assets en AndroidExtras.cmake:
           # zip -r de asset-bundle/ (mismo comando, sin compilar nada).
+          # Layout PLANO como desktop (share/Lagom/{ladybird,fonts,icons,themes},
+          # SIN nivel res/): el resource root en Android es files/ y
+          # resource://ladybird/X debe resolver a files/ladybird/X.
           rm -rf asset-bundle
-          mkdir -p asset-bundle/res/ladybird/site-compatibility
-          cp -r Base/res/ladybird Base/res/fonts Base/res/icons Base/res/themes asset-bundle/res/
-          cp WebCompat/*.json asset-bundle/res/ladybird/site-compatibility/
+          mkdir -p asset-bundle/ladybird/site-compatibility
+          cp -r Base/res/ladybird Base/res/fonts Base/res/icons Base/res/themes asset-bundle/
+          cp WebCompat/*.json asset-bundle/ladybird/site-compatibility/
           mkdir -p UI/Android/src/main/assets
           (cd asset-bundle && zip -qr ../ladybird-assets.zip ./)
           mv ladybird-assets.zip UI/Android/src/main/assets/

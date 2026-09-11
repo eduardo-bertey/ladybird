@@ -51,12 +51,16 @@
 - **Síntoma (en el celu):** `Unable to load site compatibility data: stat: No
   such file or directory` + `VERIFICATION FAILED: !is_error()` (SIGTRAP) en
   `initNativeCode`. Todo lo anterior ya anda (nativo, SDL, assets).
-- **Causa raíz:** `resource://ladybird/site-compatibility` (WebCompat/*.json)
-  viaja en desktop pero AndroidExtras solo empaquetaba 4 carpetas
-  (ladybird/fonts/icons/themes).
-- **Fix:** target `copy-android-extra-res` en `AndroidExtras.cmake` que copia
-  `WebCompat/` y `about-pages/` al asset-bundle antes del zip (igual que
-  desktop en `ResourceFiles.cmake`).
+- **Causa raíz (doble):** 1) `resource://ladybird/site-compatibility`
+  (WebCompat/*.json) no viajaba en Android (solo 4 carpetas). 2) El zip
+  Android tenía un nivel `res/` de más: desktop instala plano
+  (`share/Lagom/{ladybird,fonts...}`) pero el asset-bundle espejaba
+  `Base/res/`, así que `resource://ladybird/X` buscaba en `files/ladybird/X`
+  y estaba en `files/res/ladybird/X`.
+- **Fix:** layout plano como desktop en los dos lados (zip local del APK y
+  `AndroidExtras.cmake`: copiar a `asset-bundle/` + WebCompat a
+  `asset-bundle/ladybird/site-compatibility/`), y checks
+  `res/icons/` → `icons/` en `LadybirdActivity.cpp/.kt`.
 
 ## 17. Runtime: falta ladybird-assets.zip (NoSuchFileException)
 

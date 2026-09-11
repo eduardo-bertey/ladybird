@@ -36,7 +36,7 @@ class LadybirdActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         resourceDir = TransferAssets.transferAssets(this)
-        val testFile = File("$resourceDir/res/icons/48x48/app-browser.png")
+        val testFile = File("$resourceDir/icons/48x48/app-browser.png")
         if (!testFile.exists())
         {
             ZipFile("$resourceDir/ladybird-assets.zip").use { zip ->
