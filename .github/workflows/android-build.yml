@@ -47,6 +47,17 @@ jobs:
           gh run download "$RUN_ID" --repo "${{ github.repository }}" -n ladybird-android-sos -D UI/Android/src/main/jniLibs/arm64-v8a/
           find UI/Android/src/main/jniLibs -name "*.so"
 
+      - name: Download assets (ladybird-assets.zip del mismo run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          RUN_ID=$(gh run list --repo "${{ github.repository }}" --workflow android-07-browser.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          test -n "$RUN_ID" && test "$RUN_ID" != "null"
+          mkdir -p UI/Android/src/main/assets
+          gh run download "$RUN_ID" --repo "${{ github.repository }}" -n ladybird-android-assets -D UI/Android/src/main/assets/
+          ls -la UI/Android/src/main/assets/
+
       - name: Strip .so + agregar libc++_shared (sacar debug symbols, achica ~10x)
         run: |
           set -eux

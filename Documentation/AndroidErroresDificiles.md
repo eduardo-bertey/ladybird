@@ -46,6 +46,18 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 17. Runtime: falta ladybird-assets.zip (NoSuchFileException)
+
+- **Síntoma (en el celu):**
+  `NoSuchFileException: Invalid Assets, this won't work/ladybird-assets.zip`
+  en `LadybirdActivity.onCreate`.
+- **Causa raíz:** el zip lo genera CMake (`copy-assets`, dependencia del
+  target `ladybird`) en el source tree. Con prebuilt Gradle no corre CMake y
+  el zip nunca llega al APK.
+- **Fix:** la 07 lo sube como artifact `ladybird-android-assets` y el
+  workflow del APK lo baja a `src/main/assets/`. Más `.gitignore` para no
+  commitearlo.
+
 ## 16. Runtime: falta SDLActivity java (SIGABRT en el celu)
 
 - **Síntoma (en el celu):**

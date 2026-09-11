@@ -21,13 +21,18 @@ jobs:
         with:
           target: ladybird
 
-      # Las 4 .so del APK (ladybird + 3 servicios, todas en lib/): se suben como
-      # artifact porque los runners son efimeros y el Build/ muere con ellos.
-      # OJO: libLadybird.so con L mayuscula, el glob es case-sensitive.
-      # Se usa lib/*.so y NO **/*.so para no arrastrar .so de vcpkg_installed.
       - name: Subir .so
         uses: actions/upload-artifact@v4
         with:
           name: ladybird-android-sos
           path: ${{ github.workspace }}/Build/android-arm64/lib/*.so
+          if-no-files-found: error
+
+      # ladybird-assets.zip lo genera CMake (copy-assets) en el source tree.
+      # Con prebuilt Gradle no corre CMake: hay que pasarlo por artifact.
+      - name: Subir assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladybird-android-assets
+          path: ${{ github.workspace }}/UI/Android/src/main/assets/ladybird-assets.zip
           if-no-files-found: error

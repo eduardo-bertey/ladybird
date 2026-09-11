@@ -66,3 +66,6 @@ Meta/CMake/vcpkg/user-variables.cmake
 .DS_Store
 
 __pycache__
+
+# Generado por CMake (copy-assets) en CI, no commitear
+UI/Android/src/main/assets/ladybird-assets.zip
