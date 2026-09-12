@@ -9,12 +9,19 @@
 #include <LibCore/Resource.h>
 #include <LibWeb/Loader/SiteCompatibility.h>
 #include <LibWebView/SiteCompatibility.h>
+#include <LibWebView/Utilities.h>
 
 namespace WebView {
 
 ErrorOr<JsonValue> load_site_compatibility_data(StringView directory_uri)
 {
-    auto directory = TRY(Core::Resource::load_from_uri(directory_uri));
+    auto directory_or_error = Core::Resource::load_from_uri(directory_uri);
+    if (directory_or_error.is_error()) {
+        // DIAG-ANDROID: loguear el path real que falla (root + uri + error).
+        warnln("site-compat DIAG: uri={} root={} error={}", directory_uri, s_ladybird_resource_root, directory_or_error.error());
+        return directory_or_error.release_error();
+    }
+    auto directory = directory_or_error.release_value();
     auto children = directory->children();
     quick_sort(children);
 
