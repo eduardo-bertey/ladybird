@@ -147,6 +147,8 @@ runs:
           -DANDROID_PLATFORM=android-30
           -DANDROID_NDK="$ANDROID_NDK_HOME"
           -DANDROID_STL=c++_shared
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DVCPKG_TARGET_ANDROID=ON
           -DLADYBIRD_CACHE_DIR="${{ github.workspace }}/Build/caches"
           -DENABLE_CRANELIFT_JIT=OFF
