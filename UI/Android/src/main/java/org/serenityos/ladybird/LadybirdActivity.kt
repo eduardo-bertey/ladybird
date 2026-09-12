@@ -37,53 +37,52 @@ class LadybirdActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         resourceDir = TransferAssets.transferAssets(this)
-        // Los assets se re-extraen si cambia el layout/contenido (version) o si
-        // falta el testigo. Asi un update (pm install -r conserva datos viejos)
-        // se autocura solo sin desinstalar.
+        // Extraccion incondicional (ver abajo): autocura cualquier estado
+        // mezclado/restaurado sin desinstalar.
         val prefs = getSharedPreferences("ladybird_assets", MODE_PRIVATE)
         val ASSETS_VERSION = 2 // 1=res/, 2=plano como desktop
         val testFile = File("$resourceDir/icons/48x48/app-browser.png")
         val storedVersion = prefs.getInt("assets_version", 0)
-        Log.d("Ladybird", "assets DIAG: testFile=$testFile exists=${testFile.exists()} storedVersion=$storedVersion want=$ASSETS_VERSION")
-        if (storedVersion != ASSETS_VERSION || !testFile.exists())
-        {
-            var entryCount = 0
-            var fileCount = 0
-            ZipFile("$resourceDir/ladybird-assets.zip").use { zip ->
-                zip.entries().asSequence().forEach { entry ->
-                    entryCount++
-                    val fileName = entry.name
-                    val file = File("$resourceDir/$fileName")
-                    if (!entry.isDirectory)
-                    {
-                        val parentFolder = File(file.parent!!)
-                        if (!parentFolder.exists())
-                            parentFolder.mkdirs()
-                        zip.getInputStream(entry).use { input ->
-                            file.outputStream().use { output ->
-                                input.copyTo(output)
-                            }
-                        }
-                        fileCount++
-                    }
-                }
-            }
-            Log.d("Ladybird", "assets DIAG: extracted entries=$entryCount files=$fileCount")
-
-            // curl has some issues with the Android's way of storing certificates.
-            // We need to do this in order to make curl happy.
-            val certMain = File("$resourceDir/cacert.pem")
-            certMain.outputStream().use { output ->
-                Files.walk(Path("/system/etc/security/cacerts")).forEach { certPath ->
-                    if (!certPath.isDirectory()) {
-                        certPath.inputStream().use { input ->
+        // Extraer SIEMPRE (sin condicion): los estados mezclados/restaurados
+        // nos mataron muchas veces (testFile existe pero el resto falta o es
+        // viejo). Cuesta ~0.5s por arranque y garantiza archivos exactos del zip.
+        Log.d("Ladybird", "assets DIAG: testFile=$testFile exists=${testFile.exists()} storedVersion=$storedVersion want=$ASSETS_VERSION (extraigo siempre)")
+        var entryCount = 0
+        var fileCount = 0
+        ZipFile("$resourceDir/ladybird-assets.zip").use { zip ->
+            zip.entries().asSequence().forEach { entry ->
+                entryCount++
+                val fileName = entry.name
+                val file = File("$resourceDir/$fileName")
+                if (!entry.isDirectory)
+                {
+                    val parentFolder = File(file.parent!!)
+                    if (!parentFolder.exists())
+                        parentFolder.mkdirs()
+                    zip.getInputStream(entry).use { input ->
+                        file.outputStream().use { output ->
                             input.copyTo(output)
                         }
                     }
+                    fileCount++
                 }
             }
-            prefs.edit().putInt("assets_version", ASSETS_VERSION).apply()
         }
+        Log.d("Ladybird", "assets DIAG: extracted entries=$entryCount files=$fileCount")
+
+        // curl has some issues with the Android's way of storing certificates.
+        // We need to do this in order to make curl happy.
+        val certMain = File("$resourceDir/cacert.pem")
+        certMain.outputStream().use { output ->
+            Files.walk(Path("/system/etc/security/cacerts")).forEach { certPath ->
+                if (!certPath.isDirectory()) {
+                    certPath.inputStream().use { input ->
+                        input.copyTo(output)
+                    }
+                }
+            }
+        }
+        prefs.edit().putInt("assets_version", ASSETS_VERSION).apply()
         val userDir = applicationContext.getExternalFilesDir(null)!!.absolutePath;
         initNativeCode(resourceDir, "Ladybird", timerService, userDir)
 
