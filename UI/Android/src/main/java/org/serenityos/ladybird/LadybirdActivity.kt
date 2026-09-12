@@ -7,6 +7,9 @@
 package org.serenityos.ladybird
 
 import androidx.appcompat.app.AppCompatActivity
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
@@ -32,6 +35,37 @@ class LadybirdActivity : AppCompatActivity() {
     private lateinit var view: WebView
     private lateinit var urlEditText: EditText
     private var timerService = TimerExecutorService()
+    // Hay que retener las conexiones o el framework desbindea el servicio.
+    private var requestServerConnection: ServiceConnection? = null
+    private var imageDecoderConnection: ServiceConnection? = null
+
+    // Llamados desde native (initNativeCode): bindean los servicios
+    // :RequestServer y :ImageDecoder pasandoles el fd del socket.
+    fun bindRequestServerService(ipcFd: Int) {
+        val connector = LadybirdServiceConnection(ipcFd, resourceDir)
+        connector.onDisconnect = {
+            Log.e("Ladybird", "RequestServer Died! :(")
+        }
+        bindService(
+            Intent(this, RequestServerService::class.java),
+            connector,
+            Context.BIND_AUTO_CREATE
+        )
+        requestServerConnection = connector
+    }
+
+    fun bindImageDecoderService(ipcFd: Int) {
+        val connector = LadybirdServiceConnection(ipcFd, resourceDir)
+        connector.onDisconnect = {
+            Log.e("Ladybird", "ImageDecoder Died! :(")
+        }
+        bindService(
+            Intent(this, ImageDecoderService::class.java),
+            connector,
+            Context.BIND_AUTO_CREATE
+        )
+        imageDecoderConnection = connector
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

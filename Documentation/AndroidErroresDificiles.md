@@ -83,6 +83,26 @@
 - **Fix:** si `Core::EventLoop::is_running()`, reusar `current()` en vez de
   crear otro (desktop intacto: ahi no hay loop previo).
 
+## 24. Servicios: el UI bindeaba binarios que no existen
+
+- **Síntoma:** `Could not launch any of [/system/libexec/RequestServer,
+  /system/bin/RequestServer, ...]` + `!is_error()`.
+- **Causa raíz:** `launch_request_server/image_decoder_process()` hacen
+  fork+exec de binarios desktop. En Android los servicios son procesos
+  Android (`:RequestServer`, `:ImageDecoder`, `:WebContent`) que se bindean
+  por Binder pasandoles un socket (patron `bind_service`, ya usado por el
+  proceso WebContent). Al UI le faltaba bindear los suyos: nadie llamaba a
+  `bind_request_server/image_decoder_java` desde el proceso UI (esos usan el
+  objeto Java del proceso WebContent, no sirven en el UI).
+- **Fix:** `launch_request_server/image_decoder_server` ahora `virtual`;
+  el `Application` Android los overridea con `bind_service` + `bind_ui_*`
+  (llaman a `LadybirdActivity.bindRequestServer/ImageDecoderService(fd)`,
+  nuevos en Kotlin, reteniendo el ServiceConnection). Sin handshake
+  InitTransport (igual que WebContent) para no deadlokear el main thread.
+  Desktop intacto (bodies base iguales).
+- **Extra:** `LadybirdServiceBaseJNI` instalaba recursos en `{root}/res`,
+  pero los assets van en plano desde ASSETS_VERSION=2 → se cambio a `{root}`.
+
 ## 20. Android restauraba datos viejos en cada reinstall (BackupManager)
 
 - **Síntoma:** "clean installs" que no eran limpios: en el log

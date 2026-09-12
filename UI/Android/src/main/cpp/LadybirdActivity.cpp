@@ -6,6 +6,9 @@
 
 #include "ALooperEventLoopImplementation.h"
 #include "JNIHelpers.h"
+#include "WebContentService.h"
+#include <LibImageDecoderClient/Client.h>
+#include <LibRequests/RequestClient.h>
 #include <AK/ByteString.h>
 #include <AK/Format.h>
 #include <AK/HashMap.h>
@@ -35,9 +38,90 @@ public:
 
 private:
     virtual bool should_coordinate_browser_process() const override { return false; }
+    virtual ErrorOr<void> launch_request_server() override;
+    virtual ErrorOr<void> launch_image_decoder_server() override;
 };
 
 Application::Application() = default;
+
+static jmethodID s_bind_request_server_service_method = nullptr;
+static jmethodID s_bind_image_decoder_service_method = nullptr;
+
+static void bind_ui_request_server_service(int ipc_socket)
+{
+    Ladybird::JavaEnvironment env(global_vm);
+    env.get()->CallVoidMethod(s_java_instance, s_bind_request_server_service_method, ipc_socket);
+}
+
+static void bind_ui_image_decoder_service(int ipc_socket)
+{
+    Ladybird::JavaEnvironment env(global_vm);
+    env.get()->CallVoidMethod(s_java_instance, s_bind_image_decoder_service_method, ipc_socket);
+}
+
+// En Android no hay binarios sueltos: los servicios corren en procesos
+// Android (:RequestServer, :ImageDecoder) y se bindean por Binder.
+// Se replica launch_request_server/launch_image_decoder_server con
+// bind_service en vez de spawn (sin handshake InitTransport, igual que
+// hace el proceso WebContent).
+ErrorOr<void> Application::launch_request_server()
+{
+    m_request_server_client = TRY(bind_service<Requests::RequestClient>(&bind_ui_request_server_service));
+
+    auto const& browsing_data_settings = Application::settings().browsing_data_settings();
+    m_request_server_client->async_set_disk_cache_settings(browsing_data_settings.disk_cache_settings);
+
+    Application::settings().dns_settings().visit(
+        [](SystemDNS) {},
+        [&](DNSOverTLS const& dns_over_tls) {
+            m_request_server_client->async_set_dns_server(dns_over_tls.server_address, dns_over_tls.port, true, dns_over_tls.validate_dnssec_locally);
+        },
+        [&](DNSOverUDP const& dns_over_udp) {
+            m_request_server_client->async_set_dns_server(dns_over_udp.server_address, dns_over_udp.port, false, dns_over_udp.validate_dnssec_locally);
+        });
+
+    m_request_server_client->on_retrieve_http_cookie = [](URL::URL const& url, RequestServer::IsPrivate is_private) -> String {
+        auto& cookie_jar = Application::cookie_jar(is_private == RequestServer::IsPrivate::Yes ? IsPrivate::Yes : IsPrivate::No);
+        return cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http);
+    };
+
+    m_request_server_client->on_request_server_died = [this]() {
+        m_request_server_client = nullptr;
+        m_private_request_server_client = nullptr;
+
+        if (Core::EventLoop::current().was_exit_requested())
+            return;
+
+        if (auto result = launch_request_server(); result.is_error()) {
+            warnln("\033[31;1mUnable to launch replacement RequestServer: {}\033[0m", result.error());
+            VERIFY_NOT_REACHED();
+        }
+    };
+
+    if (m_browser_options.dns_settings.has_value())
+        m_settings->set_dns_settings(m_browser_options.dns_settings.value(), true);
+
+    return {};
+}
+
+ErrorOr<void> Application::launch_image_decoder_server()
+{
+    m_image_decoder_client = TRY(bind_service<ImageDecoderClient::Client>(&bind_ui_image_decoder_service));
+
+    m_image_decoder_client->on_death = [this]() {
+        m_image_decoder_client = nullptr;
+
+        if (Core::EventLoop::current().was_exit_requested())
+            return;
+
+        if (auto result = launch_image_decoder_server(); result.is_error()) {
+            dbgln("Failed to restart image decoder: {}", result.error());
+            VERIFY_NOT_REACHED();
+        }
+    };
+
+    return {};
+}
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_serenityos_ladybird_LadybirdActivity_initNativeCode(JNIEnv*, jobject, jstring, jstring, jobject, jstring);
@@ -90,6 +174,10 @@ Java_org_serenityos_ladybird_LadybirdActivity_initNativeCode(JNIEnv* env, jobjec
     VERIFY(clazz);
     s_schedule_event_loop_method = env->GetMethodID(clazz, "scheduleEventLoop", "()V");
     VERIFY(s_schedule_event_loop_method);
+    s_bind_request_server_service_method = env->GetMethodID(clazz, "bindRequestServerService", "(I)V");
+    VERIFY(s_bind_request_server_service_method);
+    s_bind_image_decoder_service_method = env->GetMethodID(clazz, "bindImageDecoderService", "(I)V");
+    VERIFY(s_bind_image_decoder_service_method);
     env->DeleteLocalRef(clazz);
 
     jobject timer_service_ref = env->NewGlobalRef(timer_service);

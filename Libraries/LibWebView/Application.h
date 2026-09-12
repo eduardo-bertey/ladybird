@@ -353,8 +353,8 @@ private:
     void handle_compositor_process_death();
     void recover_compositor_process();
     void crash_compositor_process();
-    ErrorOr<void> launch_request_server();
-    ErrorOr<void> launch_image_decoder_server();
+    virtual ErrorOr<void> launch_request_server();
+    virtual ErrorOr<void> launch_image_decoder_server();
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     ErrorOr<void> launch_wasm_compiler_server();
 #endif

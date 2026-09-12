@@ -66,23 +66,3 @@ ErrorOr<int> service_main(int ipc_socket)
 
     return event_loop.exec();
 }
-
-template<typename Client>
-ErrorOr<NonnullRefPtr<Client>> bind_service(void (*bind_method)(int))
-{
-    int socket_fds[2] {};
-    TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM, 0, socket_fds));
-
-    int ui_fd = socket_fds[0];
-    int server_fd = socket_fds[1];
-
-    // NOTE: The java object takes ownership of the socket fds
-    (*bind_method)(server_fd);
-
-    auto socket = TRY(Core::LocalSocket::adopt_fd(ui_fd));
-    TRY(socket->set_blocking(true));
-
-    auto new_client = TRY(try_make_ref_counted<Client>(make<IPC::Transport>(move(socket))));
-
-    return new_client;
-}
