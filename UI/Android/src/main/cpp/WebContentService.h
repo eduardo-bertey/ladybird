@@ -8,7 +8,7 @@
 
 #include <AK/NonnullRefPtr.h>
 #include <AK/Try.h>
-#include <LibCore/LocalSocket.h>
+#include <LibCore/Socket.h>
 #include <LibCore/System.h>
 #include <LibIPC/Transport.h>
 
