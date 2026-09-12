@@ -8,6 +8,7 @@ package org.serenityos.ladybird
 
 import androidx.appcompat.app.AppCompatActivity
 import android.os.Bundle
+import android.util.Log
 import android.view.KeyEvent
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
@@ -42,10 +43,15 @@ class LadybirdActivity : AppCompatActivity() {
         val prefs = getSharedPreferences("ladybird_assets", MODE_PRIVATE)
         val ASSETS_VERSION = 2 // 1=res/, 2=plano como desktop
         val testFile = File("$resourceDir/icons/48x48/app-browser.png")
-        if (prefs.getInt("assets_version", 0) != ASSETS_VERSION || !testFile.exists())
+        val storedVersion = prefs.getInt("assets_version", 0)
+        Log.d("Ladybird", "assets DIAG: testFile=$testFile exists=${testFile.exists()} storedVersion=$storedVersion want=$ASSETS_VERSION")
+        if (storedVersion != ASSETS_VERSION || !testFile.exists())
         {
+            var entryCount = 0
+            var fileCount = 0
             ZipFile("$resourceDir/ladybird-assets.zip").use { zip ->
                 zip.entries().asSequence().forEach { entry ->
+                    entryCount++
                     val fileName = entry.name
                     val file = File("$resourceDir/$fileName")
                     if (!entry.isDirectory)
@@ -58,9 +64,11 @@ class LadybirdActivity : AppCompatActivity() {
                                 input.copyTo(output)
                             }
                         }
+                        fileCount++
                     }
                 }
             }
+            Log.d("Ladybird", "assets DIAG: extracted entries=$entryCount files=$fileCount")
 
             // curl has some issues with the Android's way of storing certificates.
             // We need to do this in order to make curl happy.
