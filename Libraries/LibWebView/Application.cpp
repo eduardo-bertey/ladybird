@@ -712,8 +712,14 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         warnln("    Configured lists: {}", m_browser_options.content_blocker_list_paths);
     }
 
-    if (!m_event_loop)
-        m_event_loop = &create_platform_event_loop();
+    if (!m_event_loop) {
+        // En Android el JNI ya creo el loop de este thread (s_main_event_loop):
+        // crear otro hace VERIFY en el ctor (uno por thread). Reusarlo.
+        if (Core::EventLoop::is_running())
+            m_event_loop = &Core::EventLoop::current();
+        else
+            m_event_loop = &create_platform_event_loop();
+    }
     TRY(launch_services());
 
     initialize_actions();

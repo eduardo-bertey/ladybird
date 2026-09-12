@@ -60,6 +60,29 @@
   `platform_init` (`Libraries/LibWebView/Utilities.cpp`): en Android manda
   el root de `initNativeCode`, pero igual se instala el impl.
 
+## 22. Profile moria en mkdir /run/user (XDG incompleto)
+
+- **Síntoma:** `VERIFICATION FAILED: !is_error()` en `initNativeCode`,
+  sin ningun warning previo.
+- **Causa raíz:** el JNI solo ponia `XDG_CONFIG_HOME`+`XDG_DATA_HOME`.
+  `runtime_directory()` caia a `/run/user/UID` (`AK_OS_LINUX` tambien esta
+  definido en Android) y `Profile::create_legacy` → `mkdir /run/user/UID`
+  → `EACCES`. El cache (`~/.cache`, sin `HOME`) era el siguiente cadaver.
+- **Fix:** en `initNativeCode` poner `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR`,
+  `XDG_STATE_HOME`, `HOME` y `TMPDIR` bajo `user_dir`, y pre-crear los
+  6 subdirs. Kotlin: `getExternalFilesDir` con fallback a `filesDir`.
+
+## 23. Segundo EventLoop en el mismo thread
+
+- **Síntoma:** `VERIFICATION FAILED: !current_event_loop()` en
+  `LibCore/EventLoop.cpp:33` (el ctor, uno por thread).
+- **Causa raíz:** el JNI crea `s_main_event_loop`, y como en Android
+  `coordinate_browser_process=false`, `m_event_loop` llegaba nulo a
+  `Application.cpp:715` y `create_platform_event_loop()` hacia `new EventLoop`
+  → segundo loop en el thread → SIGTRAP.
+- **Fix:** si `Core::EventLoop::is_running()`, reusar `current()` en vez de
+  crear otro (desktop intacto: ahi no hay loop previo).
+
 ## 20. Android restauraba datos viejos en cada reinstall (BackupManager)
 
 - **Síntoma:** "clean installs" que no eran limpios: en el log
