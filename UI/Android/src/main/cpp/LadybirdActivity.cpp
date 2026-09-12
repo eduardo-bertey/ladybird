@@ -54,6 +54,18 @@ Java_org_serenityos_ladybird_LadybirdActivity_initNativeCode(JNIEnv* env, jobjec
     char const* raw_user_dir = env->GetStringUTFChars(user_dir, nullptr);
     setenv("XDG_CONFIG_HOME", ByteString::formatted("{}/config", raw_user_dir).characters(), 1);
     setenv("XDG_DATA_HOME", ByteString::formatted("{}/userdata", raw_user_dir).characters(), 1);
+    // En Android NO existen /run/user, ~/.cache ni $HOME: hay que ponerlos
+    // bajo user_dir o Profile::create_legacy muere en el primer mkdir.
+    setenv("XDG_CACHE_HOME", ByteString::formatted("{}/cache", raw_user_dir).characters(), 1);
+    setenv("XDG_RUNTIME_DIR", ByteString::formatted("{}/runtime", raw_user_dir).characters(), 1);
+    setenv("XDG_STATE_HOME", ByteString::formatted("{}/state", raw_user_dir).characters(), 1);
+    setenv("HOME", raw_user_dir, 1);
+    setenv("TMPDIR", ByteString::formatted("{}/tmp", raw_user_dir).characters(), 1);
+    for (auto const& subdir : { "config"sv, "userdata"sv, "cache"sv, "runtime"sv, "state"sv, "tmp"sv }) {
+        auto dir = ByteString::formatted("{}/{}", raw_user_dir, subdir);
+        if (auto result = Core::Directory::create(dir, Core::Directory::CreateDirectories::Yes, 0700); result.is_error())
+            dbgln("No pude crear {}: {}", dir, result.error());
+    }
     env->ReleaseStringUTFChars(user_dir, raw_user_dir);
 
     char const* raw_tag_name = env->GetStringUTFChars(tag_name, nullptr);

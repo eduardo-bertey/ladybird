@@ -83,7 +83,7 @@ class LadybirdActivity : AppCompatActivity() {
             }
         }
         prefs.edit().putInt("assets_version", ASSETS_VERSION).apply()
-        val userDir = applicationContext.getExternalFilesDir(null)!!.absolutePath;
+        val userDir = applicationContext.getExternalFilesDir(null)?.absolutePath ?: applicationContext.filesDir.absolutePath;
         initNativeCode(resourceDir, "Ladybird", timerService, userDir)
 
         binding = ActivityMainBinding.inflate(layoutInflater)
