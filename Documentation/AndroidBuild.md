@@ -32,5 +32,10 @@ Leyenda: 🟢 verde / 🟡 en curso / 🔴 rojo (ver causa + fix) / ⬜ no lanza
    `android-build.yml`. El oficial siempre falló por esto.
 3. Host manifest pedía simdutf 9.0.0 (ya no existe en la DB). Se llevó a
    simdutf 9.1.0 + baseline `7f3781e1`, igual que el `vcpkg.json` raíz.
+4. ccache instalado pero dormido: el setup lo pone con brew y se restaura
+   `.ccache`, pero nadie pasaba `CMAKE_C_COMPILER_LAUNCHER` → cada 07
+   recompilaba todo (~1h en macos-14 = ~600 min facturados). Ahora se pasa
+   por path absoluto con fallback (el nombre solo lo resuelve CMake contra
+   el workspace y ninja muere con 127).
 
 Detalle de los errores difíciles: `Documentation/AndroidErroresDificiles.md`.

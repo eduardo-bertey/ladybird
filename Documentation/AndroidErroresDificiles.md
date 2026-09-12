@@ -102,6 +102,13 @@
   Desktop intacto (bodies base iguales).
 - **Extra:** `LadybirdServiceBaseJNI` instalaba recursos en `{root}/res`,
   pero los assets van en plano desde ASSETS_VERSION=2 → se cambio a `{root}`.
+- **Compilacion (follow-up):** `Core::LocalSocket` vive en
+  `LibCore/Socket.h` (no existe `LocalSocket.h`); los miembros
+  `m_request_server_client`, `m_private_request_server_client` y
+  `m_image_decoder_client` pasaron de `private` a `protected` en
+  `Application.h` (neutro en desktop); en el `.cpp` del UI todo lo de
+  `WebView::` va calificado (`Application.cpp` esta dentro de
+  `namespace WebView`, el JNI no).
 
 ## 20. Android restauraba datos viejos en cada reinstall (BackupManager)
 
