@@ -46,6 +46,20 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 21. platform_init pisaba el resource root: LA causa raiz (runtime)
+
+- **Síntoma:** `stat ENOENT` en site-compat con los archivos PRESENTES.
+  El DIAG (`uri=... root=/system/share/Lagom`) lo probo: el root NO era
+  `files/` sino `/system/share/Lagom`.
+- **Causa raíz:** `initNativeCode` pone bien el root (`files/`), pero
+  `Application::create` → ctor → `platform_init()` lo SOBREESCRIBE con el
+  calculo desktop (sale del path de `app_process` → `/system/share/Lagom`)
+  e instala `ResourceImplementation` con eso. Todos los `resource://` rotos.
+  El log "Set resource dir" mentia (se imprime antes del pisoton).
+- **Fix:** `#if !defined(AK_OS_ANDROID)` alrededor de la asignacion en
+  `platform_init` (`Libraries/LibWebView/Utilities.cpp`): en Android manda
+  el root de `initNativeCode`, pero igual se instala el impl.
+
 ## 20. Android restauraba datos viejos en cada reinstall (BackupManager)
 
 - **Síntoma:** "clean installs" que no eran limpios: en el log

@@ -80,6 +80,10 @@ void platform_init(Optional<ByteString> ladybird_binary_path)
 {
     s_ladybird_binary_path = move(ladybird_binary_path);
 
+#if !defined(AK_OS_ANDROID)
+    // En Android el root lo pone initNativeCode (files/ de la app) y NO se
+    // debe pisar: el calculo de abajo da /system/share/Lagom (sale del path
+    // de app_process) y deja todos los resource:// rotos.
     s_ladybird_resource_root = [] {
         auto home = Core::Environment::get("XDG_CONFIG_HOME"sv)
                         .value_or_lazy_evaluated_optional([]() { return Core::Environment::get("HOME"sv); });
@@ -95,6 +99,7 @@ void platform_init(Optional<ByteString> ladybird_binary_path)
         return find_prefix(LexicalPath(app_dir)).append("share/Lagom"sv).string();
 #endif
     }();
+#endif
 
     Core::ResourceImplementation::install(make<Core::ResourceImplementationFile>(MUST(String::from_byte_string(s_ladybird_resource_root))));
 }
