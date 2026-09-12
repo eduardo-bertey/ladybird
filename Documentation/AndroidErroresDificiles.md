@@ -46,6 +46,15 @@
 - Issues oficiales que limitan Android: #8672 (ASM no cross-compilable),
   #421 (sin video del sistema), #484 (EventLoop).
 
+## 20. Android restauraba datos viejos en cada reinstall (BackupManager)
+
+- **Síntoma:** "clean installs" que no eran limpios: en el log
+  `BackupManagerService: restoreAtInstall pkg=org.serenityos.ladybird` —
+  el sistema restauraba `files/` (layouts viejos) en cada reinstall.
+- **Causa raíz:** `android:allowBackup="true"` en el manifest.
+- **Fix:** `allowBackup="false"` (más extracción versionada del error 19:
+  doble defensa).
+
 ## 19. Updates con datos viejos no se curaban (pm install -r)
 
 - **Síntoma:** tras update (`pm install -r` conserva datos), mezcla de layouts
