@@ -51,9 +51,12 @@
 - **Síntoma:** "clean installs" que no eran limpios: en el log
   `BackupManagerService: restoreAtInstall pkg=org.serenityos.ladybird` —
   el sistema restauraba `files/` (layouts viejos) en cada reinstall.
-- **Causa raíz:** `android:allowBackup="true"` en el manifest.
+- **Mecanismo exacto (probado con DIAG):** el restore corre EN PARALELO con
+  el primer arranque: Java ve `testFile exists=true`, el restore borra/reescribe
+  el árbol, y 2ms después el `open()` nativo da ENOENT. Carrera imposible de
+  ganar desde la app.
 - **Fix:** `allowBackup="false"` (más extracción versionada del error 19:
-  doble defensa).
+  doble defensa). Sin restore no hay carrera.
 
 ## 19. Updates con datos viejos no se curaban (pm install -r)
 
