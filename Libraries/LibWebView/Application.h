@@ -344,6 +344,12 @@ protected:
 
     bool has_spare_web_content_process() const { return m_spare_web_content_process; }
 
+protected:
+    // Los crea el puerto Android (bind_service) en vez de spawn.
+    RefPtr<Requests::RequestClient> m_request_server_client;
+    RefPtr<Requests::RequestClient> m_private_request_server_client;
+    RefPtr<ImageDecoderClient::Client> m_image_decoder_client;
+
 private:
     ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, u64 initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {});
     PrivateBrowsingSession& ensure_private_browsing_session();
@@ -493,9 +499,6 @@ private:
     bool m_webdriver_browser_connection_failed { false };
     WebDriverSessionConfig m_webdriver_session_config;
 
-    RefPtr<Requests::RequestClient> m_request_server_client;
-    RefPtr<Requests::RequestClient> m_private_request_server_client;
-    RefPtr<ImageDecoderClient::Client> m_image_decoder_client;
 #if defined(HAVE_WASM_COMPILER_SERVICE)
     RefPtr<WasmCompilerClient::Client> m_wasm_compiler_client;
 #endif

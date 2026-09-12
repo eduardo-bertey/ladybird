@@ -22,6 +22,8 @@
 #include <LibFileSystem/FileSystem.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Utilities.h>
+#include <LibWebView/WebContentClient.h>
+#include <LibWebView/WorkerProcessManager.h>
 #include <jni.h>
 
 JavaVM* global_vm;
@@ -72,16 +74,16 @@ ErrorOr<void> Application::launch_request_server()
     m_request_server_client->async_set_disk_cache_settings(browsing_data_settings.disk_cache_settings);
 
     Application::settings().dns_settings().visit(
-        [](SystemDNS) {},
-        [&](DNSOverTLS const& dns_over_tls) {
+        [](WebView::SystemDNS) {},
+        [&](WebView::DNSOverTLS const& dns_over_tls) {
             m_request_server_client->async_set_dns_server(dns_over_tls.server_address, dns_over_tls.port, true, dns_over_tls.validate_dnssec_locally);
         },
-        [&](DNSOverUDP const& dns_over_udp) {
+        [&](WebView::DNSOverUDP const& dns_over_udp) {
             m_request_server_client->async_set_dns_server(dns_over_udp.server_address, dns_over_udp.port, false, dns_over_udp.validate_dnssec_locally);
         });
 
     m_request_server_client->on_retrieve_http_cookie = [](URL::URL const& url, RequestServer::IsPrivate is_private) -> String {
-        auto& cookie_jar = Application::cookie_jar(is_private == RequestServer::IsPrivate::Yes ? IsPrivate::Yes : IsPrivate::No);
+        auto& cookie_jar = Application::cookie_jar(is_private == RequestServer::IsPrivate::Yes ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
         return cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http);
     };
 
@@ -96,10 +98,44 @@ ErrorOr<void> Application::launch_request_server()
             warnln("\033[31;1mUnable to launch replacement RequestServer: {}\033[0m", result.error());
             VERIFY_NOT_REACHED();
         }
+
+        size_t normal_client_count = 0;
+        size_t private_client_count = 0;
+        WebView::WebContentClient::for_each_client([&](WebView::WebContentClient& client) {
+            client.is_private() == WebView::IsPrivate::No ? ++normal_client_count : ++private_client_count;
+            return IterationDecision::Continue;
+        });
+
+        auto create_handles = [&](auto is_private, auto client_count) -> Vector<IPC::TransportHandle> {
+            if (client_count == 0)
+                return {};
+
+            auto response = m_request_server_client->send_sync_but_allow_failure<Messages::RequestServer::ConnectNewClients>(client_count, is_private);
+            if (!response || response->handles().size() != client_count) {
+                warnln("Failed to connect {} new clients to RequestServer", client_count);
+                VERIFY_NOT_REACHED();
+            }
+
+            return response->take_handles();
+        };
+
+        auto normal_handles = create_handles(RequestServer::IsPrivate::No, normal_client_count);
+        auto private_handles = create_handles(RequestServer::IsPrivate::Yes, private_client_count);
+
+        WebView::WebContentClient::for_each_client([&](WebView::WebContentClient& client) {
+            auto& handles = client.is_private() == WebView::IsPrivate::No ? normal_handles : private_handles;
+            client.async_connect_to_request_server(handles.take_last());
+            return IterationDecision::Continue;
+        });
+
+        if (auto result = WebView::WorkerProcessManager::the().reconnect_to_request_server(); result.is_error()) {
+            warnln("Unable to reconnect WebWorker processes to RequestServer: {}", result.error());
+            VERIFY_NOT_REACHED();
+        }
     };
 
-    if (m_browser_options.dns_settings.has_value())
-        m_settings->set_dns_settings(m_browser_options.dns_settings.value(), true);
+    if (Application::browser_options().dns_settings.has_value())
+        Application::settings().set_dns_settings(Application::browser_options().dns_settings.value(), true);
 
     return {};
 }
