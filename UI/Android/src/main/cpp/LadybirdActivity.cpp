@@ -21,6 +21,7 @@
 #include <LibCore/Timer.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/CookieJar.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WorkerProcessManager.h>
